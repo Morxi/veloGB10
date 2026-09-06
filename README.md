@@ -27,6 +27,11 @@ This project does not aim to provide generic GPU portability or support arbitrar
 same binary supports all supported models through `--model-dir`; no Python runtime or framework
 serving stack is required.
 
+> **Pair it with [VeloBenchmark](https://velobenchmark.com)** — our browser-based benchmarking and
+> live-stats console, for measuring a veloGB10 server (or any OpenAI-compatible endpoint) from a
+> point-and-click UI. See the [VeloBenchmark repo](https://github.com/sf-stav/VeloBench) for
+> installation.
+
 **Headline** (greedy, MTP-speculative, bitwise-lossless — full tables in
 [Benchmarks](#benchmarks)): Qwen3.8 27B at **~40 tok/s on one GB10 and ~56 tok/s on two** (and
 **~85 tok/s on four** with DFlash 2) · Qwen3.6 27B at **~42 tok/s** on one GB10 and **~53 tok/s on two** ·
