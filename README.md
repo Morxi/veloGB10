@@ -290,7 +290,8 @@ Two properties are treated as non-negotiable and are enforced by gates, not by h
 - **Two-node / four-node TP serving** — see below.
 - **NVFP4 / FP8 mixed-precision quantization** — offline quantizer producing HF-compatible
   compressed-tensors artifacts; NVFP4 tensor-core GEMMs for the serving path, plus direct load of
-  fine-grained block-128 FP8 (`weight_scale_inv`).
+  fine-grained block-128 FP8 (`weight_scale_inv`), with the FP8 prefill levers (tensor-core flash
+  attention + chunked GDN) on by default.
 - **Long context** — chunked prefill; 32K-class envelopes validated end-to-end on TP=2;
   model-context up to 256K on the 27B. The hybrid GDN layers carry a fixed-size recurrent state,
   so KV memory grows only on the periodic full-attention layers.
@@ -504,10 +505,11 @@ TP environment variables (read on the head, shipped to the node at sync; a node 
 Other single-node env vars: `GB10_RDMA_DEV` (device override), `RUST_INFER_ZERO_KV=1` (restore
 cold-admit KV zeroing), `RUST_INFER_PREFILL_SCALAR=1` (scalar prefill path),
 `GB10_NO_DECODE_GRAPHS=1` (disable decode graphs), `RUST_INFER_CPU_SAMPLE=1` (CPU sampling),
-`GB10_TP_TRACE=1` (per-barrier timing histograms at exit). Opt-in prefill levers (default off):
-`GB10_FA_PREFILL=1` (tensor-core flash-attention prefill), `GB10_MXFP4_PREFILL=1` (v2 W4A4 prefill
-GEMM), `GB10_GDN_CHUNK=1` / `GB10_GDN_CHUNK2=1` (GDN tensor-core chunked scan); these change the
-prefill path and are on by default only where the gates hold.
+`GB10_TP_TRACE=1` (per-barrier timing histograms at exit). Prefill levers: `GB10_FA_PREFILL`
+(tensor-core flash-attention prefill) and `GB10_GDN_CHUNK2` (tensor-core chunked GDN scan) are
+**on by default** on the FP8 path (`=0` restores the legacy path); `GB10_MXFP4_PREFILL=1` (v2 W4A4
+prefill GEMM) is an opt-in lever for the NVFP4 path, off by default (its prefill numerics are the
+owner's call). These change the prefill path and are gated where the gates hold.
 
 ### Probes (diagnostics)
 

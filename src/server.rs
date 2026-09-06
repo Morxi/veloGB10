@@ -268,6 +268,12 @@ struct ChatCompletionRequest {
     /// Per-request override of the server's --reasoning-effort default (which is 'no_think').
     #[serde(default)]
     reasoning_effort: Option<String>,
+    /// vLLM's `truncate_prompt_tokens`: keep the LAST n tokens of the prompt (left-truncation)
+    /// instead of receiving the over-length 400. Same semantics as /v1/tokenize's field; integer >= 1.
+    /// (2026-09-06: this field previously worked on /v1/tokenize ONLY — the chat path silently
+    /// dropped it, so the documented escape hatch could not actually rescue an over-length chat.)
+    #[serde(default)]
+    truncate_prompt_tokens: Option<usize>,
     /// OpenAI streaming options. Only meaningful with stream=true; serde used to drop it silently,
     /// so a client asking for include_usage got nothing and no [DONE] sentinel either.
     #[serde(default)]
@@ -493,6 +499,25 @@ async fn chat_completions(
             }
             Err(e) => return (StatusCode::BAD_REQUEST,
                 format!("vision preprocessing failed: {e}")).into_response(),
+        }
+    }
+
+    // truncate_prompt_tokens (vLLM's field): keep the LAST n tokens — the same left-truncation
+    // convention the /v1/tokenize handler implements. Runs BEFORE the max_seq_len check so any n
+    // that fits turns the over-length 400 into a served request; the boundary snapshot (ckpt_at)
+    // below re-renders the FULL template, so a truncated stream simply fails its `n < prompt_len`
+    // filter and skips the checkpoint this turn (truncated history is not a prefix of the next
+    // full-history turn anyway — the cache can't be trusted across the cut).
+    if let Some(n) = req.truncate_prompt_tokens {
+        if n == 0 {
+            return (StatusCode::BAD_REQUEST,
+                    "'truncate_prompt_tokens' must be an integer >= 1").into_response();
+        }
+        if prompt_tokens.len() > n {
+            let dropped = prompt_tokens.len() - n;
+            prompt_tokens.drain(..dropped); // keep the LAST n — vLLM's left-truncation convention
+            eprintln!("[req] truncate_prompt_tokens: dropped the OLDEST {dropped} of {} prompt \
+                       tokens (kept the last {n})", dropped + n);
         }
     }
 

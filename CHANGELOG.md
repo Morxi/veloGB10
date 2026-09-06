@@ -3,6 +3,19 @@
 High-level release notes for veloGB10. Minor bug fixes and small optimizations are grouped under
 generic language where they aren't individually notable.
 
+## v0.5.5 — FP8 prefill levers on, prompt-truncation + max_tokens fixes
+
+- **FP8 prefill levers now on by default.** The tensor-core flash-attention prefill
+  (`GB10_FA_PREFILL`) and the tensor-core chunked GDN scan (`GB10_GDN_CHUNK2`) are now default-on for
+  the FP8 path (value-checked; `=0` restores the legacy path). Big prefill speedup on the FP8
+  Qwen3.8 27B configuration. NVFP4/MXF4/other-model paths are untouched.
+- **`truncate_prompt_tokens` on `/v1/chat/completions`.** vLLM's left-truncation field now works on
+  the chat path (it previously only worked on `/v1/tokenize`, so an over-length chat couldn't be
+  rescued). Keeps the LAST `n` prompt tokens instead of the over-length 400.
+- **`max_tokens`-omitted fix.** The scheduler now clamps before rejecting instead of rejecting when
+  `prompt_len + max_new + depth + 8 > kv_stride` — a request that omits `max_tokens` no longer
+  terminates with 0 tokens. Minor bug fixes and optimizations.
+
 ## v0.5.4 — Built-in OpenTelemetry, FP8 support, DFlash2 tree mode
 
 - **Built-in OpenTelemetry.** `--otel-endpoint <URL>` streams OTLP/HTTP-JSON generation telemetry

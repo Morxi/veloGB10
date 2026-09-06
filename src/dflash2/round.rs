@@ -1477,6 +1477,10 @@ impl Df2Round {
         let Some(g) = self.round_graph.as_ref() else {
             return self.draft_round_dev(anchor);
         };
+        // F8 (diagnostic, GB10_ROUND_TRACE): split the replay wall — input H2D syncs, the eager
+        // rope gather, the pre/post syncs, the graph launch, the token readback.
+        let tr = std::env::var("GB10_ROUND_TRACE").is_ok();
+        let mut t = std::time::Instant::now();
         let ntot = self.nprev + BLOCK;
         // device inputs for this replay
         let toks: Vec<i32> = [anchor as i32].iter().copied()
@@ -1486,11 +1490,17 @@ impl Df2Round {
         self.dev.htod_sync_copy_into(&pos, &mut self.pos_blk)?;
         self.dev.htod_sync_copy_into(&[ntot as i32], self.ntot_buf.as_mut().unwrap())?;
         self.dev.htod_sync_copy_into(&[anchor], self.anchor_buf.as_mut().unwrap())?;
+        if tr { eprintln!("[round-trace] h2d inputs: {:.3} ms", t.elapsed().as_secs_f32() * 1e3); t = std::time::Instant::now(); }
         self.gather_rope(&self.blk.cos8, &self.blk.sin8, d(&self.pos_blk), BLOCK);
+        if tr { eprintln!("[round-trace] gather_rope launch: {:.3} ms", t.elapsed().as_secs_f32() * 1e3); t = std::time::Instant::now(); }
         self.dev.synchronize()?;
+        if tr { eprintln!("[round-trace] pre-replay sync: {:.3} ms", t.elapsed().as_secs_f32() * 1e3); t = std::time::Instant::now(); }
         g.launch();
+        if tr { eprintln!("[round-trace] graph launch (async): {:.3} ms", t.elapsed().as_secs_f32() * 1e3); t = std::time::Instant::now(); }
         self.dev.synchronize()?;
+        if tr { eprintln!("[round-trace] replay wait: {:.3} ms", t.elapsed().as_secs_f32() * 1e3); t = std::time::Instant::now(); }
         let tokens: Vec<u32> = self.dev.dtoh_sync_copy(&self.walk_tokens)?.to_vec();
+        if tr { eprintln!("[round-trace] tokens dtoh: {:.3} ms", t.elapsed().as_secs_f32() * 1e3); }
         Ok(tokens)
     }
 

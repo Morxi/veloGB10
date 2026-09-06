@@ -5378,12 +5378,17 @@ impl GpuModel {
         *V.get_or_init(|| std::env::var("GB10_MOE_NATIVE_PF").is_ok())
     }
 
-    /// P4 B3 chunked GDN prefill (2026-08-17): env-gated, prefill-only.
+    /// P4 B3 chunked GDN prefill (2026-08-17).
+    /// 2026-09-06 DEFAULT ON (F8 catch-up, measured on master @ 10631-tok prefill: 11768 ms →
+    /// 9806 ms, −16.7%, with binv PASS / state EXACT / LOSSLESS_OK; the identical flip is already
+    /// proven on the parked PP-serve line 7d5e4c1). Prefill-only — decode byte-identical by
+    /// construction. `GB10_GDN_CHUNK2=0` restores the legacy sequential scan (VALUE check, not
+    /// existence — the idiom that burned a benchmark session).
     fn gdn_chunk2_prefill_on() -> bool {
         static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *V.get_or_init(|| match std::env::var("GB10_GDN_CHUNK2") {
-            Ok(v) => v != "0",
-            Err(_) => false,
+            Ok(v) => !matches!(v.as_str(), "" | "0" | "false" | "off"),
+            Err(_) => true,
         })
     }
     fn gdn_chunk_prefill_on() -> bool {
@@ -5391,6 +5396,23 @@ impl GpuModel {
         // VALUE check, not existence: `GB10_GDN_CHUNK=0` must mean OFF. The `.is_ok()` existence
         // idiom burned a benchmark session (both A/B arms ran chunked because the off arm set =0).
         *V.get_or_init(|| match std::env::var("GB10_GDN_CHUNK") {
+            Ok(v) => !matches!(v.as_str(), "" | "0" | "false" | "off"),
+            Err(_) => false,
+        })
+    }
+
+    /// F8 P2c' (2026-09-06): SPLIT chunked GDN prefill — the fused gdn_chunk_tc_b walks chunks
+    /// serially in a 48-block grid; the split runs the per-chunk grams/W/subst/O in a
+    /// (chunks × heads × vchunks)-parallel kernel after a LEAN serial state-recurrence kernel
+    /// materializes every chunk's entry state (FlashInfer's decomposition). MEASURED REGRESSION
+    /// at n=10631 (this box): split H+WUO ≈ 21.7-22.3 ms/layer vs the fused gdn_chunk_tc_b at
+    /// 10.4-11.2 ms/layer (GB10_GDN_TIME, both idle) — the fused kernel's SMEM-resident state
+    /// plus all-MMA chunks beat the split's 522 MB/layer of state-scratch traffic. Default OFF;
+    /// kept as a DIAGNOSTIC variant (GB10_GDN_SPLIT=1 to A/B). The analysis doc's GDN-first
+    /// priority was based on a stale ~37 ms/layer estimate that this measurement refutes.
+    fn gdn_split_prefill_on() -> bool {
+        static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *V.get_or_init(|| match std::env::var("GB10_GDN_SPLIT") {
             Ok(v) => !matches!(v.as_str(), "" | "0" | "false" | "off"),
             Err(_) => false,
         })
@@ -8258,15 +8280,25 @@ impl GpuModel {
         let br = PF_BR.min(n);
         let bc = PF_BC;
 
-        // Fused flash-attention prefill (diagnostics/A-B knob GB10_FA_PREFILL=1, default OFF):
-        // ONE kernel replaces the whole QK^T/softmax/PV tile walk — no S/P global round-trip, no
-        // per-tile init/finalize launches. Same layouts and the same online-softmax numerics as
-        // the tiled path (P rounded to bf16 before PV, exactly like the tiled path's bf16 p_buf).
+        // Fused flash-attention prefill (ONE kernel replaces the whole QK^T/softmax/PV tile walk —
+        // no S/P global round-trip, no per-tile init/finalize launches). Same layouts and the same
+        // online-softmax numerics as the tiled path (P rounded to bf16 before PV, exactly like the
+        // tiled path's bf16 p_buf).
         // Measured on .13 (fa_tc harness): 15.3/44.7/74.0/103.5 ms at N=8192, pc=8K/16K/24K/32K
         // = 4.0x under the tiled path's per-call bar at every geometry (~54 TF/s effective).
-        // The tiled path below stays the default AND the only path verify can ever take: verify
-        // calls this function with n = depth <= 16 < PF_MIN, and this branch requires n >= PF_MIN.
-        if n >= PF_MIN && std::env::var("GB10_FA_PREFILL").is_ok() {
+        // 2026-09-06 DEFAULT ON (F8 catch-up: the vLLM recipe's FA2 prefill measures 11.6 ms/call
+        // vs our tiled path ~220 ms/mixer at N=10631 hd=256 — see PLAN/F8_CATCHUP_ANALYSIS.md
+        // §10.4; with this + GDN chunk2 the 10631-tok cell runs 11768→8123 ms, binv PASS, state
+        // EXACT, LOSSLESS_OK). The tiled path below stays the ONLY path verify can ever take:
+        // verify calls this function with n = depth <= 16 < PF_MIN, and this branch requires
+        // n >= PF_MIN — the lever is prefill-only and decode is byte-identical by construction.
+        // `GB10_FA_PREFILL=0` restores the tiled path (VALUE check, not existence — the idiom
+        // that burned a benchmark session).
+        if n >= PF_MIN
+            && std::env::var("GB10_FA_PREFILL").map_or(true, |v| {
+                !matches!(v.as_str(), "" | "0" | "false" | "off")
+            })
+        {
             // Tensor-core body covers hd in {128,256} and gqa dividing 96 (g=6 -> 16 tokens/block)
             if (hd == 256 || hd == 128) && 96 % gqa == 0 {
                 if let Some(f) = fa_tc_raw_fn() {
@@ -10250,6 +10282,101 @@ impl GpuModel {
                     // same gdn_prep_b P0 scratch; bf16 mma phases (o/S rel-L2 ~2.2e-2 vs the
                     // f32 seq oracle — the bf16-operand envelope, non-compounding over N).
                     // Prefill-only; decode/verify keep delta_step_prefill (bit-exact contract).
+                    // F8 P2c': SPLIT chunked GDN — H (serial, lean state recurrence +
+                    // per-chunk entry states) then WUO (per-chunk-parallel grams/W/subst/O).
+                    // When the raw fns are absent (stale PTX), the condition below is false and
+                    // the fused gdn_chunk_tc_b branch takes over unchanged.
+                    if Self::gdn_split_prefill_on() && n >= 256 && kd == 128 && vd == 128
+                        && gdn_split_fns().is_some() {
+                        let (h_fn, wuo_fn) = gdn_split_fns().unwrap();
+                        static SPLIT_MARK: std::sync::Once = std::sync::Once::new();
+                        SPLIT_MARK.call_once(|| eprintln!("[gsc] SPLIT chunked GDN ENGAGED (GB10_GDN_SPLIT, n={n})"));
+                        debug_assert!(mid_s_ptr == 0, "chunked GDN cannot snapshot mid-state");
+                        {
+                            let kds = kd + 4;
+                            let Qs = pool.get(n * lin_nh * kds);
+                            let Ks = pool.get(n * lin_nh * kds);
+                            let Vs = pool.get(n * lin_nh * vd);
+                            let Ps = pool.get(n * lin_nh * 2);
+                            blaunch!(self, "gdn_prep_b", (n as u32, lin_nh as u32, 1), (kd as u32,1,1), (2*kd*4) as u32,
+                                (d(&qkv), d(&b) + ba_off_pf, d(&a) + ba_off_pf, stride_pack as i32, (kd as i32) | ((vd as i32) << 16),
+                                 d(&la.a_log), d(&la.dt_bias),
+                                 (n as i32 & 0xFFFFFF) | ((self.eff_lin_k_heads() as i32 & 0xFF) << 24),
+                                 d(&Qs), d(&Ks), d(&Vs), d(&Ps)));
+                            let gdn_time = std::env::var("GB10_GDN_TIME").is_ok();
+                            if gdn_time { self.sync_stream(); }
+                            let t_split = std::time::Instant::now();
+                            const GSC_C: usize = 32;
+                            let nc = n.div_ceil(GSC_C);
+                            let vcb = vd / 64;                 // v-chunks per head (2)
+                            // states scratch [chunk][head][KD][VD] bf16
+                            let states = pool.get_bf16(nc * lin_nh * kd * vd);
+                            let n_nkh = (n as i32 & 0xFFFFFF)
+                                | ((self.eff_lin_k_heads() as i32 & 0xFF) << 24);
+                            // --- H ---
+                            let mut a_st = s_ptr;
+                            let mut a_ks = d(&Ks); let mut a_vs = d(&Vs); let mut a_ps = d(&Ps);
+                            let mut a_scr = *states.device_ptr() as u64;
+                            let mut a_kdvd_h = (kd as i32) | ((vd as i32) << 16);
+                            let mut a_n = n_nkh;
+                            let mut args_h: [*mut std::ffi::c_void; 7] = [
+                                &mut a_st as *mut u64 as *mut _, &mut a_ks as *mut u64 as *mut _,
+                                &mut a_vs as *mut u64 as *mut _, &mut a_ps as *mut u64 as *mut _,
+                                &mut a_scr as *mut u64 as *mut _,
+                                &mut a_kdvd_h as *mut i32 as *mut _, &mut a_n as *mut i32 as *mut _,
+                            ];
+                            let mut cf = cudarc::driver::sys::CUlaunchConfig {
+                                gridDimX: lin_nh as u32 * vcb as u32, gridDimY: 1, gridDimZ: 1,
+                                blockDimX: 256, blockDimY: 1, blockDimZ: 1,
+                                sharedMemBytes: 34816,
+                                hStream: self.stream.stream,
+                                attrs: std::ptr::null_mut(), numAttrs: 0,
+                            };
+                            let r = unsafe {
+                                cudarc::driver::sys::cuLaunchKernelEx(&mut cf, h_fn,
+                                    args_h.as_mut_ptr(), std::ptr::null_mut())
+                            };
+                            if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                                panic!("gdn_chunk_states_b launch failed ({r:?})");
+                            }
+                            // --- WUO ---
+                            let mut a_core2 = d(&core);
+                            let mut a_qs2 = d(&Qs); let mut a_ks2 = d(&Ks);
+                            let mut a_vs2 = d(&Vs); let mut a_ps2 = d(&Ps);
+                            let mut a_scr2 = *states.device_ptr() as u64;
+                            let mut a_n2 = n_nkh;
+                            let mut args_w: [*mut std::ffi::c_void; 7] = [
+                                &mut a_core2 as *mut u64 as *mut _, &mut a_qs2 as *mut u64 as *mut _,
+                                &mut a_ks2 as *mut u64 as *mut _, &mut a_vs2 as *mut u64 as *mut _,
+                                &mut a_ps2 as *mut u64 as *mut _,
+                                &mut a_scr2 as *mut u64 as *mut _, &mut a_n2 as *mut i32 as *mut _,
+                            ];
+                            let mut cf2 = cudarc::driver::sys::CUlaunchConfig {
+                                gridDimX: nc as u32, gridDimY: lin_nh as u32, gridDimZ: vcb as u32,
+                                blockDimX: 256, blockDimY: 1, blockDimZ: 1,
+                                sharedMemBytes: 83204,
+                                hStream: self.stream.stream,
+                                attrs: std::ptr::null_mut(), numAttrs: 0,
+                            };
+                            let r = unsafe {
+                                cudarc::driver::sys::cuLaunchKernelEx(&mut cf2, wuo_fn,
+                                    args_w.as_mut_ptr(), std::ptr::null_mut())
+                            };
+                            if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                                panic!("gdn_chunk_wuo_b launch failed ({r:?})");
+                            }
+                            pool.release_bf16(states, nc * lin_nh * kd * vd);
+                            pool.release(Qs, n * lin_nh * kds);
+                            pool.release(Ks, n * lin_nh * kds);
+                            pool.release(Vs, n * lin_nh * vd);
+                            pool.release(Ps, n * lin_nh * 2);
+                            if gdn_time {
+                                self.sync_stream();
+                                eprintln!("[gdn-time] layer {li} SPLIT kernels: {:.2} ms",
+                                          t_split.elapsed().as_secs_f32()*1e3);
+                            }
+                        }
+                    } else
                     if Self::gdn_chunk2_prefill_on() && n >= 256 && kd == 128 && vd == 128 {
                         static CHUNK2_MARK: std::sync::Once = std::sync::Once::new();
                         CHUNK2_MARK.call_once(|| eprintln!("[gtc] tensor-core chunked GDN ENGAGED (GB10_GDN_CHUNK2, n={n})"));
@@ -17976,6 +18103,53 @@ fn gdn_chunk_tc_load_raw_fn() -> Option<cudarc::driver::sys::CUfunction> {
     };
     if r != sys::CUresult::CUDA_SUCCESS { eprintln!("[gtc] smem opt-in failed ({r:?})"); return None; }
     Some(f)
+}
+
+/// F8 P2c' — one-time raw-module fetch of the SPLIT chunked GDN pair
+/// (`gdn_chunk_states_b` + `gdn_chunk_wuo_b`). Same pattern as `gdn_chunk_tc_load_raw_fn`.
+/// Returns (states_fn, wuo_fn).
+#[allow(clippy::type_complexity)]
+fn gdn_split_load_raw_fns() -> Option<(cudarc::driver::sys::CUfunction, cudarc::driver::sys::CUfunction)> {
+    use cudarc::driver::sys;
+    let ptx = std::fs::read_to_string("src/ptx/gpu_batch.ptx").ok()?;
+    let ptx_c = std::ffi::CString::new(ptx).ok()?;
+    let mut module: sys::CUmodule = std::ptr::null_mut();
+    let r = unsafe {
+        sys::cuModuleLoadDataEx(&mut module, ptx_c.as_ptr() as *const std::ffi::c_void,
+                                0, std::ptr::null_mut(), std::ptr::null_mut())
+    };
+    if r != sys::CUresult::CUDA_SUCCESS { eprintln!("[gsc] module load failed ({r:?})"); return None; }
+    // H: Sb 128*72*2 + Kt 128*40*2 + Vb 32*72*2 + f32 (32+32+33)*4 = 33,668 + slack.
+    let h_smem: i32 = 34816;
+    // WUO: the fused kernel's exact section layout (83204 B).
+    let wuo_smem: i32 = 83204;
+    let mut out = [std::ptr::null_mut(); 2];
+    for (i, name) in ["gdn_chunk_states_b", "gdn_chunk_wuo_b"].iter().enumerate() {
+        let cname = std::ffi::CString::new(*name).ok()?;
+        let mut f: sys::CUfunction = std::ptr::null_mut();
+        let r = unsafe { sys::cuModuleGetFunction(&mut f, module, cname.as_ptr()) };
+        if r != sys::CUresult::CUDA_SUCCESS { eprintln!("[gsc] get {name} failed ({r:?})"); return None; }
+        let bytes: i32 = if i == 0 { h_smem } else { wuo_smem };
+        let r = unsafe {
+            sys::cuFuncSetAttribute(f, sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, bytes)
+        };
+        if r != sys::CUresult::CUDA_SUCCESS { eprintln!("[gsc] {name} smem opt-in failed ({r:?})"); return None; }
+        out[i] = f;
+    }
+    Some((out[0], out[1]))
+}
+
+/// Process-wide handles for the split pair (module loads once).
+#[allow(clippy::type_complexity)]
+fn gdn_split_fns() -> Option<(cudarc::driver::sys::CUfunction, cudarc::driver::sys::CUfunction)> {
+    #[derive(Clone, Copy)]
+    struct FnH(cudarc::driver::sys::CUfunction);
+    unsafe impl Send for FnH {}
+    unsafe impl Sync for FnH {}
+    static V: std::sync::OnceLock<Option<(FnH, FnH)>> = std::sync::OnceLock::new();
+    V.get_or_init(|| gdn_split_load_raw_fns().map(|(a, b)| (FnH(a), FnH(b))))
+        .as_ref()
+        .map(|(a, b)| (a.0, b.0))
 }
 
 /// One-time raw-module fetch of `attn_prefill_fa_b` (the tensor-core fused flash-attention

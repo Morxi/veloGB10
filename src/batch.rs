@@ -1226,9 +1226,47 @@ impl BatchScheduler {
                     None => break,
                 }
             }
+            // F8 diagnosis (temporary, GB10_LOOP_TRACE): split the wall around decode_step so the
+            // serve-vs-bench per-step gap (261 vs 188 ms) can be attributed.
+            let loop_trace = std::env::var("GB10_LOOP_TRACE").is_ok();
+            let t_admit = if loop_trace { Some(std::time::Instant::now()) } else { None };
+            while self.num_active() < self.max_batch
+                  && self.lanes[self.num_active()].is_none() {
+                match self.rx.try_recv() {
+                    Ok(req) => self.admit(req),
+                    Err(_) => break,
+                }
+            }
+            let b = self.num_active();
+            if b == 0 {
+                match self.rx.recv().await {
+                    Some(req) => { self.admit(req); continue; }
+                    None => break,
+                }
+            }
+            let t_step = if loop_trace { Some(std::time::Instant::now()) } else { None };
+            let t_yield0 = if loop_trace { Some(std::time::Instant::now()) } else { None };
             self.decode_step(b);
+            let decode_ms = t_step.map(|t0| t0.elapsed().as_secs_f32() * 1e3);
             // Yield to tokio so streaming handlers can flush SSE events between decode steps.
             tokio::task::yield_now().await;
+            if let (Some(t0), Some(ty0), Some(ta0), Some(dm)) = (t_step, t_yield0, t_admit, decode_ms) {
+                static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                static LAST: std::sync::OnceLock<std::sync::Mutex<std::time::Instant>> =
+                    std::sync::OnceLock::new();
+                let last = LAST.get_or_init(|| std::sync::Mutex::new(std::time::Instant::now()));
+                let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n >= 5 && n < 35 {
+                    let mut prev = last.lock().unwrap();
+                    let since_prev = prev.elapsed().as_secs_f32() * 1e3;
+                    *prev = std::time::Instant::now();
+                    let yield_ms = ty0.elapsed().as_secs_f32() * 1e3 - dm;
+                    let _ = t0;
+                    eprintln!("[loop-trace] step {n}: decode_step={dm:.1}ms post_yield={yield_ms:.1}ms \
+                               admit_ms={:.1} since_prev_total={since_prev:.1}ms",
+                              ta0.elapsed().as_secs_f32() * 1e3);
+                }
+            }
         }
     }
 
@@ -1633,12 +1671,30 @@ impl BatchScheduler {
         // of slop). All inputs are replicated state, so both TP ranks reject identically.
         let mtp_depth = if will_use_mtp { crate::gpu::MAX_AUTO_DEPTH } else { 0 };
         let mtp_headroom = if will_use_mtp { mtp_depth + 8 } else { 1 };
+        // BUG2 fix (2026-09-06, PLAN/FIX_8192_CHAT_TRUNCATION): CLAMP before rejecting. The server
+        // grants room = max_seq_len - plen and cannot see this spec headroom, so with
+        // --max-tokens >= max_seq_len every request that omitted max_tokens asked for the full
+        // room and was REJECTED outright: completion_tokens=0, finish mapped to "length" — a
+        // dead server for every default client (reproduced on master @ 286fdbd: plen 17 +
+        // max_new 65519 + depth 8 + 8 > 65536). A request whose budget doesn't fit must still
+        // generate what the KV cache holds (finish_reason: "length" is the contract for running
+        // short); reject only when NOTHING fits (prompt + headroom alone fill the cache). The
+        // bound this clamp enforces is exactly the one the reject used to enforce, so the
+        // OOB-corruption protection is unchanged.
+        let asked_max_new = max_new;
+        let max_new = max_new.min(self.kv_stride.saturating_sub(plen + mtp_headroom));
+        if max_new < asked_max_new {
+            eprintln!("[req] max_tokens clamped {} -> {} (KV stride {} − plen {plen} − spec headroom \
+                       {mtp_headroom}; finish=length if generation runs out)",
+                      asked_max_new, max_new, self.kv_stride);
+        }
         let reject_msg = if plen >= self.kv_stride {
             Some(format!("prompt is {plen} tokens but the KV cache holds {} — raise --max-seq-len",
                          self.kv_stride))
-        } else if plen + max_new + mtp_headroom > self.kv_stride {
-            Some(format!("plen {plen} + max_new {max_new} + depth {mtp_depth} + 8 exceeds KV stride {} — \
-                          raise --max-seq-len", self.kv_stride))
+        } else if max_new == 0 {
+            Some(format!("plen {plen} + spec headroom {mtp_headroom} leaves no generation room in the \
+                          KV stride {} (asked {asked_max_new}) — raise --max-seq-len",
+                         self.kv_stride))
         } else {
             None
         };
@@ -1657,7 +1713,7 @@ impl BatchScheduler {
             let _ = tx.send(TokEvent::Finish { reason: "context_length_exceeded".to_string() });
             return;
         }
-        let max_new = max_new.min(self.kv_stride - plen - mtp_headroom);
+        // (max_new was already clamped to the KV budget above the reject — BUG2 fix, 2026-09-06.)
 
         // Bound the pool. Safe here: `trim` synchronizes before freeing, and this runs before any GPU
         // work for this request. Without it the pool grows forever — see Pool::trim.

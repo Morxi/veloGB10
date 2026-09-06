@@ -1696,6 +1696,386 @@ extern "C" __global__ __launch_bounds__(GTC_THR, 1) void gdn_chunk_tc_b(
 }
 
 
+// ================== SPLIT CHUNKED GDN PREFILL (F8 P2c', 2026-09-06) ==================
+// The fused gdn_chunk_tc_b serializes C=32-token chunk steps inside ONE block per (head,
+// v-chunk): the heavy per-chunk WY/gram/subst work runs 333 iterations deep in a 48-block grid,
+// so the GPU idles at ~13% occupancy for the whole scan. FlashInfer's decomposition (the
+// recipe's 6.1 ms/layer vs our 37) splits the SERIAL part (the state recurrence — which the WY
+// identity reduces to S' = gamma*S + K'^T V with K' row-scaled by lambda_s*beta_s, NO U/W
+// dependency in exact math) from the per-chunk HEAVY work (grams/W/subst/O — embarrassingly
+// parallel over chunks once every chunk's ENTRY state is materialized).
+//
+//   gdn_chunk_states_b  — kernel H, grid (nh * vchunks): serial walk, ONE lean mma stage per
+//                         chunk (S' = gamma*S + Kt'·V, k=C=32), writing every chunk ENTRY state
+//                         (bf16 — the SAME rounding the fused kernel's SMEM Sb applies each
+//                         chunk boundary) to the scratch [chunk][head][KD][VD].
+//   gdn_chunk_wuo_b     — kernel WUO, grid (chunks, nh, vchunks): the fused kernel's
+//                         staging/A-D-grams/W/subst/Ub-Ulb/O sections VERBATIM, with Sb loaded
+//                         from the scratch instead of carried. No state update, no writeback.
+//
+// Numerics: the state route changes rounding (direct lambda-beta-V vs the WY route through
+// W->subst->U), prefill-only drift of the same class as chunked-vs-seq (~1e-4, tolerance 1e-2);
+// decode/verify keep delta_step_prefill (bit-exact contract). Gate GB10_GDN_SPLIT (=0 restores
+// the fused gdn_chunk_tc_b path).
+
+#define GSC_C 32                    // chunk length — MUST match GTC_C (staging constants shared)
+#define GSC_KD2 (128 + 8)
+#define GSC_CD2 (GSC_C + 8)
+#define GSC_VD2 (GTC_VC + 8)
+#define GSC_THR 256
+
+// --- H: serial state recurrence + per-chunk entry-state materialization ---
+extern "C" __global__ __launch_bounds__(GSC_THR, 1) void gdn_chunk_states_b(
+    float* state, const float* __restrict__ Ks, const float* __restrict__ Vs,
+    const float* __restrict__ Ps, __nv_bfloat16* __restrict__ states_scratch,
+    int kd_vd, int N_nkh)
+{
+    (void)kd_vd;                     // host-guaranteed 128/128; tiles compile-time
+    const int N = N_nkh & 0xFFFFFF;
+    const int ncb = GTC_VC == 64 ? 2 : 1;
+    const int NH_ = (int)(gridDim.x / ncb);
+    const int head = blockIdx.x / ncb;
+    const int bb0 = (blockIdx.x % ncb) * GTC_VC;
+    const int t = threadIdx.x;
+    const int warp = t >> 5, lane = t & 31;
+    const int g = lane >> 2, tq = lane & 3;
+
+    extern __shared__ unsigned char gsc_dyn[];
+    __nv_bfloat16* Sb = (__nv_bfloat16*)gsc_dyn;                 // [KD][VD2] carried state
+    __nv_bfloat16* Kt = Sb + 128 * GSC_VD2;                      // [KD][CD2] scaled K^T
+    __nv_bfloat16* Vb = Kt + 128 * GSC_CD2;                      // [C][VD2]
+    float* lam = (float*)(Vb + GSC_C * GSC_VD2);                 // [C]   lambda_s * beta_s
+    float* bt = lam + GSC_C;                                     // [C]
+    float* lg = bt + GSC_C;                                      // [C+1] log-decay prefix
+
+    // load entry state of chunk 0 (bf16 rounding matches the fused kernel's SMEM carry)
+    const float* S_in = state + ((long long)head * 128) * 128 + bb0;
+    for (int i = t; i < 128 * GTC_VC; i += GSC_THR) {
+        int r = i / GTC_VC, c = i % GTC_VC;
+        Sb[r * GSC_VD2 + c] = f2b(S_in[(long long)r * 128 + c]);
+    }
+
+    const int nchunks = (N + GSC_C - 1) / GSC_C;
+    for (int c0 = 0; c0 < N; c0 += GSC_C) {
+        const int ci = c0 / GSC_C;
+        const int n = min(GSC_C, N - c0);
+        // ---- stage: scaled K^T, V, beta, log-decays ----
+        for (int i = t; i < n * 128; i += GSC_THR) {
+            int s = i / 128, r = i % 128;
+            const long long base = ((long long)(c0 + s) * NH_ + head);
+            Kt[r * GSC_CD2 + s] = f2b(Ks[base * 132 + r]);
+        }
+        for (int i = t; i < n * GTC_VC; i += GSC_THR) {
+            int s = i / GTC_VC, c = i % GTC_VC;
+            const long long base = ((long long)(c0 + s) * NH_ + head);
+            Vb[s * GSC_VD2 + c] = f2b(Vs[base * 128 + bb0 + c]);
+        }
+        __syncthreads();
+        for (int i = t; i < GSC_C; i += GSC_THR) {
+            if (i < n) {
+                const long long base = ((long long)(c0 + i) * NH_ + head);
+                bt[i] = Ps[base * 2 + 0]; lg[i + 1] = Ps[base * 2 + 1];
+            } else { bt[i] = 0.f; lg[i + 1] = 0.f; }
+        }
+        __syncthreads();
+        if (warp == 0 && lane < GSC_C) {          // inclusive scan (same as the fused kernel)
+            float v = lg[lane + 1];
+#pragma unroll
+            for (int o = 1; o < GSC_C; o <<= 1) {
+                float u = __shfl_up_sync(0xFFFFFFFFu, v, o);
+                if ((int)lane >= o) v += u;
+            }
+            lg[lane + 1] = v;
+        }
+        if (t == 0) lg[0] = 0.f;
+        __syncthreads();
+        const float gn = __expf(lg[n]);
+        for (int i = t; i < GSC_C; i += GSC_THR)
+            lam[i] = (i < n) ? __expf(gn - lg[i + 1]) * bt[i] : 0.f;
+        // scale K^T rows by lam (the direct WY-form recurrence operand)
+        for (int i = t; i < n * 128; i += GSC_THR) {
+            int s = i / 128, r = i % 128;
+            Kt[r * GSC_CD2 + s] = f2b(b2f(Kt[r * GSC_CD2 + s]) * lam[s]);
+        }
+        // zero-pad the tail
+        for (int i = t; i < (GSC_C - n) * 128; i += GSC_THR) {
+            int s = n + i / 128, r = i % 128;
+            Kt[r * GSC_CD2 + s] = f2b(0.f);
+        }
+        for (int i = t; i < (GSC_C - n) * GTC_VC; i += GSC_THR)
+            Vb[(n + i / GTC_VC) * GSC_VD2 + (i % GTC_VC)] = f2b(0.f);
+        __syncthreads();
+
+        // ---- materialize the ENTRY state of this chunk ----
+        __nv_bfloat16* S_c = states_scratch + ((long long)ci * NH_ + head) * (128 * 128) + bb0;
+        for (int i = t; i < 128 * GTC_VC; i += GSC_THR) {
+            int r = i / GTC_VC, c = i % GTC_VC;
+            S_c[(long long)r * 128 + c] = Sb[r * GSC_VD2 + c];
+        }
+
+        // ---- S' = gamma*S + Kt'·V  (mma 128x64, k=C) — the ONLY math in the serial walk ----
+        {
+            const int mt = warp;                   // 8 m-tiles of 16 kd-rows
+            float acc[8][4];
+#pragma unroll
+            for (int j = 0; j < 8; j++)
+#pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    const int row = mt * 16 + g + 8 * (e >= 2);
+                    const int col = j * 8 + 2 * tq + (e & 1);
+                    acc[j][e] = gn * b2f(Sb[row * GSC_VD2 + col]);
+                }
+            for (int ks = 0; ks < GSC_C; ks += 16) {
+                const int r0 = mt * 16 + g, r1 = r0 + 8, cc = ks + 4 * tq;
+                unsigned aKt[4] = {
+                    *(const unsigned*)(Kt + r0 * GSC_CD2 + cc), *(const unsigned*)(Kt + r1 * GSC_CD2 + cc),
+                    *(const unsigned*)(Kt + r0 * GSC_CD2 + cc + 2), *(const unsigned*)(Kt + r1 * GSC_CD2 + cc + 2)};
+#pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    const int col = j * 8 + g;
+                    unsigned bV[2] = {
+                        gtc_pack2(b2f(Vb[(ks + 4 * tq) * GSC_VD2 + col]), b2f(Vb[(ks + 4 * tq + 1) * GSC_VD2 + col])),
+                        gtc_pack2(b2f(Vb[(ks + 4 * tq + 2) * GSC_VD2 + col]), b2f(Vb[(ks + 4 * tq + 3) * GSC_VD2 + col]))};
+                    gtc_mma(acc[j], aKt, bV);
+                }
+            }
+#pragma unroll
+            for (int j = 0; j < 8; j++)
+#pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    const int row = mt * 16 + g + 8 * (e >= 2);
+                    const int col = j * 8 + 2 * tq + (e & 1);
+                    Sb[row * GSC_VD2 + col] = f2b(acc[j][e]);
+                }
+        }
+        __syncthreads();
+    }
+
+    // final state writeback (bf16 -> f32), same as the fused kernel
+    float* S_out = state + ((long long)head * 128) * 128 + bb0;
+    for (int i = t; i < 128 * GTC_VC; i += GSC_THR) {
+        int r = i / GTC_VC, c = i % GTC_VC;
+        S_out[(long long)r * 128 + c] = b2f(Sb[r * GSC_VD2 + c]);
+    }
+}
+
+// --- WUO: per-chunk grams/W/subst/O in PARALLEL over (chunk, head, vchunk) ---
+extern "C" __global__ __launch_bounds__(GTC_THR, 1) void gdn_chunk_wuo_b(
+    __nv_bfloat16* core, const float* __restrict__ Qs, const float* __restrict__ Ks,
+    const float* __restrict__ Vs, const float* __restrict__ Ps,
+    const __nv_bfloat16* __restrict__ states_scratch, int N_nkh)
+{
+    const int N = N_nkh & 0xFFFFFF;
+    const int ncb = GTC_VC == 64 ? 2 : 1;
+    const int NH_ = (int)gridDim.y;          // heads (gridDim.y = lin_nh; z = v-chunk)
+    const int chunk = blockIdx.x;
+    const int head = blockIdx.y;
+    const int bb0 = blockIdx.z * GTC_VC;
+    const int c0 = chunk * GSC_C;
+    const int n = min(GSC_C, N - c0);
+    const int t = threadIdx.x;
+    const int warp = t >> 5, lane = t & 31;
+    const int g = lane >> 2, tq = lane & 3;
+    const int C = GSC_C, VC = GTC_VC, KD2 = GSC_KD2, CD2 = GSC_CD2, VD2 = GSC_VD2;
+
+    extern __shared__ unsigned char gwo_dyn[];
+    __nv_bfloat16* Qb = (__nv_bfloat16*)gwo_dyn;                 // [C][KD2]
+    __nv_bfloat16* Kb = Qb + C * KD2;                            // [C][KD2]
+    __nv_bfloat16* Kt = Kb + C * KD2;                            // [KD][CD2]
+    __nv_bfloat16* Vb = Kt + 128 * CD2;                          // [C][VD2]
+    __nv_bfloat16* Db = Vb + C * VD2;                            // [C][CD2]
+    __nv_bfloat16* Ub = Db + C * CD2;                            // [C][VD2]
+    __nv_bfloat16* Ulb = Ub + C * VD2;                           // [C][VD2]
+    __nv_bfloat16* Sb = Ulb + C * VD2;                           // [KD][VD2]  (from scratch)
+    float* Af = (float*)(Sb + 128 * VD2);                        // [C][C]
+    float* Wf = Af + C * C;                                      // [C][VC]
+    float* Of = Wf + C * VC;                                     // [C][VC]  (unused, layout kept)
+    float* bt = Of + C * VC;                                     // [C]
+    float* lg = bt + C;                                          // [C+1]
+
+    // ---- staging (verbatim from the fused kernel, chunk fixed) ----
+    for (int i = t; i < n * 128; i += GTC_THR) {
+        int tt = i / 128, r = i % 128;
+        const long long base = ((long long)(c0 + tt) * NH_ + head);
+        Qb[tt * KD2 + r] = f2b(Qs[base * 132 + r]);
+        const float kv = Ks[base * 132 + r];
+        Kb[tt * KD2 + r] = f2b(kv);
+        Kt[r * CD2 + tt] = f2b(kv);
+    }
+    for (int i = t; i < n * VC; i += GTC_THR) {
+        int tt = i / VC, c = i % VC;
+        const long long base = ((long long)(c0 + tt) * NH_ + head);
+        Vb[tt * VD2 + c] = f2b(Vs[base * 128 + bb0 + c]);
+    }
+    __syncthreads();
+    for (int i = t; i < (C - n) * 128; i += GTC_THR) {
+        int tt = n + i / 128, r = i % 128;
+        Qb[tt * KD2 + r] = f2b(0.f); Kb[tt * KD2 + r] = f2b(0.f); Kt[r * CD2 + tt] = f2b(0.f);
+    }
+    for (int i = t; i < (C - n) * VC; i += GTC_THR)
+        Vb[(n + i / VC) * VD2 + (i % VC)] = f2b(0.f);
+    __syncthreads();
+    for (int i = t; i < C; i += GTC_THR) {
+        if (i < n) {
+            const long long base = ((long long)(c0 + i) * NH_ + head);
+            bt[i] = Ps[base * 2 + 0]; lg[i + 1] = Ps[base * 2 + 1];
+        } else { bt[i] = 0.f; lg[i + 1] = 0.f; }
+    }
+    __syncthreads();
+    if (warp == 0 && lane < C) {
+        float v = lg[lane + 1];
+#pragma unroll
+        for (int o = 1; o < C; o <<= 1) {
+            float u = __shfl_up_sync(0xFFFFFFFFu, v, o);
+            if ((int)lane >= o) v += u;
+        }
+        lg[lane + 1] = v;
+    }
+    if (t == 0) lg[0] = 0.f;
+    __syncthreads();
+
+    // ---- chunk ENTRY state from the H kernel's scratch ----
+    const __nv_bfloat16* S_c = states_scratch + ((long long)chunk * NH_ + head) * (128 * 128) + bb0;
+    for (int i = t; i < 128 * VC; i += GTC_THR) {
+        int r = i / VC, c = i % VC;
+        Sb[r * VD2 + c] = S_c[(long long)r * 128 + c];
+    }
+    __syncthreads();
+
+    // ---- A / D grams (verbatim) ----
+    {
+        const int mt = warp >> 2, nt = warp & 3;
+        float accA[4] = {0,0,0,0}, accD[4] = {0,0,0,0};
+        for (int ks = 0; ks < 128; ks += 16) {
+            const int r0 = mt * 16 + g, r1 = r0 + 8, cc = ks + 4 * tq, s_row = nt * 8 + g;
+            unsigned aK[4] = {
+                *(const unsigned*)(Kb + r0 * KD2 + cc), *(const unsigned*)(Kb + r1 * KD2 + cc),
+                *(const unsigned*)(Kb + r0 * KD2 + cc + 2), *(const unsigned*)(Kb + r1 * KD2 + cc + 2)};
+            unsigned aQ[4] = {
+                *(const unsigned*)(Qb + r0 * KD2 + cc), *(const unsigned*)(Qb + r1 * KD2 + cc),
+                *(const unsigned*)(Qb + r0 * KD2 + cc + 2), *(const unsigned*)(Qb + r1 * KD2 + cc + 2)};
+            unsigned bK[2] = {
+                gtc_pack2(b2f(Kb[s_row * KD2 + cc]), b2f(Kb[s_row * KD2 + cc + 1])),
+                gtc_pack2(b2f(Kb[s_row * KD2 + cc + 2]), b2f(Kb[s_row * KD2 + cc + 3]))};
+            gtc_mma(accA, aK, bK);
+            gtc_mma(accD, aQ, bK);
+        }
+#pragma unroll
+        for (int e = 0; e < 4; e++) {
+            const int row = mt * 16 + g + 8 * (e >= 2);
+            const int scol = nt * 8 + 2 * tq + (e & 1);
+            Af[row * C + scol] = (scol < row) ? accA[e] * __expf(lg[row] - lg[scol + 1]) : 0.f;
+            Db[row * CD2 + scol] =
+                (scol <= row && scol < n) ? f2b(accD[e] * __expf(lg[row + 1] - lg[scol + 1])) : f2b(0.f);
+        }
+    }
+    __syncthreads();
+
+    // ---- W = V - exp(lg[tt+1]) * (K S) (verbatim; Sb from scratch) ----
+    {
+        const int mt = warp >> 2, nt0 = (warp & 3) * 2;
+        float acc[2][4] = {{0,0,0,0},{0,0,0,0}};
+        for (int ks = 0; ks < 128; ks += 16) {
+            const int r0 = mt * 16 + g, r1 = r0 + 8, cc = ks + 4 * tq;
+            unsigned aK[4] = {
+                *(const unsigned*)(Kb + r0 * KD2 + cc), *(const unsigned*)(Kb + r1 * KD2 + cc),
+                *(const unsigned*)(Kb + r0 * KD2 + cc + 2), *(const unsigned*)(Kb + r1 * KD2 + cc + 2)};
+#pragma unroll
+            for (int j = 0; j < 2; j++) {
+                const int col = (nt0 + j) * 8 + g;
+                unsigned bS[2] = {
+                    gtc_pack2(b2f(Sb[(ks + 4 * tq) * VD2 + col]), b2f(Sb[(ks + 4 * tq + 1) * VD2 + col])),
+                    gtc_pack2(b2f(Sb[(ks + 4 * tq + 2) * VD2 + col]), b2f(Sb[(ks + 4 * tq + 3) * VD2 + col]))};
+                gtc_mma(acc[j], aK, bS);
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < 2; j++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const int row = mt * 16 + g + 8 * (e >= 2);
+                const int col = (nt0 + j) * 8 + 2 * tq + (e & 1);
+                const float v = (row < n) ? b2f(Vb[row * VD2 + col]) : 0.f;
+                Wf[row * VC + col] = v - __expf(lg[row + 1]) * acc[j][e];
+            }
+    }
+    __syncthreads();
+
+    // ---- U fwd-substitution (verbatim) ----
+    for (int c = t; c < VC; c += GTC_THR) {
+        for (int tt = 0; tt < n; tt++) {
+            const float b = bt[tt];
+            float acc = b * Wf[tt * VC + c];
+            for (int s = 0; s < tt; s++) acc -= b * Af[tt * C + s] * Wf[s * VC + c];
+            Wf[tt * VC + c] = acc;
+        }
+    }
+    __syncthreads();
+
+    // ---- Ub / Ulb (verbatim) ----
+    {
+        for (int i = t; i < C * VC; i += GTC_THR) {
+            int s = i / VC, c = i % VC;
+            const float u = (s < n) ? Wf[s * VC + c] : 0.f;
+            Ub[s * VD2 + c] = f2b(u);
+            Ulb[s * VD2 + c] = f2b(u * __expf(lg[n] - lg[s + 1]));
+        }
+    }
+    __syncthreads();
+
+    // ---- O = exp(lg[tt+1]) * (Q S) + (D U) (verbatim) ----
+    {
+        const int mt = warp >> 2, nt0 = (warp & 3) * 2;
+        float acc[2][4] = {{0,0,0,0},{0,0,0,0}};
+        for (int ks = 0; ks < 128; ks += 16) {
+            const int r0 = mt * 16 + g, r1 = r0 + 8, cc = ks + 4 * tq;
+            unsigned aQ[4] = {
+                *(const unsigned*)(Qb + r0 * KD2 + cc), *(const unsigned*)(Qb + r1 * KD2 + cc),
+                *(const unsigned*)(Qb + r0 * KD2 + cc + 2), *(const unsigned*)(Qb + r1 * KD2 + cc + 2)};
+#pragma unroll
+            for (int j = 0; j < 2; j++) {
+                const int col = (nt0 + j) * 8 + g;
+                unsigned bS[2] = {
+                    gtc_pack2(b2f(Sb[(ks + 4 * tq) * VD2 + col]), b2f(Sb[(ks + 4 * tq + 1) * VD2 + col])),
+                    gtc_pack2(b2f(Sb[(ks + 4 * tq + 2) * VD2 + col]), b2f(Sb[(ks + 4 * tq + 3) * VD2 + col]))};
+                gtc_mma(acc[j], aQ, bS);
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < 2; j++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const int row = mt * 16 + g + 8 * (e >= 2);
+                const int col = (nt0 + j) * 8 + 2 * tq + (e & 1);
+                acc[j][e] = __expf(lg[row + 1]) * acc[j][e];
+            }
+        for (int ks = 0; ks < C; ks += 16) {
+            const int r0 = mt * 16 + g, r1 = r0 + 8, cc = ks + 4 * tq;
+            unsigned aD[4] = {
+                *(const unsigned*)(Db + r0 * CD2 + cc), *(const unsigned*)(Db + r1 * CD2 + cc),
+                *(const unsigned*)(Db + r0 * CD2 + cc + 2), *(const unsigned*)(Db + r1 * CD2 + cc + 2)};
+#pragma unroll
+            for (int j = 0; j < 2; j++) {
+                const int col = (nt0 + j) * 8 + g;
+                unsigned bU[2] = {
+                    gtc_pack2(b2f(Ub[(ks + 4 * tq) * VD2 + col]), b2f(Ub[(ks + 4 * tq + 1) * VD2 + col])),
+                    gtc_pack2(b2f(Ub[(ks + 4 * tq + 2) * VD2 + col]), b2f(Ub[(ks + 4 * tq + 3) * VD2 + col]))};
+                gtc_mma(acc[j], aD, bU);
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < 2; j++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const int row = mt * 16 + g + 8 * (e >= 2);
+                if (row < n) {
+                    const int col = (nt0 + j) * 8 + 2 * tq + (e & 1);
+                    core[(long long)(c0 + row) * (NH_ * 128) + head * 128 + bb0 + col] = f2b(acc[j][e]);
+                }
+            }
+    }
+}
+
 // Template body: OLDSTAGE=false is the serving path (P0 dense-scratch staging from gdn_prep_b);
 // OLDSTAGE=true is a DIAGNOSTIC variant with the pre-P0 in-kernel staging (normalize + serial
 // dots from qkv/b_in/a_in, scratch args ignored) — selected by GB10_GDN_OLDSTAGE at load, used
