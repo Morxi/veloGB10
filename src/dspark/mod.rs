@@ -18,6 +18,7 @@
 pub mod oracle;
 pub mod synth;
 pub mod load;
+pub mod round;
 
 // ---------------------------------------------------------------------------
 // Anatomy constants (PLAN/B8_S2_WORKDOC.md §3 — authoritative; use as-is).
@@ -69,6 +70,11 @@ pub const N_TENSORS: usize = 62;
 /// Exact parameter count of the checkpoint (reconciled; see `PLAN/B8_S2_WORKDOC.md` §3).
 pub const N_PARAMS: u64 = 1_359_284_737;
 
+/// S7 CLOSE-OUT: sha256 of the REAL published artifact (`model.safetensors`, identical bytes in
+/// Qwen3.8-27B-DSpark{,-512K,-vLLM,-vLLM-512K}; verified against `--probe-dspark-bind`'s
+/// prefix/suffix pin 2026-09-06). Loaders pin the full hex.
+pub const REAL_SHA256: &str = "9d26d5e637551c244d543c67c790bd0947f360e005c569e5851a185ffe692786";
+
 /// Default synthetic-artifact output directory — CWD-relative (never a hardcoded box path;
 /// owner rule 2026-08-23), overridable via DSPARK_SYNTH_DIR or the CLI value.
 pub const DEFAULT_SYNTH_DIR: &str = "dspark-synth-qwen38";
@@ -84,26 +90,26 @@ pub const SYNTH_EMBED_HEAD_SEED: u64 = 0xE11B_2026_D5A2_0002;
 
 /// The 62-tensor inventory in a FIXED, deterministic order (globals first, then layers 0..4).
 ///
-/// Every tensor is BF16. Shapes are the workdoc §3 table verbatim. `markov.W1.weight` is the
-/// `Embedding(248320→256)` table (stored `[num_embeddings, embedding_dim]`); `markov.W2.weight` is
-/// the `Linear(256→248320, no bias)` weight stored `[out, in]` — both are `[248320, 256]`.
-/// `confidence.weight` is `[1, 5376]` (Linear(5376→1) over `[h ∥ latent]`); `confidence.bias` is
-/// the single scalar bias in the whole model.
+/// Every tensor is BF16. Shapes are the workdoc §3 table verbatim. `markov_head.markov_w1.weight`
+/// is the `Embedding(248320→256)` table (stored `[num_embeddings, embedding_dim]`);
+/// `markov_head.markov_w2.weight` is the `Linear(256→248320, no bias)` weight stored `[out, in]` —
+/// both are `[248320, 256]`. `confidence_head.proj.weight` is `[1, 5376]` (Linear(5376→1) over
+/// `[h ∥ latent]`); `confidence_head.proj.bias` is the single scalar bias in the whole model.
 ///
-/// NOTE (DECISION-K, REVALIDATE AT S7): the exact tensor-name strings are not on disk (no
-/// `dflash.py`/`dspark.py` reference). These names follow the DFlash-backbone convention the
-/// addendum cites (`layers.{i}.self_attn.*`, `layers.{i}.mlp.*`, `fc.weight`, `hidden_norm.weight`,
-/// `norm.weight`) extended with the Markov/confidence head names from Table A1. S7's real-artifact
-/// bind probe maps any name drift.
+/// S7 CLOSE-OUT (2026-09-06, DECISION-K resolved): the real checkpoint's safetensors header
+/// (sha256 `9d26d5e6…fe692786`, 62 tensors, all BF16, params == N_PARAMS) uses the
+/// `markov_head.markov_w1/w2` + `confidence_head.proj.*` names — the earlier DFlash-convention
+/// guesses (`markov.W1` / `confidence.*`) never existed on disk. The synth generator writes the
+/// real names, so the oracle/probe contract is unchanged.
 pub fn inventory() -> Vec<(String, Vec<usize>)> {
     let mut v = Vec::with_capacity(N_TENSORS);
     v.push(("fc.weight".to_string(), vec![HIDDEN, TAP_CONCAT_DIM]));
     v.push(("hidden_norm.weight".to_string(), vec![HIDDEN]));
     v.push(("norm.weight".to_string(), vec![HIDDEN]));
-    v.push(("markov.W1.weight".to_string(), vec![VOCAB, MARKOV_RANK]));
-    v.push(("markov.W2.weight".to_string(), vec![VOCAB, MARKOV_RANK]));
-    v.push(("confidence.weight".to_string(), vec![1, CONF_IN_DIM]));
-    v.push(("confidence.bias".to_string(), vec![1]));
+    v.push(("markov_head.markov_w1.weight".to_string(), vec![VOCAB, MARKOV_RANK]));
+    v.push(("markov_head.markov_w2.weight".to_string(), vec![VOCAB, MARKOV_RANK]));
+    v.push(("confidence_head.proj.weight".to_string(), vec![1, CONF_IN_DIM]));
+    v.push(("confidence_head.proj.bias".to_string(), vec![1]));
     for i in 0..N_LAYERS {
         let lp = format!("layers.{i}");
         v.push((format!("{lp}.self_attn.q_proj.weight"), vec![HIDDEN, HIDDEN]));

@@ -9,6 +9,8 @@ pub mod gpu;
 pub mod quant;
 pub mod mxfp4;
 pub mod batch;
+pub mod tel;
+pub mod dispatch_assert;
 pub mod kernels;
 pub mod sampler;
 pub mod tools;
@@ -37,6 +39,7 @@ pub mod dsv4_dspark;
 pub mod dflash;
 pub mod dspark;
 pub mod dflash2;
+pub mod json_schema;
 
 use serde::Serialize;
 
@@ -79,6 +82,14 @@ pub fn make_timings(
         prompt_per_second: if prompt_ms > 0.0 { prompt_len as f64 * 1e3 / prompt_ms } else { 0.0 },
         predicted_per_second: if predicted_ms > 0.0 { n as f64 * 1e3 / predicted_ms } else { 0.0 },
     }
+}
+
+/// The drafter-artifact directory as an ENV KNOB (diagnostics/harness plumbing; the user-facing
+/// surface is the CLI flag `--draft-dir`, resolved in `resolve_draft_dir`). Generic name
+/// `GB10_DRAFT_DIR`; P14's first spelling `GB10_DFLASH_DIR` survives as a deprecated alias that
+/// warns once (AGENTS §7).
+pub fn draft_dir_env() -> Option<String> {
+    env_knob("GB10_DRAFT_DIR", "GB10_DFLASH_DIR")
 }
 
 /// Resolve a generic (family-agnostic) env knob, honoring a deprecated family-prefixed alias.

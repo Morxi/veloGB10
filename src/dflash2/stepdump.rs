@@ -32,7 +32,7 @@ use std::sync::Arc;
 use serde::Serialize;
 
 use crate::dflash2::capture::Df2PrimeSink;
-use crate::dflash2::{BLOCK, HIDDEN, TAP_CONCAT_DIM, TAP_LAYERS};
+use crate::dflash2::{block, HIDDEN, TAP_CONCAT_DIM, TAP_LAYERS};
 
 /// The number of steps whose RAW h_final is retained (the oracle-replay window).
 pub const RAW_STEPS: usize = 64;
@@ -281,9 +281,9 @@ impl StepDump {
 
     /// Per-layer × per-column checksums of the fed-span staging (the JSONL tap fingerprint).
     pub fn tap_checksums(staging: &[half::bf16]) -> Vec<u64> {
-        let mut ck = Vec::with_capacity(TAP_LAYERS.len() * BLOCK);
+        let mut ck = Vec::with_capacity(TAP_LAYERS.len() * block());
         for li in 0..TAP_LAYERS.len() {
-            for m in 0..BLOCK {
+            for m in 0..block() {
                 let off = m * TAP_CONCAT_DIM + li * HIDDEN;
                 let words: Vec<u16> = staging[off..off + HIDDEN].iter().map(|b| b.to_bits()).collect();
                 ck.push(fnv64(&words));
@@ -309,7 +309,7 @@ impl StepDump {
         let _ = self.jsonl.write_all(line.as_bytes());
         let _ = self.jsonl.write_all(b"\n");
         if let Some(hf) = h_final {
-            if r.step < RAW_STEPS as u64 && hf.len() == BLOCK * HIDDEN {
+            if r.step < RAW_STEPS as u64 && hf.len() == block() * HIDDEN {
                 let bytes: &[u8] = bytemuck::cast_slice(hf);
                 let _ = self.hfinal.write_all(bytes);
             }

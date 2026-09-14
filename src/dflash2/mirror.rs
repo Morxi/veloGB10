@@ -840,12 +840,14 @@ pub fn head_logits_mirror(w_flat: &[bf16], x: &[f32], rows: usize, hidden: usize
 /// ASCENDING 8-warp sum, then s = unary + w. Identical bf16 inputs → bitwise-equal scores.
 /// `hp` = [7][256] (bf16 values as f32), `cand`/`unary` = [7][16], codebooks row-major bf16.
 pub fn round_walk_mirror(hp: &[f32], cand: &[u32], unary: &[f32], anchor: u32,
-                         pred_cb: &[bf16], succ_cb: &[bf16], rank: usize)
+                         pred_cb: &[bf16], succ_cb: &[bf16], rank: usize, nlevels: usize)
     -> (Vec<u32>, Vec<f32>) {
-    let mut tokens = vec![0u32; 7];
-    let mut scores = vec![0.0f32; 7 * 16];
+    // DF2 block-16: `nlevels` is the live chain length (block-1: 7 or 15). The device walk's
+    // trip count is the same parameter, so the mirror must be told it rather than assume 7.
+    let mut tokens = vec![0u32; nlevels];
+    let mut scores = vec![0.0f32; nlevels * 16];
     let mut prev = anchor as usize;
-    for p in 0..7 {
+    for p in 0..nlevels {
         let prow = &pred_cb[prev * rank..(prev + 1) * rank];
         let hpr = &hp[p * rank..(p + 1) * rank];
         let a: Vec<f32> = (0..rank).map(|r| prow[r].to_f32() * hpr[r]).collect();

@@ -199,7 +199,7 @@ fn print_help() {
     println!("                             behavior bit-identically. Applies to --head --dspark");
     println!("                             AND --server-dspark on.");
     println!("    --dspark-fp8-head <on|off> fp8_bsb draft LM head + Markov W2 (halve the draft");
-    println!("                             head reads; item 1.7(i)). ON by default (user decision");
+    println!("    --fp8-prefill <on|off>    native e4m3 W8A8 prefill GEMM (FP8 trunks; needs --mxfp4=on); rides TpConfig");    println!("                             head reads; item 1.7(i)). ON by default (user decision");
     println!("                             2026-08-05); OFF = the bf16 draft head. Draft-side only:");
     println!("                             LOSSLESS preserved, acceptance may shift at near-ties.");
     println!("                             Rides TpConfig (SPMD).");
@@ -236,13 +236,35 @@ fn print_help() {
     println!("                             taps; negative controls; determinism; perf vs 15.21 ms.");
     println!("    --df2-capture <on|off>    S4F: arm the trunk tap capture (DEFAULT OFF - with it off");
     println!("                             the capture branch is dead: free. Rides TpConfig under TP.");
-    println!("    --spec-source <src>       S5F: the speculation source {{mtp,dflash2,none}} (default");
-    println!("                             mtp — routing UNCHANGED; dflash2 serves via the S4F");
-    println!("                             integrated round at b==1, falling back to MTP when the");
-    println!("                             artifact is absent/failed (never a hard failure); none =");
-    println!("                             plain decode. S6F owns per-domain routing.");
-    println!("    --draft-dir <dir>         S5F: the DFlash2 artifact dir for --spec-source=dflash2");
+    println!("    --spec-source <src>       THE speculation selector, one knob for every drafting");
+    println!("                             path: {{mtp,dspark,dflash2,dflash2-rq,dflash2-auto,");
+    println!("                             dflash2-tree,dflash,none}} (default mtp — routing");
+    println!("                             UNCHANGED; dflash2* serves via the S4F integrated round at");
+    println!("                             b==1, falling back to MTP when no artifact is supplied;");
+    println!("                             none = plain decode. S6F owns per-domain routing.");
+    println!("                             `dflash` = the P14 z-lab DFlash v1 BLOCK drafter: greedy");
+    println!("                             b==1 lanes only, serves via MTP for anything else");
+    println!("                             (prefix-cache reuse, sampled, schema requests). OPT-IN and");
+    println!("                             off in every default posture; works at TP=1 and --tp N");
+    println!("                             (the lane is installed on EVERY rank — SPMD mirror).");
+    println!("    --draft-dir <dir>         THE drafter artifact dir for EVERY source above");
+    println!("                             (dflash2*, dspark, dflash). MANDATORY when --spec-source");
+    println!("                             explicitly names a drafter that cannot run without one;");
+    println!("                             optional for dflash2-auto/mtp/none (no dir = MTP");
+    println!("                             fallback). A dir that does not exist always stops the app,");
+    println!("                             and a failed load refuses to start — never a silent");
+    println!("                             downgrade. Env equivalent: GB10_DRAFT_DIR.");
+    println!("                             (`--dflash-dir` / GB10_DFLASH_DIR are DEPRECATED P14-era");
+    println!("                             aliases for the dflash source only; they warn and will be");
+    println!("                             removed.)");
     println!("    --df2-round-shard <on|off> P2: shard the DFlash2 drafter round across the TP ranks");
+    println!("    --df2-carry <on|off>       Keep DFlash2 in the draft seat across a prefix-cache");
+    println!("                               hit (default off). Off = a cache hit falls back to MTP,");
+    println!("                               which on prefix-heavy traffic is most requests.");
+    println!("    --df2-block <8|16>         DFlash2 draft block (default 8). 16 = anchor + 15x MASK,");
+    println!("                               verify width 16 = MAX_VERIFY. Block 16 is refused with");
+    println!("                               --spec-source dflash2-tree (the tree needs up to 31 cols).");
+    println!("                               The draft artifacts are block-agnostic: no re-bake.");
     println!("                               (TP>2 only; head+selector stay replicated; the sharded");
     println!("                               round adds 2 all-reduces/layer on the trunk's AR path).  [on]");
     println!("    --df2-prose-lane <lane>    P3(b) L1: prose (General) routing under --spec-source");
@@ -250,6 +272,10 @@ fn print_help() {
     println!("                               GREEDY (temp-0) requests, rq for sampled (DEFAULT,");
     println!("                               P3(a) close quad sweep); rq = always the real-q walk.");
     println!("                             --draft-dir <dir> is REQUIRED (no default).");
+    println!("    --probe-dspark-round <dir> WI1 GATE: the DSpark round on GPU vs the CPU oracle");
+    println!("                             (synthetic taps at ctx 8 then 16 via prime + inject:");
+    println!("                             h_final rel-L2, markov-chain tokens EXACT on the device");
+    println!("                             logits, latents + confidence head EXACT).");
     println!("    --probe-df2-prime         S5F GATE: prompt-prime correctness — prime_window == the");
     println!("                             proven chunked path on the SAME taps (ring k/v bitwise);");
     println!("                             prefill-captured vs decode-captured tap delta + drafts.");
@@ -301,10 +327,21 @@ fn print_help() {
     println!("  --bench-accept           Acceptance diagnosis by target confidence / n-gram run");
     println!("  --bench-mtp-sample       Distribution gate for stochastic MTP (chi-square)");
     println!("  --bench-tree             Tree-verify byte gate (RESULT: TREE_OK)");
-    println!("  --bench-lanes            Batched-verify-across-lanes byte gate (RESULT: LANES_OK)");
+    println!("  --bench-lanes            Batched-verify-across-lanes byte gate, pairs + packs p=2..5 (RESULT: LANES_OK)");
     println!("  --bench-prefill          Pure prefill timing (TTFT proxy) [--seq-len N]");
     println!("  --probe-binv             Batch-invariance: col 0 bit-identical N=1..16 (prints PASS)");
+    println!("  --probe-dispatch         Dispatch assert: N<=16 never takes the prefill dequant arm,");
+    println!("                           and N=17 DOES (the negative control that makes it non-vacuous)");
     println!("  --probe-state            GDN recurrent-state divergence probe (must be 0.0)");
+    println!("  --tripwire <posture>     Permanent pool/OOB tripwire: off|observe|assert (default off;");
+    println!("                           assert is downgraded to observe on a TP rank). Counters move");
+    println!("                           in every posture — a `debug_assert!` used to be dead in release");
+    println!("  --tripwire-selftest      Negative control: provokes a footprint violation (the ccaa234");
+    println!("                           incident arithmetic + a real slack overwrite) and REQUIRES the");
+    println!("                           tripwire to fire; exits 0 only if all four legs hold");
+    println!("  --pool-census            Per-allocation (site, req, footprint, pad, bucket) census of the");
+    println!("                           prefill path + per-prefill-window (n, tp64) records. NEVER on");
+    println!("                           for a timing run");
     println!("  --probe-reject           Reject-path checkpoint/rollback 3-way probe");
     println!("  --probe-gemm             cuBLAS bf16 GEMM per-shape batch-invariance audit");
     println!("  --probe-tq [goldens-dir] TurboQuant KV kernel validation vs the E4 reference");
@@ -329,10 +366,13 @@ fn print_help() {
     println!("  SESSION BEHAVIOR FLAGS (env aliases in parentheses, back-compat; CLI wins)");
     println!("════════════════════════════════════════════════════════════════════════════════");
     println!();
-    println!("  --kv-cache bf16|q4|tq|k8v4  KV cache format (q4 = 4-bit GB10_KV_QUANT; tq = 3.5-bit");
+    println!("  --kv-cache bf16|q4|tq|k8v4|k8v8  KV cache format (q4 = 4-bit GB10_KV_QUANT; tq = 3.5-bit");
     println!("                           TurboQuant GB10_KV_TQ=1; k8v4 = int8-K + q4-V GB10_KV_K8V4=1;");
     println!("                           =0 restores bf16/q4 byte-for-byte)");
     println!("  --reasoning-effort <e>   reasoning level in the chat template (no_think|low|high|medium|xhigh)");
+    println!("  --thinking <mode>        server: engine's thinking override — auto (default: pass nothing, the");
+    println!("                           model's own chat_template.jinja decides) | on | off. Per-request");
+    println!("                           override: chat_template_kwargs.enable_thinking");
     println!("  --output-prompts [n]     server: log each chat request human-readable (params, messages,");
     println!("                           rendered prompt, first n chars; default n=6000, absent = off)");
     println!("                           (default: model's own template default — xhigh for Qwen, low for hy_v3)");
@@ -403,7 +443,51 @@ fn load_model_gpu(dir: &str, tp_rank: Option<i32>, world: i32)
 
 fn main() {
     let args: Vec<String> = env::args().collect();
+    // DF2 block-16: resolve the draft block FIRST, before any DFlash2 buffer or round is built.
+    // It is a process global read by every sizing/launch site in src/dflash2/, so it must be
+    // installed once and never changed; block 8 reproduces today's allocations and launches
+    // exactly, which is what makes flag-off identity structural rather than re-verified.
+    // (On a TP node the head's value arrives on TpConfig and is installed at the node install
+    // site below — a node is never given --df2-block by hand.)
+    if let Some(v) = parse_arg(&args, "--df2-block") {
+        let b: usize = v.parse().unwrap_or_else(|_| {
+            panic!("--df2-block must be 8 or 16 (got '{v}')")
+        });
+        gb10_inference::dflash2::set_block(b).unwrap_or_else(|e| panic!("--df2-block: {e}"));
+    }
     cli_env_bridge(&args);
+
+    // ---- PLAN/TRIPWIRE_SPEC.md (P10 W2): the permanent host-side OOB / alloc tripwire --------
+    // `--tripwire <off|observe|assert>` sets the posture; `--pool-census` turns on the per-alloc
+    // census (never for a timing run); `--tripwire-selftest` is the negative control and exits.
+    {
+        use gb10_inference::gpu::{census_set, tripwire_set, Tripwire};
+        match parse_arg(&args, "--tripwire") {
+            None | Some("off") => tripwire_set(Tripwire::Off),
+            Some("observe") => tripwire_set(Tripwire::Observe),
+            Some("assert") => {
+                // Spec §5.8: under TP an asymmetric abort is WORSE than the bug it reports (the
+                // FIX #4 rank-asymmetry amplifier killed a node and tripped the TP watchdog). The
+                // downgrade is deterministic, so both ranks agree on the posture.
+                let world = parse_tp_world(&args).unwrap_or(1);
+                if world > 1 {
+                    eprintln!("[tripwire] --tripwire assert DOWNGRADED to observe: this process is a \
+                               TP rank (world={world}); an asymmetric abort is worse than the bug");
+                    tripwire_set(Tripwire::Observe);
+                } else {
+                    tripwire_set(Tripwire::Assert);
+                }
+            }
+            Some(other) => {
+                eprintln!("--tripwire must be off|observe|assert (got '{other}')");
+                std::process::exit(1);
+            }
+        }
+        census_set(args.iter().any(|a| a == "--pool-census"));
+        if args.iter().any(|a| a == "--tripwire-selftest") {
+            std::process::exit(gb10_inference::gpu::tripwire_selftest());
+        }
+    }
 
     if args.iter().any(|a| a == "--help" || a == "-h") {
         print_help();
@@ -564,6 +648,15 @@ fn main() {
         run_probe_dflash2(&args, &dir);
         return;
     }
+    if args.iter().any(|a| a == "--probe-dspark-round" || a.starts_with("--probe-dspark-round=")) {
+        // value on the flag itself, else --draft-dir (the same convention as --probe-df2-round)
+        let dir = parse_arg(&args, "--probe-dspark-round").filter(|v| !v.starts_with("--"))
+            .or_else(|| parse_arg(&args, "--draft-dir"))
+            .map(str::to_string)
+            .unwrap_or_else(|| panic!("--probe-dspark-round needs <draft-dir> (on the flag or --draft-dir)"));
+        run_probe_dspark_round(&args, &dir);
+        return;
+    }
     if args.iter().any(|a| a == "--probe-df2-draft" || a.starts_with("--probe-df2-draft=")) {
         let dir = required_dir_arg(&args, "--draft-dir", "the DFlash2 draft artifact for --probe-df2-draft");
         run_probe_df2_draft(&args, &dir);
@@ -626,6 +719,15 @@ fn main() {
         let dir = parse_arg(&args, "--model-dir").expect("--probe-binv requires --model-dir <DIR>");
         let (gpu, _) = load_model_gpu(dir, None, 1);
         if !gpu.probe_binv() { std::process::exit(1); }
+        return;
+    }
+    // DISPATCH_ASSERT (PLAN/DISPATCH_ASSERT_SPEC.md): the AGENTS §6 rule as a machine-checked test.
+    // Asserts BOTH directions of the dispatch invariant and requires the cliff to be observable.
+    if args.iter().any(|a| a == "--probe-dispatch") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-dispatch requires --model-dir <DIR>");
+        gb10_inference::dispatch_assert::set_posture(gb10_inference::dispatch_assert::POSTURE_ASSERT);
+        let (gpu, _) = load_model_gpu(dir, None, 1);
+        if !gpu.probe_dispatch() { std::process::exit(1); }
         return;
     }
     // TP4-campaign Step-0 audit: per-rank weight accounting. `--rank R --world W` reproduces the
@@ -803,6 +905,38 @@ fn main() {
         std::env::set_var("GB10_MXFP4", "1");   // native mode at load (OMMA modules resident)
         let (gpu, _) = load_model_gpu(dir, None, 1);
         gpu.probe_mxfp4_fused();
+        return;
+    }
+    // P14 DFlash v1 local lane probe (single process, greedy):
+    //   ./gb10_inference --probe-dflash-local /tmp/p14_ctx --model-dir <35B> \
+    //        --dflash-dir <DFlash artifact> --prompt "..." --max-new-tokens N --max-seq-len M
+    // Runs the v1 draft/verify/accept loop and writes the real-tap DFCT + tokens.json (the torch
+    // oracle input) at <prefix>.dfct / <prefix>.tokens.json.
+    if args.iter().any(|a| a == "--probe-dflash-local") {
+        let i = args.iter().position(|a| a == "--probe-dflash-local").unwrap();
+        let out_prefix = args.get(i + 1).filter(|s| !s.starts_with("--"))
+            .cloned().unwrap_or_else(|| "/tmp/p14_ctx".to_string());
+        let dir = parse_arg(&args, "--model-dir")
+            .expect("--probe-dflash-local requires --model-dir <target DIR>").to_string();
+        let ddir = resolve_draft_dir(&args, Some(gb10_inference::batch::SpecSource::DFlash))
+            .expect("--probe-dflash-local requires --draft-dir <DIR> (or GB10_DRAFT_DIR)");
+        // the trunk's tap sink arms at load; set BOTH spellings so a harness that still exports the
+        // P14-era alias keeps working (readers inside the engine use the generic name)
+        std::env::set_var("GB10_DRAFT_DIR", &ddir);
+        std::env::set_var("GB10_DFLASH_DIR", &ddir);
+        let (gpu, _) = gb10_inference::gpu::GpuModel::load_from_dir(&dir).expect("model load");
+        let tokenizer = QwenTokenizer::from_file(&format!("{}/tokenizer.json", dir.trim_end_matches('/')))
+            .expect("tokenizer");
+        let prompt_text = parse_arg(&args, "--prompt").unwrap_or(
+            "The invention of the printing press in the fifteenth century changed Europe forever.");
+        let max_new: usize = parse_arg(&args, "--max-new-tokens").and_then(|s| s.parse().ok()).unwrap_or(32);
+        let max_seq_len: usize = parse_arg(&args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(2048);
+        let prompt = tokenizer.encode(prompt_text, true).expect("encode");
+        println!("probe-dflash-local: prompt {} tokens, max_new={max_new}, max_seq_len={max_seq_len}, drafter {ddir}",
+                 prompt.len());
+        let out = gpu.dflash_generate_local(&ddir, &prompt, max_new, max_seq_len, Some(&out_prefix));
+        println!("TOKENS: {}", out.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(","));
+        println!("TEXT: {}", tokenizer.decode(&out, true).unwrap_or_default());
         return;
     }
     // MXFP4-native Phase A (quality fix): CROSS-CHAIN quality instrument — the same real prompt
@@ -1236,6 +1370,13 @@ fn cli_env_bridge(args: &[String]) {
     fn set(args: &[String], flag: &str, var: &str) {
         if args.iter().any(|a| a == flag) { std::env::set_var(var, "1"); }
     }
+    // F8/P1: --fp8-prefill on|off — the native e4m3 W8A8 prefill lane. Bridged HERE so
+    // EVERY entry path (server/probe/bench) sees it before the PF8_ON OnceLock reads the
+    // env. Under --tp the flag ALSO rides TpConfig (the node installs the env) — the
+    // bridge covers the head, TpConfig covers the ranks.
+    if let Some(v) = parse_arg(args, "--fp8-prefill") {
+        if matches!(&v[..], "on" | "true" | "1" | "yes") { std::env::set_var("GB10_FP8_PREFILL", "1"); }
+    }
     // TP feature flags.
     set(args, "--tp-fp32-partials", "GB10_TP_FP32_PARTIALS");
     set(args, "--tp-graph", "GB10_TP_GRAPH");
@@ -1273,9 +1414,10 @@ fn cli_env_bridge(args: &[String]) {
             "q4" => { std::env::set_var("GB10_KV_QUANT", "1"); std::env::remove_var("GB10_KV_TQ"); std::env::remove_var("GB10_KV_K8V4"); }
             "tq" => { std::env::set_var("GB10_KV_TQ", "1"); std::env::remove_var("GB10_KV_QUANT"); std::env::remove_var("GB10_KV_K8V4"); }
             "tq3" => { std::env::set_var("GB10_KV_TQ", "3"); std::env::remove_var("GB10_KV_QUANT"); std::env::remove_var("GB10_KV_K8V4"); }
-            "k8v4" => { std::env::set_var("GB10_KV_K8V4", "1"); std::env::remove_var("GB10_KV_QUANT"); std::env::remove_var("GB10_KV_TQ"); }
+            "k8v4" => { std::env::set_var("GB10_KV_K8V4", "1"); std::env::remove_var("GB10_KV_QUANT"); std::env::remove_var("GB10_KV_TQ"); std::env::remove_var("GB10_KV_K8V8"); }
+            "k8v8" => { std::env::set_var("GB10_KV_K8V8", "1"); std::env::remove_var("GB10_KV_QUANT"); std::env::remove_var("GB10_KV_TQ"); std::env::remove_var("GB10_KV_K8V4"); }
             "bf16" => { std::env::remove_var("GB10_KV_QUANT"); std::env::remove_var("GB10_KV_TQ"); std::env::remove_var("GB10_KV_K8V4"); }
-            other => { eprintln!("--kv-cache must be bf16|q4|tq|tq3|k8v4 (got '{other}')"); std::process::exit(1); }
+            other => { eprintln!("--kv-cache must be bf16|q4|tq|tq3|k8v4|k8v8 (got '{other}')"); std::process::exit(1); }
         }
     }
     // MTP: unify the bench-path GB10_TP_MTP env with the server CLI (`--mtp=on|off`, `--mtp-depth`).
@@ -1338,24 +1480,1102 @@ fn required_dir_arg(args: &[String], flag: &str, what: &str) -> String {
 /// dflash2-auto) — the user asked for that drafter, so a missing/bad dir stops the app. With
 /// any other source (or none given — the default dflash2-auto resolves to the MTP fallback
 /// when no artifact is supplied) the flag is OPTIONAL: None = serve via MTP, no hard failure.
-/// A flag that IS provided but points nowhere is always a hard stop, whatever the source.
-fn resolve_df2_draft_dir(args: &[String]) -> Option<String> {
-    let explicit_df2 = parse_arg(args, "--spec-source")
-        .map(|sv| gb10_inference::batch::SpecSource::from_cli(&sv.to_lowercase())
-             .map(gb10_inference::batch::is_df2_src).unwrap_or(false))
-        .unwrap_or(false);
-    if explicit_df2 {
-        Some(required_dir_arg(args, "--draft-dir",
-                              "the DFlash2 draft artifact (--spec-source names a DFlash2 source)"))
-    } else {
-        parse_arg(args, "--draft-dir").map(|d| {
-            if !std::path::Path::new(d).is_dir() {
-                eprintln!("FATAL: --draft-dir directory does not exist: {d}");
-                std::process::exit(2);
-            }
+/// One-time deprecation notice for a superseded spelling (AGENTS §7: a family-prefixed name lives
+/// on only as a back-compat alias that WARNS — silent aliases keep the old spelling alive forever).
+fn warn_deprecated_alias(old: &str, new: &str) {
+    use std::sync::Once;
+    static FLAG: Once = Once::new();
+    static ENV: Once = Once::new();
+    let w = if old.contains("--") { &FLAG } else { &ENV };
+    w.call_once(|| eprintln!("[warn] {old} is deprecated — use {new} (still honored for now)"));
+}
+
+/// Does `--spec-source` name a drafter that CANNOT run without an artifact? An explicit drafter
+/// source makes `--draft-dir` mandatory (the user asked for that lane: a missing or bad dir stops
+/// the app, never a silent MTP downgrade); `dflash2-auto`/`mtp`/`none` may serve without one.
+fn draft_source_requires_artifact(src: Option<gb10_inference::batch::SpecSource>) -> bool {
+    use gb10_inference::batch::SpecSource as S;
+    matches!(src, Some(S::DFlash) | Some(S::DFlash2) | Some(S::DFlash2Rq)
+                  | Some(S::DFlash2Tree) | Some(S::Dspark))
+}
+
+/// THE drafter-artifact resolver — ONE flag, `--draft-dir <dir>`, for every speculative source
+/// (`--spec-source` is the only selector; AGENTS §7 "one knob, one generic name"). Precedence:
+///
+///   `--draft-dir`  >  `--dflash-dir`  >  `GB10_DRAFT_DIR`  >  `GB10_DFLASH_DIR`
+///                     (deprecated,        (generic env:      (deprecated alias,
+///                      v1 source only)     any source)        v1 source only)
+///
+/// The two deprecated spellings are P14's first interface for the v1 block drafter and are honored
+/// ONLY for that source — so an existing command line or launcher keeps working while a
+/// `--dflash-dir` can never silently stand in for a DF2/DSpark artifact.
+///
+/// A flag or env var that IS provided but points nowhere is always a hard stop, whatever the source.
+fn resolve_draft_dir(args: &[String], src: Option<gb10_inference::batch::SpecSource>) -> Option<String> {
+    let is_v1 = matches!(src, Some(gb10_inference::batch::SpecSource::DFlash));
+    let from_flag = parse_arg(args, "--draft-dir").map(str::to_string).or_else(|| {
+        if !is_v1 { return None; }
+        parse_arg(args, "--dflash-dir").map(|d| {
+            warn_deprecated_alias("--dflash-dir", "--draft-dir");
             d.to_string()
         })
+    });
+    let dir = match from_flag {
+        Some(d) => Some(d),
+        // The generic env knob is honored for every source; the P14-era DFLASH alias only for v1.
+        // `env_knob` prints its own one-time deprecation warning when the alias wins.
+        None if is_v1 => gb10_inference::env_knob("GB10_DRAFT_DIR", "GB10_DFLASH_DIR"),
+        None => std::env::var("GB10_DRAFT_DIR").ok(),
+    };
+    match dir {
+        Some(d) => {
+            if !std::path::Path::new(&d).is_dir() {
+                eprintln!("FATAL: drafter artifact directory does not exist: {d}");
+                std::process::exit(2);
+            }
+            Some(d)
+        }
+        None if draft_source_requires_artifact(src) => {
+            eprintln!("FATAL: --spec-source {} requires --draft-dir <artifact dir> \
+                       (or GB10_DRAFT_DIR); there is no default path",
+                      src.map(|s| s.cli_name()).unwrap_or("?"));
+            std::process::exit(2);
+        }
+        None => None,
     }
+}
+
+/// WI1 GATE: the DSpark round on GPU vs the CPU oracle (`dspark::oracle`), self-contained —
+/// NO trunk load: the borrowed embed/head are the oracle's own deterministic synthetic tables
+/// (SYNTH_EMBED_HEAD_SEED), materialized once to bf16 so the device gathers EXACTLY what the
+/// oracle generates (up to bf16 rounding, which the rel-L2 gates absorb; the chain gate runs
+/// the host markov chain on the DEVICE logits, so token EXACTness carries zero tolerance
+/// risk). Synthetic taps at ctx 8 (prime_window), then +8 injected (inject_dev) → ctx 16 —
+/// the second round exercises the ring attention over injected context.
+fn run_probe_dspark_round(args: &[String], draft_dir: &str) {
+    use gb10_inference::dflash2::round::BorrowedW;
+    use gb10_inference::dflash2::synth::SyntheticTables;
+    use cudarc::driver::DevicePtr;
+    use gb10_inference::dspark::oracle::{DsparkConfig, DsparkOracle, RoundCtx};
+    use gb10_inference::dspark::{load as ds_load, HIDDEN as DH, MARKOV_RANK, TAP_CONCAT_DIM, VOCAB as DV};
+    use half::bf16;
+
+    let pin = parse_arg(args, "--sha256");
+    let all_pass = std::cell::Cell::new(true);
+    let check = |name: &str, ok: bool| {
+        println!("  [{:6}] {name}", if ok { "PASS" } else { "FAIL" });
+        if !ok { all_pass.set(false); }
+    };
+    let rel_l2 = |a: &[f32], b: &[f32]| -> f64 {
+        let mut num = 0.0f64; let mut den = 0.0f64;
+        for i in 0..a.len().min(b.len()) {
+            let dd = (a[i] - b[i]) as f64;
+            num += dd * dd; den += (b[i] as f64) * (b[i] as f64);
+        }
+        (num / den.max(1e-30)).sqrt()
+    };
+
+    // ---- Part 0: artifact + oracle (host) ---------------------------------
+    println!("== loads ==");
+    let t0 = std::time::Instant::now();
+    let art = ds_load::load(draft_dir, pin).expect("DSpark artifact load");
+    println!("  artifact: {} tensors, {} params, sha {}… ({:.1}s)",
+             art.n_tensors, art.n_params, &art.sha256[..16], t0.elapsed().as_secs_f32());
+    let oracle = DsparkOracle::from_weights(DsparkConfig::default(), art.weights.clone())
+        .expect("oracle build");
+
+    // ---- Part 1: the round on GPU with synthetic borrowed tables ----------
+    let dev = cudarc::driver::CudaDevice::new(0).expect("CudaDevice");
+    let synth = SyntheticTables::new(gb10_inference::dspark::SYNTH_EMBED_HEAD_SEED);
+    let scale = 1.0f32 / (DH as f32).sqrt();
+    fn materialize(synth: &SyntheticTables, table: u64, scale: f32,
+                   dev: &std::sync::Arc<cudarc::driver::CudaDevice>)
+                   -> std::sync::Arc<cudarc::driver::CudaSlice<bf16>> {
+        let mut out = vec![bf16::default(); DV * DH];
+        let nthreads = std::env::var("GB10_DF2_MIRROR_THREADS").ok()
+            .and_then(|v| v.parse::<usize>().ok()).filter(|&n| (1..=16).contains(&n)).unwrap_or(8);
+        let rows_per = (DV + nthreads - 1) / nthreads;
+        std::thread::scope(|sc| {
+            let mut rest = out.as_mut_slice();
+            let mut r0 = 0usize;
+            for t in 0..nthreads {
+                let r1 = if t == nthreads - 1 { DV } else { (r0 + rows_per).min(DV) };
+                if r0 >= r1 { break; }
+                let (a, b) = rest.split_at_mut((r1 - r0) * DH);
+                rest = b;
+                let base = r0;
+                r0 = r1;
+                sc.spawn(move || {
+                    for (i, row) in a.chunks_mut(DH).enumerate() {
+                        let v = synth.row(table, (base + i) as u32, DH, scale);
+                        for (d, x) in row.iter_mut().enumerate() {
+                            *x = bf16::from_f32(v[d]);
+                        }
+                    }
+                });
+            }
+        });
+        std::sync::Arc::new(dev.htod_sync_copy(&out).expect("table upload"))
+    }
+    let t1 = std::time::Instant::now();
+    let embed_tbl = materialize(&synth, SyntheticTables::TABLE_EMBED, scale, &dev);
+    let head_tbl = materialize(&synth, SyntheticTables::TABLE_HEAD, scale, &dev);
+    println!("  synthetic embed+head tables materialized ({:.1}s)", t1.elapsed().as_secs_f32());
+    let head_w = BorrowedW::Bf16 { ptr: *head_tbl.device_ptr() as u64 };
+    let embed_w = BorrowedW::Bf16 { ptr: *embed_tbl.device_ptr() as u64 };
+    let mut round = gb10_inference::dspark::round::DsparkRound::load_pinned(
+        draft_dir, Some(head_w), Some(embed_w), 4096, pin).expect("DsparkRound load");
+
+    // ---- REAL-TAPS mode: replay the SERVED dspark steps offline on the captured taps with the
+    // REAL trunk embed+lm_head (outside.safetensors), walking prime → per-step inject → draft
+    // exactly as the lane did. Agreement with the served drafts proves the round consumed the
+    // captured taps faithfully; disagreement with the TRUNK then localizes to tap content or
+    // artifact semantics — never to the lane plumbing.
+    if let Some(dir) = parse_arg(args, "--real-taps") {
+        let trunk_dir = parse_arg(args, "--embed-from")
+            .unwrap_or("models/Qwen3.8-27B-FP8").to_string();
+        let load_outside = |key: &str| -> Vec<bf16> {
+            use std::io::{Read, Seek, SeekFrom};
+            let path = format!("{}/outside.safetensors", trunk_dir.trim_end_matches('/'));
+            let mut f = std::fs::File::open(&path).expect("open outside.safetensors");
+            let mut hb = [0u8; 8];
+            f.read_exact(&mut hb).unwrap();
+            let n = u64::from_le_bytes(hb) as usize;
+            let mut hdr = vec![0u8; n];
+            f.read_exact(&mut hdr).unwrap();
+            let h: serde_json::Value = serde_json::from_slice(&hdr).expect("header json");
+            let e = h.get(key).unwrap_or_else(|| panic!("{key} missing from outside.safetensors"));
+            let off = e["data_offsets"][0].as_u64().unwrap();
+            let len = e["data_offsets"][1].as_u64().unwrap() - off;
+            assert_eq!(e["dtype"].as_str().unwrap(), "BF16", "{key} not BF16");
+            f.seek(SeekFrom::Start(8 + n as u64 + off)).unwrap();
+            let mut raw = vec![0u8; len as usize];
+            f.read_exact(&mut raw).expect("tensor bytes");
+            raw.chunks_exact(2).map(|c| bf16::from_le_bytes([c[0], c[1]])).collect()
+        };
+        let t_embed = std::time::Instant::now();
+        let embed_real = dev.htod_sync_copy(&load_outside("model.language_model.embed_tokens.weight"))
+            .expect("embed upload");
+        let head_real = dev.htod_sync_copy(&load_outside("lm_head.weight")).expect("head upload");
+        println!("  real trunk embed+lm_head loaded ({:.1}s)", t_embed.elapsed().as_secs_f32());
+        drop(round);   // the synth-table round; rebuild with the real tables
+        drop((embed_tbl, head_tbl));   // free the 5 GB synth tables before the trunk loads
+        let head_w = BorrowedW::Bf16 { ptr: *head_real.device_ptr() as u64 };
+        let embed_w = BorrowedW::Bf16 { ptr: *embed_real.device_ptr() as u64 };
+        let mut round = gb10_inference::dspark::round::DsparkRound::load_pinned(
+            draft_dir, Some(head_w), Some(embed_w), 4096, pin).expect("DsparkRound load (real tables)");
+
+        // captured inputs: walk every request dir r{N} (GB10_DSPARK_DUMP_STEPS steps each)
+        let mut reqdirs: Vec<usize> = std::fs::read_dir(dir).expect("dump dir")
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let n = e.file_name().to_string_lossy().to_string();
+                n.strip_prefix('r').and_then(|s| s.parse::<usize>().ok())
+            })
+            .collect();
+        reqdirs.sort_unstable();
+        let list = |meta: &str, key: &str| -> Vec<u32> {
+            meta.lines().find(|l| l.starts_with(key))
+                .and_then(|l| l.split('[').nth(1)).and_then(|r| r.split(']').next())
+                .map(|r| r.split(',').filter_map(|x| x.trim().parse::<u32>().ok()).collect())
+                .unwrap_or_default()
+        };
+        let mut grand_match = 0usize; let mut grand_steps = 0usize; let mut grand_d0 = 0usize;
+        // chain-formula tally: cur (base+resid, as served) vs base-only, per chain position
+        let mut cur_hit = [0usize; 7]; let mut base_hit = [0usize; 7]; let mut chain_n = 0usize;
+        let rank = MARKOV_RANK;
+        let w1 = &oracle.weights.w1;
+        let w2 = &oracle.weights.w2;
+        let argmx = |v: &[f32]| -> usize {
+            let mut bi = 0usize; let mut bv = f32::NEG_INFINITY;
+            for (i, x) in v.iter().enumerate() { if *x > bv { bv = *x; bi = i; } }
+            bi
+        };
+        for &r in &reqdirs {
+            let rdir = format!("{dir}/r{r}");
+            let raw = match std::fs::read(format!("{rdir}/taps_wide.bin")) { Ok(x) => x, Err(_) => continue };
+            let plen = raw.len() / (2 * TAP_CONCAT_DIM);
+            let mut taps: Vec<bf16> = Vec::with_capacity(plen * TAP_CONCAT_DIM);
+            for c in raw.chunks_exact(2) { taps.push(bf16::from_le_bytes([c[0], c[1]])); }
+            let steps_meta: Vec<(u32, Vec<u32>, Vec<u32>, usize)> = (0..24).filter_map(|k| {
+                let meta = std::fs::read_to_string(format!("{rdir}/step{k}/meta.txt")).ok()?;
+                let anchor = meta.lines().find(|l| l.starts_with("anchor"))?
+                    .split_whitespace().nth(1)?.parse().ok()?;
+                let nacc: usize = meta.lines().find(|l| l.starts_with("nacc"))?
+                    .split_whitespace().nth(1)?.parse().ok()?;
+                Some((anchor, list(&meta, "drafts"), list(&meta, "preds"), nacc))
+            }).collect();
+            if steps_meta.is_empty() { continue; }
+            println!("== r{r}: {plen} prime cols, {} captured steps ==", steps_meta.len());
+            round.reset();
+            let taps_dev = dev.htod_sync_copy(&taps).expect("taps upload");
+            round.prime_window(&taps_dev, plen, 0).expect("prime real taps");
+            for (k, &(anchor, ref served, ref preds, nacc)) in steps_meta.iter().enumerate() {
+                let dev_toks = round.draft_round_dev(anchor).expect("draft replay");
+                let m = (nacc + 1).min(8);
+                let same = dev_toks[..7.min(dev_toks.len())] == served[..7.min(served.len())];
+                let d0ok = dev_toks.first() == preds.first();
+                grand_match += same as usize; grand_steps += 1; grand_d0 += d0ok as usize;
+                // per-position formula table: the round now runs the REFERENCE chain (bias at
+                // every position, prev seeded by the ANCHOR); the dump's row k contains
+                // resid(prev_k) with prev_0 = anchor. Strip with the SERVED chain's prevs to
+                // recover base rows, then re-chain base-only host-side. (On OLD dumps —
+                // pre-anchor-bias rounds — row 0 carried no resid, so only rows k>=1 compare.)
+                if let Ok(lraw) = std::fs::read(format!("{rdir}/step{k}/logits.bin")) {
+                    if lraw.len() >= 7 * DV * 4 {
+                        let lg: Vec<f32> = lraw.chunks_exact(4)
+                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                        chain_n += 1;
+                        let mut toks_b = [0u32; 7];
+                        let mut prev_s = anchor as usize;
+                        for kk in 0..7 {
+                            if preds.get(kk).copied() == Some(served.get(kk).copied().unwrap_or(0)) {
+                                cur_hit[kk] += 1;
+                            }
+                            // strip the served chain's resid (prev = served chain's own prev)
+                            let w1s = &w1[prev_s * rank..(prev_s + 1) * rank];
+                            let mut base = vec![0.0f32; DV];
+                            for o in 0..DV {
+                                let w2row = &w2[o * rank..(o + 1) * rank];
+                                let mut s = 0.0f32;
+                                for i in 0..rank { s += w2row[i] * w1s[i]; }
+                                base[o] = lg[kk * DV + o] - s;
+                            }
+                            if kk + 1 < served.len() { prev_s = served[kk] as usize; }
+                            toks_b[kk] = argmx(&base) as u32;
+                            if preds.get(kk) == Some(&toks_b[kk]) { base_hit[kk] += 1; }
+                        }
+                    }
+                }
+                if k < 2 || !same || !d0ok {
+                    println!("  r{r} step{k}: anchor {anchor} | replay {dev_toks:?} | served {served:?} | trunk d0 {} | replay==served {same} d0==trunk {d0ok}",
+                             preds.first().map(|x| x.to_string()).unwrap_or_default());
+                }
+                let sraw = std::fs::read(format!("{rdir}/step{k}/staging.bin")).expect("staging");
+                let st: Vec<bf16> = sraw.chunks_exact(2).map(|c| bf16::from_le_bytes([c[0], c[1]])).collect();
+                assert_eq!(st.len(), 8 * TAP_CONCAT_DIM, "staging dump must be 8 columns");
+                let mut chunk_f = vec![0.0f32; 8 * TAP_CONCAT_DIM];
+                for (i, b) in st.iter().enumerate() { chunk_f[i] = b.to_f32(); }
+                round.upload_chunk(&chunk_f).expect("upload chunk");
+                round.inject_dev(m).expect("inject");
+            }
+        }
+        println!("  replay==served on {grand_match}/{grand_steps} steps; d0==trunk on {grand_d0}/{grand_steps} steps");
+        println!("  chain per-position trunk-hits (n={chain_n}): served(base+resid) {cur_hit:?} | base-only {base_hit:?}");
+        check("real-taps replay reproduces served drafts", grand_steps > 0 && grand_match == grand_steps);
+
+        // ---- Ground-truth compare (--with-trunk): prefill-capture the SAME positions the
+        // decode-capture fed the ring, and diff. The prime (prefill) capture is PROVEN good —
+        // step 0's d0 matched the trunk — so its columns for positions 61..63 are ground truth.
+        if args.iter().any(|a| a == "--with-trunk" || a == "--gt-reprime") && reqdirs.first() == Some(&0) {
+            let gt_reprime = args.iter().any(|a| a == "--gt-reprime");
+            let rdir0 = format!("{dir}/r0");
+            let prow = std::fs::read(format!("{rdir0}/prompt.bin")).expect("prompt.bin");
+            let prompt: Vec<u32> = prow.chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            let (mut gpu, _) = load_model_gpu(&trunk_dir, None, 1);
+            let (_r2, _sink, prime2) = load_dspark_round_dir(&mut gpu, 4096, draft_dir, None)
+                .expect("dspark triple");
+            gpu.set_dspark_prime_sink(prime2.clone());
+            let max_seq_len = (prompt.len() + 256).next_power_of_two();
+            let mut pool = gb10_inference::gpu::Pool::new(gpu.dev().clone());
+            let kv_stride = max_seq_len;
+            let mut prime_cols = |ptoks: &[u32]| -> Vec<f32> {
+                let mut state = gpu.new_batch_state(1, 1, max_seq_len);
+                let (_t, _h) = gpu.prefill_batch(&mut pool, ptoks, &mut state, 0, kv_stride, 0);
+                gpu.sync_stream();
+                let cols: Vec<half::bf16> = gpu.dev().dtoh_sync_copy(&prime2.taps).unwrap();
+                let n = ptoks.len().min(cols.len() / TAP_CONCAT_DIM);
+                cols[..n * TAP_CONCAT_DIM].iter().map(|b| b.to_f32()).collect()
+            };
+            let col = |taps: &[f32], c: usize| -> Vec<f32> {
+                taps[c * TAP_CONCAT_DIM..(c + 1) * TAP_CONCAT_DIM].to_vec()
+            };
+            // ---- The tap-noise discriminator: re-prime the ring from PREFILL ground-truth taps
+            // of the true committed stream (zero decode-capture/FP8-verify noise) and measure
+            // the d0 hit-rate vs the served 9/24 baseline. Jump ⇒ the gap is tap noise; flat ⇒
+            // artifact semantics. true stream = prompt ++ [anchor_0] ++ per-step preds[0..nacc+1);
+            // at step k the ring holds taps[0..nprev) = all but the last token (lag-one design).
+            if gt_reprime {
+                let steps_meta: Vec<(u32, Vec<u32>, Vec<u32>, usize)> = (0..24).filter_map(|k| {
+                    let meta = std::fs::read_to_string(format!("{rdir0}/step{k}/meta.txt")).ok()?;
+                    let anchor = meta.lines().find(|l| l.starts_with("anchor"))?
+                        .split_whitespace().nth(1)?.parse().ok()?;
+                    let nacc: usize = meta.lines().find(|l| l.starts_with("nacc"))?
+                        .split_whitespace().nth(1)?.parse().ok()?;
+                    let ls = |key: &str| -> Vec<u32> {
+                        meta.lines().find(|l| l.starts_with(key))
+                            .and_then(|l| l.split('[').nth(1)).and_then(|r| r.split(']').next())
+                            .map(|r| r.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+                            .unwrap_or_default()
+                    };
+                    Some((anchor, ls("drafts"), ls("preds"), nacc))
+                }).collect();
+                let mut stream = prompt.clone();
+                stream.push(steps_meta[0].0);   // anchor_0 at position 61
+                let mut hits = 0usize;
+                println!("  [gt-reprime] re-priming from prefill GT taps per step …");
+                for (k, (anchor, _served, preds, nacc)) in steps_meta.iter().enumerate() {
+                    let np = stream.len() - 1;          // nprev: ring rows [0..np)
+                    let mut gt = prime_cols(&stream[..np]); // GT taps for [0..np)
+                    // A/B: reverse the 5 tap chunks per column (fc pairing convention)
+                    if std::env::var("GB10_DSPARK_TAP_REV").map(|v| v == "1").unwrap_or(false) {
+                        let c5 = TAP_CONCAT_DIM / 5;
+                        for col in gt.chunks_mut(TAP_CONCAT_DIM) {
+                            for i in 0..2 {
+                                for j in 0..c5 {
+                                    let (a, b) = (i * c5 + j, (4 - i) * c5 + j);
+                                    col.swap(a, b);
+                                }
+                            }
+                        }
+                    }
+                    let tb: Vec<bf16> = gt.iter().map(|&x| bf16::from_f32(x)).collect();
+                    round.reset();
+                    let tdev = dev.htod_sync_copy(&tb).expect("gt taps upload");
+                    round.prime_window(&tdev, np, 0).expect("gt prime");
+                    let toks = round.draft_round_dev(*anchor).expect("gt draft");
+                    let ok = toks.first() == preds.first();
+                    hits += ok as usize;
+                    if k < 4 || ok {
+                        println!("  [gt-reprime] step{k}: anchor {anchor} d0 {} (trunk {}) {}",
+                                 toks[0], preds.first().unwrap_or(&0), if ok { "HIT" } else { "miss" });
+                    }
+                    stream.extend(preds.iter().take(nacc + 1));
+                }
+                println!("  [gt-reprime] d0==trunk on {hits}/{} steps (served-noise baseline: 9/24)",
+                         steps_meta.len());
+                check("gt-reprime improves d0 hit-rate over the noise baseline", hits > 9);
+            }
+            // sanity: prime capture of the prompt == the serving taps_wide
+            let raw0 = std::fs::read(format!("{rdir0}/taps_wide.bin")).expect("taps_wide r0");
+            let taps0: Vec<f32> = raw0.chunks_exact(2)
+                .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32()).collect();
+            let cap61 = prime_cols(&prompt);
+            let rel = rel_l2(&cap61, &taps0);
+            println!("  [gt] prime-capture(prompt) vs serving taps_wide relL2 {rel:.3e} (expect ~0)");
+            // ground truth for positions 61, 62 (the injected rows)
+            let mut p2 = prompt.clone(); p2.push(1596);
+            let cap62 = prime_cols(&p2);
+            let mut p3 = p2.clone(); p3.push(1144);
+            let cap63 = prime_cols(&p3);
+            // decode-captured staging (step0) cols 0,1
+            let sraw0 = std::fs::read(format!("{rdir0}/step0/staging.bin")).expect("staging0");
+            let st0: Vec<f32> = sraw0.chunks_exact(2)
+                .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32()).collect();
+            let r61 = rel_l2(&col(&st0, 0), &col(&cap62, 61));
+            let r62 = rel_l2(&col(&st0, 1), &col(&cap63, 62));
+            println!("  [gt] decode-capture col0 (1596@61) vs prefill GT: relL2 {r61:.3e}");
+            println!("  [gt] decode-capture col1 (1144@62) vs prefill GT: relL2 {r62:.3e}");
+            check("gt: decode capture matches prefill GT (col0)", r61 < 5e-2);
+            check("gt: decode capture matches prefill GT (col1)", r62 < 5e-2);
+        }
+        if !all_pass.get() { std::process::exit(1); }
+        println!("RESULT: REAL_TAPS_OK");
+        return;
+    }
+
+    // (The earlier oracle-on-real-taps branch was folded into the replay above: with the REAL
+    // embed+head the replay subsumes it, and the synth-table oracle comparison was uninformative
+    // — the anchor embed was synthetic garbage.)
+
+    // synthetic taps: 16 rows (8 prime + 8 inject), one deterministic generator
+    let tap_scale = 0.5f32;
+    let mut taps_rm = vec![0.0f32; 16 * TAP_CONCAT_DIM];   // row-major [16, 25600]
+    for i in 0..16 {
+        let r = synth.row(SyntheticTables::TABLE_TAPS, i as u32, TAP_CONCAT_DIM, tap_scale);
+        taps_rm[i * TAP_CONCAT_DIM..(i + 1) * TAP_CONCAT_DIM].copy_from_slice(&r);
+    }
+    // the gemm x convention is TOKEN-major (column c at c*inn) — the prime buffer is just the
+    // first 8 tap ROWS, contiguous (row-major [8, 25600])
+    let taps_b: Vec<bf16> = taps_rm[..8 * TAP_CONCAT_DIM].iter().map(|&x| bf16::from_f32(x)).collect();
+    let taps_dev = dev.htod_sync_copy(&taps_b).expect("taps upload");
+
+    // host replicate of the ctx-KV write (k/v_proj + perhead k_norm + rope at offset
+    // positions) — isolates prime/inject ring content from the block pass
+    let ctx_kv_rep = |li: usize, th_rows: &[f32], m: usize, pos0: usize| -> (Vec<f32>, Vec<f32>) {
+        let l = &art.weights.layers[li];
+        let lin = |wv: &[f32], x: &[f32], outn: usize, inn: usize, rows: usize| -> Vec<f32> {
+            let mut o = vec![0.0f32; rows * outn];
+            for r in 0..rows {
+                for oi in 0..outn {
+                    let wr = &wv[oi * inn..(oi + 1) * inn];
+                    let mut acc = 0.0f32;
+                    for i in 0..inn { acc += wr[i] * x[r * inn + i]; }
+                    o[r * outn + oi] = acc;
+                }
+            }
+            o
+        };
+        let freqs = gb10_inference::dspark::oracle::yaarn_freqs(128, 1e7, 32.0, 8192, 32, 1);
+        let mut k = lin(&l.k_proj, th_rows, 8 * 128, DH, m);
+        let v = lin(&l.v_proj, th_rows, 8 * 128, DH, m);
+        for r in 0..m {
+            for h2 in 0..8usize {
+                let base = (r * 8 + h2) * 128;
+                let ss: f32 = k[base..base + 128].iter().map(|x| x * x).sum();
+                let inv = 1.0f32 / (ss / 128.0 + 1e-6).sqrt();
+                for d2 in 0..128 { k[base + d2] *= inv * l.k_norm[d2]; }
+            }
+        }
+        // rope: NeoX half-split (j, j+64) with the YaRN mscale folded into cos/sin — the
+        // reference conventions now shared by the round, the oracle, and this replicate.
+        let mscale = 0.1f32 * 32.0f32.ln() + 1.0f32;
+        for r in 0..m {
+            for h2 in 0..8usize {
+                let base = (r * 8 + h2) * 128;
+                for j in 0..64usize {
+                    let ang = (pos0 + r) as f32 * freqs[j];
+                    let (c, sn) = (ang.cos() * mscale, ang.sin() * mscale);
+                    let x1 = k[base + j];
+                    let x2 = k[base + 64 + j];
+                    k[base + j] = x1 * c - x2 * sn;
+                    k[base + 64 + j] = x2 * c + x1 * sn;
+                }
+            }
+        }
+        (k, v)
+    };
+    let kv_gate = |tag: &str, li: usize, rows_off: usize, m: usize, th_rows: &[f32],
+                   round: &gb10_inference::dspark::round::DsparkRound| {
+        let (kd, vd) = round.dump_kv_rows(li, rows_off + m).expect("dump_kv_rows");
+        let (kh, vh) = ctx_kv_rep(li, th_rows, m, rows_off);
+        // both sides → (kvh, r_local, d): the device dump covers rows [0, off+m) per kvh
+        // (R = off+m, row r of kvh h at h*R*stride + r*stride); the host replicate covers the
+        // m new rows (r, kvh, d). Restrict the device to [off, off+m) and reorder to match.
+        let big_r = rows_off + m;
+        // device dump (kvh, r, d): element (h, r) starts at h*big_r*128 + r*128
+        let mut kd2 = Vec::with_capacity(8 * m * 128);
+        let mut vd2 = Vec::with_capacity(8 * m * 128);
+        for h in 0..8usize {
+            for r in rows_off..big_r {
+                let base = h * big_r * 128 + r * 128;
+                kd2.extend_from_slice(&kd[base..base + 128]);
+                vd2.extend_from_slice(&vd[base..base + 128]);
+            }
+        }
+        // host replicate (r, kvh, d): row r starts at r*(8*128)
+        let mut kh2 = Vec::with_capacity(8 * m * 128);
+        let mut vh2 = Vec::with_capacity(8 * m * 128);
+        for h in 0..8usize {
+            for r in 0..m {
+                let base = r * (8 * 128) + h * 128;
+                kh2.extend_from_slice(&kh[base..base + 128]);
+                vh2.extend_from_slice(&vh[base..base + 128]);
+            }
+        }
+        let rlk = rel_l2(&kd2, &kh2);
+        let rlv = rel_l2(&vd2, &vh2);
+        check(&format!("{tag} L{li} ctx-KV k relL2 {rlk:.3e} < 5e-3"), rlk < 5e-3);
+        check(&format!("{tag} L{li} ctx-KV v relL2 {rlv:.3e} < 5e-3"), rlv < 5e-3);
+    };
+
+    let run_round_checks = |tag: &str, anchor_tok: u32, ctx_rows: usize,
+                            round: &mut gb10_inference::dspark::round::DsparkRound,
+                            oracle: &DsparkOracle| {
+        println!("== {tag}: ctx {ctx_rows}, anchor {anchor_tok} ==");
+        // device round
+        let toks_dev = round.draft_round_dev(anchor_tok).expect("draft_round_dev");
+        let h_dev = round.read_h_final().expect("read_h_final");
+        let lg_dev = round.dump_logits().expect("dump_logits");
+        let lat_dev = round.read_latents().expect("read_latents");
+        // oracle on the SAME taps
+        let ctx = RoundCtx {
+            tap_hiddens: taps_rm[..ctx_rows * TAP_CONCAT_DIM].to_vec(),
+            anchor: anchor_tok,
+            confidence_threshold: 0.15,
+        };
+        let out = oracle.run_round(&ctx);
+        // gate 1: h_final rel-L2 (bf16 device staging vs f32 oracle) — all 7 rows
+        let h_or = out.h.clone();
+        let rl = rel_l2(&h_dev, &h_or);
+        // gate 1b: the device round is a BF16-STAGING implementation (every stage boundary
+        // rounds to bf16) vs the oracle's f32; the gap compounds through the 5 layers +
+        // attention (~1e-1 at ctx 16). DF2 head-gate precedent: documented rel-L2, not a
+        // defect. A STRUCTURAL bug (layout/rope/ring) shows up as ~1.0; the gate catches that.
+        check(&format!("{tag} h_final relL2 {rl:.3e} < 2e-1 (bf16-staging documented)"), rl < 2e-1);
+        // gate 2: the markov chain on the DEVICE logits (exact); dump_logits is token-major
+        // [7, VOCAB] — the oracle chain's own layout.
+        let lg0 = lg_dev;
+        let mo = oracle.markov_chain(&lg0, anchor_tok);
+        check(&format!("{tag} chain tokens EXACT (dev {:?} vs host {:?})",
+                       &toks_dev[..7], &mo.tokens[..]),
+              toks_dev[..7] == mo.tokens);
+        // gate 3: latents exact (both f32 upcasts of the same bf16 W1 rows)
+        let maxd = lat_dev.iter().zip(mo.latents.iter())
+            .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        check(&format!("{tag} latents EXACT (max|d| {maxd:.3e})"), maxd == 0.0);
+        // gate 4: confidence head. 4a (SHARP): the host mirror vs the oracle on the SAME
+        // device h readback + latents — identical f32 inputs, identical accumulation order →
+        // EXACT. This isolates mirror correctness from inherited h noise. 4b (diagnostic):
+        // survival vs the oracle's own f32 h — the sigmoid amplifies the bf16-staging h gap
+        // (relL2 ~2.7e-2) nonlinearly; under the reference norm magnitudes one position can
+        // swing ~0.5. Adaptive verify is OFF in serving (confidence is diagnostic-only), so
+        // this arm documents the inherited variance rather than gating on it.
+        let (_, survival, k_verify) = round.confidence(&h_dev, &lat_dev);
+        let co_mirror = oracle.confidence(&h_dev, &lat_dev, 0.15);
+        let mmax = survival.iter().zip(co_mirror.survival.iter())
+            .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        check(&format!("{tag} confidence mirror on same h (max|d| {mmax:.3e} < 1e-6; f32 sigmoid-branch ulps)"), mmax < 1e-6);
+        let mut pmax = 0.0f32;
+        for k in 0..6 {
+            pmax = pmax.max((survival[k] - out.survival[k]).abs());
+        }
+        check(&format!("{tag} confidence survival (oracle-f32-h) max|d| {pmax:.3e} < 5e-1 (k_verify {k_verify} vs {}; inherited bf16-staging h gap, documented)",
+                       out.k_verify), pmax < 5e-1);
+        // gate 5: full logits rel-L2 vs the oracle's synth head (the borrowed-head path gate;
+        // bf16 rounding of the table + binv accumulation order → loose bound)
+        let rl_lg = rel_l2(&lg0, &out.logits0);
+        check(&format!("{tag} logits relL2 {rl_lg:.3e} < 5e-1 (bf16-staging documented)"), rl_lg < 5e-1);
+    };
+
+    let run_round_checks_ctx0 = |tag: &str, anchor_tok: u32,
+                                 round: &mut gb10_inference::dspark::round::DsparkRound,
+                                 oracle: &DsparkOracle| {
+        println!("== {tag} ==");
+        let toks_dev = round.draft_round_dev(anchor_tok).expect("draft_round_dev ctx0");
+        let h_dev = round.read_h_final().expect("read_h_final ctx0");
+        let lg_dev = round.dump_logits().expect("dump_logits ctx0");
+        let ctx = RoundCtx {
+            tap_hiddens: Vec::new(),
+            anchor: anchor_tok,
+            confidence_threshold: 0.15,
+        };
+        let out = oracle.run_round(&ctx);
+        let h_or = out.h.clone();
+        let rl = rel_l2(&h_dev, &h_or);
+        // gate 1b: the device round is a BF16-STAGING implementation (every stage boundary
+        // rounds to bf16) vs the oracle's f32; the gap compounds through the 5 layers +
+        // attention (~1e-1 at ctx 16). DF2 head-gate precedent: documented rel-L2, not a
+        // defect. A STRUCTURAL bug (layout/rope/ring) shows up as ~1.0; the gate catches that.
+        check(&format!("{tag} h_final relL2 {rl:.3e} < 2e-1 (bf16-staging documented)"), rl < 2e-1);
+        // dump_logits is already token-major [7, VOCAB] = the oracle's logits0 layout
+        check(&format!("{tag} chain tokens EXACT"),
+              { let mo = oracle.markov_chain(&lg_dev, anchor_tok); toks_dev[..7] == mo.tokens });
+        let rl_lg = rel_l2(&lg_dev, &out.logits0);
+        check(&format!("{tag} logits relL2 {rl_lg:.3e} < 5e-1 (bf16-staging documented)"), rl_lg < 5e-1);
+    };
+
+    // ---- Round 0: ctx 0 (no prime) — isolates the BLOCK PASS (embed → layers → head) from
+    // ---- the prime/ring-write path. The oracle runs the same empty-ctx round.
+    run_round_checks_ctx0("round0 ctx0", 777, &mut round, &oracle);
+
+    // ---- Round 1: prime ctx 8, draft from anchor 1234 ---------------------
+    round.prime_window(&taps_dev, 8, 0).expect("prime_window 8");
+    {
+        // th gate: prime's fc+hidden_norm vs the oracle's tap projection (rows 0..8)
+        let th_dev = round.dump_th(8).expect("dump_th");
+        let ctx = RoundCtx {
+            tap_hiddens: taps_rm[..8 * TAP_CONCAT_DIM].to_vec(),
+            anchor: 1234,
+            confidence_threshold: 0.15,
+        };
+        let out = oracle.run_round(&ctx);
+        let rl = rel_l2(&th_dev, &out.th);
+        check(&format!("prime th relL2 {rl:.3e} < 2e-2"), rl < 2e-2);
+    }
+    run_round_checks("round1 ctx8", 1234, 8, &mut round, &oracle);
+    // ctx-KV gates: prime rows [0..8) at positions [0..8) — the oracle's own th feeds the host
+    // replicate, so this isolates k/v_proj + k_norm + rope + the ring write from the block pass.
+    for li in [0usize, 4] {
+        let th_prime = oracle.tap_project(&taps_rm[..8 * TAP_CONCAT_DIM], 8);
+        kv_gate("prime-ctx8", li, 0, 8, &th_prime, &round);
+    }
+
+    // ---- K-pipeline stage bisect: gemm → norm → rope → ring write, one layer, vs host. ----
+    {
+        let li = 0usize;
+        let th8 = oracle.tap_project(&taps_rm[..8 * TAP_CONCAT_DIM], 8);
+        let (g, nr, rp, ring) = round.probe_k_pipeline(li, &th8, 8, 0).expect("probe_k_pipeline");
+        // host stages
+        let l = &art.weights.layers[li];
+        let lin = |wv: &[f32], x: &[f32], outn: usize, inn: usize, rows: usize| -> Vec<f32> {
+            let mut o = vec![0.0f32; rows * outn];
+            for r in 0..rows {
+                for oi in 0..outn {
+                    let wr = &wv[oi * inn..(oi + 1) * inn];
+                    let mut acc = 0.0f32;
+                    for i in 0..inn { acc += wr[i] * x[r * inn + i]; }
+                    o[r * outn + oi] = acc;
+                }
+            }
+            o
+        };
+        let hg = lin(&l.k_proj, &th8, 8 * 128, DH, 8);
+        let mut hn = hg.clone();
+        for r in 0..8 {
+            for h2 in 0..8usize {
+                let base = (r * 8 + h2) * 128;
+                let ss: f32 = hn[base..base + 128].iter().map(|x| x * x).sum();
+                let inv = 1.0f32 / (ss / 128.0 + 1e-6).sqrt();
+                for d2 in 0..128 { hn[base + d2] *= inv * l.k_norm[d2]; }
+            }
+        }
+        let freqs = gb10_inference::dspark::oracle::yaarn_freqs(128, 1e7, 32.0, 8192, 32, 1);
+        let mscale = 0.1f32 * 32.0f32.ln() + 1.0f32;
+        let mut hr = hn.clone();
+        for r in 0..8 {
+            for h2 in 0..8usize {
+                let base = (r * 8 + h2) * 128;
+                for j in 0..64usize {
+                    let ang = r as f32 * freqs[j];
+                    let (c, sn) = (ang.cos() * mscale, ang.sin() * mscale);
+                    let x1 = hr[base + j];
+                    let x2 = hr[base + 64 + j];
+                    hr[base + j] = x1 * c - x2 * sn;
+                    hr[base + 64 + j] = x2 * c + x1 * sn;
+                }
+            }
+        }
+        // device stage buffers are token-major [8, 1024]; restrict to rows [0..8) (all of them)
+        let rl_g = rel_l2(&g, &hg);
+        let rl_n = rel_l2(&nr, &hn);
+        let rl_r = rel_l2(&rp, &hr);
+        println!("  [kpipe] L{li} relL2 gemm {rl_g:.3e} norm {rl_n:.3e} rope {rl_r:.3e}");
+        check(&format!("kpipe gemm relL2 {rl_g:.3e} < 1e-2"), rl_g < 1e-2);
+        check(&format!("kpipe norm relL2 {rl_n:.3e} < 1e-2"), rl_n < 1e-2);
+        check(&format!("kpipe rope relL2 {rl_r:.3e} < 1e-2"), rl_r < 1e-2);
+        let _ = ring;
+    }
+
+    // ---- Round 2: inject 8 more committed taps (the serving step shape), ctx 16
+    {
+        // the inject's staging is the NEXT 8 committed tap rows, row-major (upload_chunk doc)
+        round.upload_chunk(&taps_rm[8 * TAP_CONCAT_DIM..]).expect("upload_chunk");
+        round.inject_dev(8).expect("inject_dev 8");
+    }
+    // ctx-KV gates: inject rows [8..16) at positions [8..16)
+    for li in [0usize, 4] {
+        let th_inj = oracle.tap_project(&taps_rm[8 * TAP_CONCAT_DIM..16 * TAP_CONCAT_DIM], 8);
+        kv_gate("inject-ctx16", li, 8, 8, &th_inj, &round);
+    }
+    run_round_checks("round2 ctx16", 4321, 16, &mut round, &oracle);
+
+    // ---- Round 2b: the SAME ctx 16 but primed in ONE window (no inject) — isolates whether
+    // the ctx16 failure lives in the INJECT path's state or in the ctx16 shape itself.
+    {
+        round.reset();
+        let mut taps64 = vec![0.0f32; 16 * TAP_CONCAT_DIM];
+        taps64[..16 * TAP_CONCAT_DIM].copy_from_slice(&taps_rm[..16 * TAP_CONCAT_DIM]);
+        let w16: Vec<bf16> = taps64.iter().map(|&x| bf16::from_f32(x)).collect();
+        let w16_dev = dev.htod_sync_copy(&w16).expect("w16 upload");
+        round.prime_window(&w16_dev, 16, 0).expect("prime 16");
+        run_round_checks("round2b ctx16-prime-only", 4321, 16, &mut round, &oracle);
+    }
+    // ---- Round 2c: per-layer bisect at ctx16 (the inject-then-draft failing shape). ----
+    {
+        // rebuild the failing state: prime 8 + inject 8 (round2's path), then layer-by-layer
+        round.reset();
+        {
+            let mut taps8 = vec![0.0f32; 8 * TAP_CONCAT_DIM];
+            taps8.copy_from_slice(&taps_rm[..8 * TAP_CONCAT_DIM]);
+            let w8: Vec<bf16> = taps8.iter().map(|&x| bf16::from_f32(x)).collect();
+            let w8_dev = dev.htod_sync_copy(&w8).expect("w8 upload");
+            round.prime_window(&w8_dev, 8, 0).expect("prime 8");
+        }
+        {
+            let mut chunk = vec![0.0f32; 8 * TAP_CONCAT_DIM];
+            chunk.copy_from_slice(&taps_rm[8 * TAP_CONCAT_DIM..16 * TAP_CONCAT_DIM]);
+            round.upload_chunk(&chunk).expect("upload 8");
+            round.inject_dev(8).expect("inject 8");
+        }
+        // host replicate of the block pass at ctx16 (embed + 5 layers), oracle primitives
+        let w = &art.weights;
+        let hnorm2 = |x: &mut Vec<f32>, wv: &[f32], rows: usize, n: usize| {
+            for r in 0..rows {
+                let ss: f32 = x[r * n..(r + 1) * n].iter().map(|v| v * v).sum();
+                let inv = 1.0f32 / (ss / n as f32 + 1e-6).sqrt();
+                for i in 0..n { x[r * n + i] = x[r * n + i] * inv * wv[i]; }
+            }
+        };
+        let lin2 = |wv: &[f32], x: &[f32], outn: usize, inn: usize, rows: usize| -> Vec<f32> {
+            let mut o = vec![0.0f32; rows * outn];
+            for r in 0..rows {
+                for oi in 0..outn {
+                    let wr = &wv[oi * inn..(oi + 1) * inn];
+                    let mut acc = 0.0f32;
+                    for i in 0..inn { acc += wr[i] * x[r * inn + i]; }
+                    o[r * outn + oi] = acc;
+                }
+            }
+            o
+        };
+        // th for the ctx rows → the oracle's ctx KV (public API) at positions [0..16)
+        let th16 = oracle.tap_project(&taps_rm[..16 * TAP_CONCAT_DIM], 16);
+        let ctxkv = oracle.draft_kv_write(&th16, 16);
+        let toks = [777u32, 248077, 248077, 248077, 248077, 248077, 248077];
+        let freqs = gb10_inference::dspark::oracle::yaarn_freqs(128, 1e7, 32.0, 8192, 32, 1);
+        let mut hh = vec![0.0f32; 7 * DH];
+        for (r, t) in toks.iter().enumerate() {
+            hh[r * DH..(r + 1) * DH].copy_from_slice(&synth.row(SyntheticTables::TABLE_EMBED, *t, DH, scale));
+        }
+        let silu = |x: f32| x / (1.0 + (-x).exp());
+        for (li, l) in w.layers.iter().enumerate() {
+            let mut ln = hh.clone();
+            hnorm2(&mut ln, &l.input_ln, 7, DH);
+            let q = lin2(&l.q_proj, &ln, 40 * 128, DH, 7);
+            let (mut qh, mut kh) = (q.clone(), lin2(&l.k_proj, &ln, 8 * 128, DH, 7));
+            let norm_heads = |x: &mut Vec<f32>, wv: &[f32], heads: usize| {
+                for r in 0..7 {
+                    for h2 in 0..heads {
+                        let base = (r * heads + h2) * 128;
+                        let ss: f32 = x[base..base + 128].iter().map(|v| v * v).sum();
+                        let inv = 1.0f32 / (ss / 128.0 + 1e-6).sqrt();
+                        for d2 in 0..128 { x[base + d2] *= inv * wv[d2]; }
+                    }
+                }
+            };
+            norm_heads(&mut qh, &l.q_norm, 40);
+            norm_heads(&mut kh, &l.k_norm, 8);
+            // NeoX half-split + mscale (reference conventions)
+            let mscale = 0.1f32 * 32.0f32.ln() + 1.0f32;
+            let rope_on = |x: &mut Vec<f32>, heads: usize| {
+                for r in 0..7usize {
+                    for h2 in 0..heads {
+                        let base = (r * heads + h2) * 128;
+                        for j in 0..64usize {
+                            let ang = (16 + r) as f32 * freqs[j];
+                            let (c, sn) = (ang.cos() * mscale, ang.sin() * mscale);
+                            let x1 = x[base + j];
+                            let x2 = x[base + 64 + j];
+                            x[base + j] = x1 * c - x2 * sn;
+                            x[base + 64 + j] = x2 * c + x1 * sn;
+                        }
+                    }
+                }
+            };
+            rope_on(&mut qh, 40);
+            rope_on(&mut kh, 8);
+            let vb = lin2(&l.v_proj, &ln, 8 * 128, DH, 7);
+            // attention over ctx [0..16) + block [16..23)
+            let ntot = 23usize;
+            let mut attn = vec![0.0f32; 7 * 40 * 128];
+            let sc = 1.0f32 / (128.0f32).sqrt();
+            for r in 0..7 {
+                for h2 in 0..40 {
+                    let kvh = h2 / 5;
+                    let qrow = &qh[(r * 40 + h2) * 128..(r * 40 + h2 + 1) * 128];
+                    let mut scores = vec![0.0f32; ntot];
+                    let mut mmax = f32::NEG_INFINITY;
+                    for j in 0..ntot {
+                        let ksrc: &[f32] = if j < 16 { &ctxkv.layers[li].k } else { &kh };
+                        let jr = if j < 16 { j } else { j - 16 };
+                        let krow = &ksrc[(jr * 8 + kvh) * 128..(jr * 8 + kvh + 1) * 128];
+                        let mut sacc = 0.0f32;
+                        for d2 in 0..128 { sacc += qrow[d2] * krow[d2]; }
+                        sacc *= sc;
+                        scores[j] = sacc;
+                        if sacc > mmax { mmax = sacc; }
+                    }
+                    let mut sum = 0.0f32;
+                    for s2 in scores.iter_mut() { *s2 = (*s2 - mmax).exp(); sum += *s2; }
+                    let orow = &mut attn[(r * 40 + h2) * 128..(r * 40 + h2 + 1) * 128];
+                    for j in 0..ntot {
+                        let wgt = scores[j] / sum;
+                        let vsrc: &[f32] = if j < 16 { &ctxkv.layers[li].v } else { &vb };
+                        let jr = if j < 16 { j } else { j - 16 };
+                        let vrow = &vsrc[(jr * 8 + kvh) * 128..(jr * 8 + kvh + 1) * 128];
+                        for d2 in 0..128 { orow[d2] += wgt * vrow[d2]; }
+                    }
+                }
+            }
+            let ao = lin2(&l.o_proj, &attn, DH, 40 * 128, 7);
+            let mut h2v = vec![0.0f32; 7 * DH];
+            for i in 0..7 * DH { h2v[i] = hh[i] + ao[i]; }
+            let mut h2n = h2v.clone();
+            hnorm2(&mut h2n, &l.post_ln, 7, DH);
+            let gate = lin2(&l.gate_proj, &h2n, 10240, DH, 7);
+            let up = lin2(&l.up_proj, &h2n, 10240, DH, 7);
+            let mut ffn = vec![0.0f32; 7 * 10240];
+            for i in 0..7 * 10240 { ffn[i] = silu(gate[i]) * up[i]; }
+            let down = lin2(&l.down_proj, &ffn, DH, 10240, 7);
+            for i in 0..7 * DH { hh[i] = h2v[i] + down[i]; }
+
+            round.draft_round_partial_dev(777, li + 1).expect("partial ctx16");
+            let hd = round.dump_h(7).expect("dump_h");
+            let rl = rel_l2(&hd, &hh);
+            check(&format!("bisect ctx16 L{} h relL2 {rl:.3e} < 3e-1", li), rl < 3e-1);
+        }
+        round.reset();
+    }
+    // ---- Round 2d: THE FAILING SEQUENCE EXACTLY — prime 8, FULL ctx8 draft (head+chain),
+    // inject 8, then the per-layer bisect at ctx16. If this fails where 2c passed, the ctx8
+    // draft's own execution poisons the next round.
+    {
+        round.reset();
+        {
+            let mut taps8 = vec![0.0f32; 8 * TAP_CONCAT_DIM];
+            taps8.copy_from_slice(&taps_rm[..8 * TAP_CONCAT_DIM]);
+            let w8: Vec<bf16> = taps8.iter().map(|&x| bf16::from_f32(x)).collect();
+            let w8_dev = dev.htod_sync_copy(&w8).expect("w8 upload");
+            round.prime_window(&w8_dev, 8, 0).expect("prime 8");
+        }
+        let _ = round.draft_round_dev(777).expect("ctx8 draft");
+        {
+            let mut chunk = vec![0.0f32; 8 * TAP_CONCAT_DIM];
+            chunk.copy_from_slice(&taps_rm[8 * TAP_CONCAT_DIM..16 * TAP_CONCAT_DIM]);
+            round.upload_chunk(&chunk).expect("upload 8");
+            round.inject_dev(8).expect("inject 8");
+        }
+        // (the host-side ctx16 replicate hh was left at the final-layer values by 2c; rebuild it)
+        // — cheap enough to just rerun the chain of partials and compare layer-by-layer against
+        // the oracle's public final hidden instead: compare each partial's h to the 2c target is
+        // not possible here, so gate the FINAL full draft's h vs the oracle ctx16 h.
+        let toks_dev = round.draft_round_dev(777).expect("full ctx16 draft after sequence");
+        let h_dev = round.read_h_final().expect("read_h_final");
+        let ctx = RoundCtx {
+            tap_hiddens: taps_rm[..16 * TAP_CONCAT_DIM].to_vec(),
+            anchor: 777,
+            confidence_threshold: 0.15,
+        };
+        let out = oracle.run_round(&ctx);
+        let h_or = out.h.clone();
+        let rl = rel_l2(&h_dev, &h_or);
+        check(&format!("round2d ctx16-after-sequence h relL2 {rl:.3e} < 2e-1"), rl < 2e-1);
+        check(&format!("round2d chain tokens EXACT"),
+              { let mo = oracle.markov_chain(&round.dump_logits().expect("lg"), 777); toks_dev[..7] == mo.tokens });
+        round.reset();
+    }
+
+    // ---- Round 3: the SERVING shape — a WIDE prime window (n=61, the chat-prompt case the
+    // serving prefill hits in one PREFILL_CHUNK window) then a 3-col inject. The ctx16 round
+    // above only primes at n=8; a wide-n bug in the prime path (rmsnorm/gather/rope/write_kv
+    // at window widths) would show here and NOWHERE else.
+    {
+        round.reset();
+        let mut taps64 = vec![0.0f32; 64 * TAP_CONCAT_DIM];
+        for i in 0..64 {
+            let r = synth.row(SyntheticTables::TABLE_TAPS, (100 + i) as u32, TAP_CONCAT_DIM, tap_scale);
+            taps64[i * TAP_CONCAT_DIM..(i + 1) * TAP_CONCAT_DIM].copy_from_slice(&r);
+        }
+        let w61: Vec<bf16> = taps64[..61 * TAP_CONCAT_DIM].iter().map(|&x| bf16::from_f32(x)).collect();
+        let w61_dev = dev.htod_sync_copy(&w61).expect("wide taps upload");
+        round.prime_window(&w61_dev, 61, 0).expect("wide prime 61");
+        let toks_dev = round.draft_round_dev(777).expect("draft ctx61");
+        let h_dev = round.read_h_final().expect("read_h_final");
+        let lg_dev = round.dump_logits().expect("dump_logits");
+        let ctx = RoundCtx {
+            tap_hiddens: taps64[..61 * TAP_CONCAT_DIM].to_vec(),
+            anchor: 777,
+            confidence_threshold: 0.15,
+        };
+        let out = oracle.run_round(&ctx);
+        let h_or = out.h.clone();
+        let rl = rel_l2(&h_dev, &h_or);
+        check(&format!("round3 ctx61 h_final relL2 {rl:.3e} < 2e-1 (bf16-staging documented)"), rl < 2e-1);
+        let mo = oracle.markov_chain(&lg_dev, 777);
+        check(&format!("round3 ctx61 chain tokens EXACT"), toks_dev[..7] == mo.tokens);
+        // then the serving step shape: 3 committed taps injected (nacc=2 style)
+        {
+            let mut chunk = vec![0.0f32; 8 * TAP_CONCAT_DIM];
+            chunk[..3 * TAP_CONCAT_DIM].copy_from_slice(&taps64[61 * TAP_CONCAT_DIM..64 * TAP_CONCAT_DIM]);
+            round.upload_chunk(&chunk).expect("upload_chunk 3");
+            round.inject_dev(3).expect("inject_dev 3");
+        }
+        let toks_dev = round.draft_round_dev(555).expect("draft ctx64");
+        let lg_dev = round.dump_logits().expect("dump_logits");
+        let ctx = RoundCtx {
+            tap_hiddens: taps64[..64 * TAP_CONCAT_DIM].to_vec(),
+            anchor: 555,
+            confidence_threshold: 0.15,
+        };
+        let out = oracle.run_round(&ctx);
+        check(&format!("round3 ctx64 chain tokens EXACT"),
+              { let mo = oracle.markov_chain(&lg_dev, 555); toks_dev[..7] == mo.tokens });
+        let _ = out;
+    }
+
+    // ---- Layer bisect (ctx0): device h after each layer vs a host replicate. ----
+    if std::env::var("GB10_DSPARK_BISECT").is_ok() {
+        println!("== layer bisect (ctx0) ==");
+        // host replicate of the block pass (the oracle's exact math on the artifact weights)
+        let w = &art.weights;
+        let hnorm = |x: &mut Vec<f32>, wv: &[f32], rows: usize, n: usize| {
+            for r in 0..rows {
+                let ss: f32 = x[r * n..(r + 1) * n].iter().map(|v| v * v).sum();
+                let inv = 1.0f32 / (ss / n as f32 + 1e-6).sqrt();
+                for i in 0..n {
+                    x[r * n + i] = x[r * n + i] * inv * wv[i];
+                }
+            }
+        };
+        let lin = |wv: &[f32], x: &[f32], outn: usize, inn: usize, rows: usize| -> Vec<f32> {
+            let mut o = vec![0.0f32; rows * outn];
+            for r in 0..rows {
+                for oi in 0..outn {
+                    let wr = &wv[oi * inn..(oi + 1) * inn];
+                    let mut acc = 0.0f32;
+                    for i in 0..inn {
+                        acc += wr[i] * x[r * inn + i];
+                    }
+                    o[r * outn + oi] = acc;
+                }
+            }
+            o
+        };
+        let row = |t: u32| -> Vec<f32> { synth.row(SyntheticTables::TABLE_EMBED, t, DH, scale) };
+        let mut hh = vec![0.0f32; 7 * DH];
+        let toks = [777u32, 248077, 248077, 248077, 248077, 248077, 248077];
+        for (r, t) in toks.iter().enumerate() {
+            hh[r * DH..(r + 1) * DH].copy_from_slice(&row(*t));
+        }
+        let silu = |x: f32| x / (1.0 + (-x).exp());
+        for (li, l) in w.layers.iter().enumerate() {
+            let mut ln = hh.clone();
+            hnorm(&mut ln, &l.input_ln, 7, DH);
+            let q = lin(&l.q_proj, &ln, 40 * 128, DH, 7);
+            let (mut qh, mut kh): (Vec<f32>, Vec<f32>) = (q.clone(), lin(&l.k_proj, &ln, 8 * 128, DH, 7));
+            let norm_heads = |x: &mut Vec<f32>, wv: &[f32], heads: usize| {
+                for r in 0..7 {
+                    for h2 in 0..heads {
+                        let base = (r * heads + h2) * 128;
+                        let ss: f32 = x[base..base + 128].iter().map(|v| v * v).sum();
+                        let inv = 1.0f32 / (ss / 128.0 + 1e-6).sqrt();
+                        for d2 in 0..128 {
+                            x[base + d2] *= inv * wv[d2];
+                        }
+                    }
+                }
+            };
+            norm_heads(&mut qh, &l.q_norm, 40);
+            norm_heads(&mut kh, &l.k_norm, 8);
+            // rope at positions 0..7 (ctx0) — freqs from the same yaarn table; NeoX half-split
+            // pairing + mscale, the reference conventions.
+            let freqs = gb10_inference::dspark::oracle::yaarn_freqs(
+                128, 1e7, 32.0, 8192, 32, 1);
+            let mscale = 0.1f32 * 32.0f32.ln() + 1.0f32;
+            let rope_on = |x: &mut Vec<f32>, heads: usize| {
+                for r in 0..7usize {
+                    for h2 in 0..heads {
+                        let base = (r * heads + h2) * 128;
+                        for j in 0..64usize {
+                            let ang = r as f32 * freqs[j];
+                            let (c, sn) = (ang.cos() * mscale, ang.sin() * mscale);
+                            let x1 = x[base + j];
+                            let x2 = x[base + 64 + j];
+                            x[base + j] = x1 * c - x2 * sn;
+                            x[base + 64 + j] = x2 * c + x1 * sn;
+                        }
+                    }
+                }
+            };
+            rope_on(&mut qh, 40);
+            rope_on(&mut kh, 8);
+            let vb = lin(&l.v_proj, &ln, 8 * 128, DH, 7);
+            // attention over the 7 block keys only (ctx0)
+            let mut attn = vec![0.0f32; 7 * 40 * 128];
+            let sc = 1.0f32 / (128.0f32).sqrt();
+            for r in 0..7 {
+                for h2 in 0..40 {
+                    let kvh = h2 / 5;
+                    let qrow = &qh[(r * 40 + h2) * 128..(r * 40 + h2 + 1) * 128];
+                    let mut scores = vec![0.0f32; 7];
+                    let mut m = f32::NEG_INFINITY;
+                    for j in 0..7 {
+                        let krow = &kh[(j * 8 + kvh) * 128..(j * 8 + kvh + 1) * 128];
+                        let mut sacc = 0.0f32;
+                        for d2 in 0..128 {
+                            sacc += qrow[d2] * krow[d2];
+                        }
+                        sacc *= sc;
+                        scores[j] = sacc;
+                        if sacc > m { m = sacc; }
+                    }
+                    let mut sum = 0.0f32;
+                    for s2 in scores.iter_mut() { *s2 = (*s2 - m).exp(); sum += *s2; }
+                    let orow = &mut attn[(r * 40 + h2) * 128..(r * 40 + h2 + 1) * 128];
+                    for j in 0..7 {
+                        let wgt = scores[j] / sum;
+                        let vrow = &vb[(j * 8 + kvh) * 128..(j * 8 + kvh + 1) * 128];
+                        for d2 in 0..128 {
+                            orow[d2] += wgt * vrow[d2];
+                        }
+                    }
+                }
+            }
+            let ao = lin(&l.o_proj, &attn, DH, 40 * 128, 7);
+            let mut h2v = vec![0.0f32; 7 * DH];
+            for i in 0..7 * DH { h2v[i] = hh[i] + ao[i]; }
+            let mut h2n = h2v.clone();
+            hnorm(&mut h2n, &l.post_ln, 7, DH);
+            let gate = lin(&l.gate_proj, &h2n, 10240, DH, 7);
+            let up = lin(&l.up_proj, &h2n, 10240, DH, 7);
+            let mut ffn = vec![0.0f32; 7 * 10240];
+            for i in 0..7 * 10240 { ffn[i] = silu(gate[i]) * up[i]; }
+            let down = lin(&l.down_proj, &ffn, DH, 10240, 7);
+            for i in 0..7 * DH { hh[i] = h2v[i] + down[i]; }
+
+            // device side: partial round to layer li+1, dump h
+            round.reset();
+            round.draft_round_partial_dev(777, li + 1).expect("partial round");
+            let hd = round.dump_h(7).expect("dump_h");
+            let rl = rel_l2(&hd, &hh);
+            // compounding bf16-staging gap (documented above); must stay well below ~1.0
+            check(&format!("bisect after layer {} h relL2 {rl:.3e} < 3e-1 (bf16-staging documented)", li),
+                  rl < 3e-1);
+        }
+        round.reset();
+    }
+
+    println!("== summary ==");
+    if all_pass.get() {
+        println!("DSPARK_ROUND_PROBE: ALL PASS");
+    } else {
+        println!("DSPARK_ROUND_PROBE: FAILURES PRESENT");
+        std::process::exit(1);
+    }
+}
+
+/// WI1: load the Qwen3.8-27B-DSpark round (the `--spec-source dspark` serving drafter) —
+/// the DF2 loader's fail-soft shape: any refusal (ctx bound, trunk mismatch, missing/failed
+/// artifact) logs a WARN and returns None so the lane degrades to MTP, never a hard failure.
+fn load_dspark_round_dir(gpu: &mut gb10_inference::gpu::GpuModel, max_c: usize, draft_dir: &str,
+                         sha_pin: Option<&str>)
+    -> Option<(gb10_inference::dspark::round::DsparkRound,
+               std::sync::Arc<gb10_inference::dflash2::capture::Df2TapSink>,
+               std::sync::Arc<gb10_inference::dflash2::capture::Df2PrimeSink>)> {
+    use gb10_inference::dflash2::capture::{Df2PrimeSink, Df2TapSink};
+    // F8 acceptance A2 (owner directive 2026-09-06): the packed-arg geometry fields are 21
+    // bits wide (gpu_dspark.cu) — the round carries the full 512K context class. Beyond the
+    // 2^21 field width the round refuses loudly here rather than at the first long-context
+    // request (the old 16-bit fields capped at 65520 — lifted).
+    if max_c + 15 >= (1 << 21) {
+        eprintln!("[dspark] WARN: --max-seq-len {max_c} exceeds the DSpark round's packed-arg \
+                   ctx bound ({}) — serving via MTP (auto-fallback)", (1 << 21) - 15);
+        return None;
+    }
+    // The drafter is dimension-fixed to the 3.8-27B trunk shapes (borrowed head/embed + taps
+    // at layers <= 52); an incompatible trunk refuses here (the standing fallback).
+    if !gpu.df2_round_compatible() {
+        let (h, v, l) = gpu.df2_trunk_dims();
+        eprintln!("[dspark] WARN: trunk hidden={h} vocab={v} layers={l} is not DSpark-compatible \
+                   (the drafter borrows the 3.8-27B head/embed; taps reach layer 52) — serving \
+                   via MTP (auto-fallback)");
+        return None;
+    }
+    let (head, embed) = match gpu.df2_borrow() {
+        Some(p) => p,
+        None => {
+            eprintln!("[dspark] WARN: trunk lm_head/embed are not NVFP4/BF16 (or absent) — the \
+                       borrowed-head path is unavailable; serving via MTP");
+            return None;
+        }
+    };
+    let mut round = match gb10_inference::dspark::round::DsparkRound::load_pinned(
+        draft_dir, Some(head), Some(embed), max_c, sha_pin) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[dspark] WARN: DSpark round load FAILED ({e:#}) — absent/failed artifact \
+                       is never a hard failure; serving via MTP (standing directive)");
+            return None;
+        }
+    };
+    let sink = std::sync::Arc::new(Df2TapSink::new(gpu.dev()));
+    round.attach_sink(&sink);
+    let prime = std::sync::Arc::new(Df2PrimeSink::new(
+        gpu.dev(), gb10_inference::batch::PREFILL_CHUNK));
+    gpu.set_dspark_capture(sink.clone());
+    Some((round, sink, prime))
 }
 
 /// Parse the `--tp [N]` flag — the single authority for the TP rank count on a TP run.
@@ -1727,12 +2947,22 @@ fn run_bench_tree(args: &[String]) {
 /// independent draft chains (one per lane, each rooted in its own committed slot state) into ONE verify
 /// and asserts each lane's per-column logits are bit-equal to running that lane alone. Lanes share
 /// committed length here (shared pos_start). Prints RESULT: LANES_OK or LANES_MISMATCH (exit 1).
+/// P11 (BATCHED_MTP P1): additionally PACKS p=2..=5 lanes (the production take widths) at the
+/// production allocator depths — the 2-lane sweep stays as the regression anchor.
 fn run_bench_lanes(args: &[String]) {
     let dir = parse_arg(args, "--model-dir").expect("--bench-lanes requires --model-dir");
     let tok_path = format!("{}/tokenizer.json", dir.trim_end_matches('/'));
     let prompt_text = parse_arg(args, "--prompt").unwrap_or(
         "The quick brown fox jumps over the lazy dog near the river bank at dawn while the sun rises \
-         slowly over distant hills and a light wind carries the smell of rain across the wide valley.");
+         slowly over distant hills and a light wind carries the smell of rain across the wide valley. \
+         Later that morning a surveyor arrived with maps and instruments, measured the river's width at \
+         three separate fords, noted the reed beds on the near bank, and recorded every observation in a \
+         leather notebook whose pages had already begun to curl from the damp. She had walked the valley \
+         for eleven days by then, sleeping in barns and occasionally in the open, and had filled most of \
+         the notebook with sketches of bridges, fords, mill races, and the old stone weir two miles \
+         downstream from the mill, where her grandfather had once worked as a keeper and where, if the \
+         deeds could be believed, a right of way still existed across the water meadow to the church. \
+         The fox, unbothered by any of this, had long since gone to ground.");
     let max_seq_len: usize = parse_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(8192);
     let tokenizer = QwenTokenizer::from_file(&tok_path).expect("tokenizer");
     let prompt = tokenizer.encode(prompt_text, true).expect("encode");
@@ -1764,12 +2994,42 @@ fn run_bench_lanes(args: &[String]) {
                      if mism == 0 { "  OK" } else { "  <-- FAIL" });
         }
     }
-    if total_mism == 0 {
-        println!("\nRESULT: LANES_OK ({total_cols} lane-columns; every lane's logits bit-identical packed \
-                  vs alone -- GDN forest scan is lane-independent)");
+    // P11 (BATCHED_MTP P1): the production pack widths. take=5 ships; the pairs sweep above cannot
+    // see p=3..5 (AGENTS §3's self-consistency blind spot). Same byte oracle, production allocator
+    // (per-lane depth = MAX_VERIFY/p - 1 capped by the policy depth; caps 4 and 8 both exercised —
+    // auto re-picks depth every window, so both caps are production-reachable).
+    println!("Forest pack gate (production take widths, distinct prefixes per lane):");
+    let mut pack_mism = 0usize;
+    let mut pack_cols = 0usize;
+    for cap in [4usize, 8] {
+        for pack in [2usize, 3, 4, 5] {
+            let depth = (16usize / pack).saturating_sub(1).clamp(1, cap);
+            let per = prompt.len() / pack;
+            if per < 8 {
+                // Degrade, don't panic: a short custom --prompt can still exercise the widths it
+                // fits; the skipped width says so in the log (P1 needs PASS, not a crash).
+                println!("  pack p={pack} cap={cap}: SKIPPED (prompt too short — {per} tokens/lane)");
+                continue;
+            }
+            let lanes: Vec<Vec<u32>> =
+                (0..pack).map(|i| prompt[i * per..(i + 1) * per].to_vec()).collect();
+            let refs: Vec<&[u32]> = lanes.iter().map(|v| v.as_slice()).collect();
+            // p lanes + p GDN snapshot slots.
+            let mut state = gpu.new_batch_state(pack, 2 * pack, max_seq_len);
+            gpu.dev().synchronize().unwrap();
+            let (cols, mism) = gpu.bench_lanes_pack(&mut pool, &mut state, &refs, max_seq_len, cap);
+            pack_mism += mism;
+            pack_cols += cols;
+            println!("  pack p={pack} cap={cap} d={depth}: {cols} cols, {mism} bit-mismatch{}",
+                     if mism == 0 { "  OK" } else { "  <-- FAIL" });
+        }
+    }
+    if total_mism + pack_mism == 0 {
+        println!("\nRESULT: LANES_OK (pairs {total_cols} + packs {pack_cols} lane-columns, packs p=2..5; \
+                  every lane's logits bit-identical packed vs alone -- GDN forest scan is lane-independent)");
     } else {
-        println!("\nRESULT: LANES_MISMATCH ({total_mism} diverged) -- a lane's logits depend on its \
-                  neighbours; the forest verify is NOT lane-pure");
+        println!("\nRESULT: LANES_MISMATCH ({total_mism} pair + {pack_mism} pack diverged) -- a lane's \
+                  logits depend on its neighbours; the forest verify is NOT lane-pure");
         std::process::exit(1);
     }
 }
@@ -2318,7 +3578,7 @@ fn run_probe_dspark_synth(args: &[String], dir: &str) {
         }
         let h = oracle.block_forward(&emb, &kv, l);
         let logits0 = oracle.lm_head(&h, 7);
-        let mo = oracle.markov_chain(&logits0, &h);
+        let mo = oracle.markov_chain(&logits0, blk[0]);
         let co = oracle.confidence(&h, &mo.latents, 0.5);
         if h.len() != 7 * cfg.hidden { return Err("block_forward shape".into()); }
         if logits0.len() != 7 * cfg.vocab { return Err("lm_head shape".into()); }
@@ -2878,7 +4138,7 @@ fn run_replay_df2_round(args: &[String]) {
         }
         let (_lh, h) = oracle.backbone_forward(&emb, &kv, pos);
         let h_sel = &h[hidden..block * hidden];
-        let logits = oracle.linear(&head, h_sel, vocab, hidden, 7);
+        let logits = oracle.linear(&head, h_sel, vocab, hidden, block - 1);
         let sel = oracle.select_path(h_sel, &logits, st.committed);
 
         // --- comparisons ---
@@ -2917,17 +4177,20 @@ fn run_replay_df2_round(args: &[String]) {
             }
             0.0  // outside the top-20 (=> outside the nucleus)
         };
-        let mut p_oracle = vec![f32::NAN; 7];
-        for j in 0..7 { p_oracle[j] = table_p(sel.tokens[j], j, &st.top20); }
+        // DF2 block-16: the live level count, never a constant 7.
+        let nlv = block - 1;
+        let mut p_oracle = vec![f32::NAN; nlv];
+        for j in 0..nlv { p_oracle[j] = table_p(sel.tokens[j], j, &st.top20); }
         let p_engine = &st.p_draft;
         let p_oracle_sum: f32 = p_oracle.iter().sum();
         let p_engine_sum: f32 = p_engine.iter().sum();
         // 4. oracle chain on the ENGINE's candidate sets (isolate the chain)
-        let mut chain_on_engine = [0u32; 7];
-        if st.candidates.len() == 7 * 16 && st.unary.len() == 7 * 16 {
-            let mut cands = [[0u32; 16]; 7];
-            let mut unars = [[0.0f32; 16]; 7];
-            for p_ in 0..7 { for k in 0..16 {
+        let mut chain_on_engine =
+            [0u32; gb10_inference::dflash2::oracle::MAX_SELECT_LEVELS];
+        if st.candidates.len() == nlv * 16 && st.unary.len() == nlv * 16 {
+            let mut cands = [[0u32; 16]; gb10_inference::dflash2::oracle::MAX_SELECT_LEVELS];
+            let mut unars = [[0.0f32; 16]; gb10_inference::dflash2::oracle::MAX_SELECT_LEVELS];
+            for p_ in 0..nlv { for k in 0..16 {
                 cands[p_][k] = st.candidates[p_ * 16 + k];
                 unars[p_][k] = st.unary[p_ * 16 + k];
             }}
@@ -2935,7 +4198,7 @@ fn run_replay_df2_round(args: &[String]) {
             chain_on_engine = co.tokens;
         }
         let mut ce_match = 0;
-        for j in 0..7 { if chain_on_engine[j] == st.drafts.get(j).copied().unwrap_or(u32::MAX) { ce_match += 1; } }
+        for j in 0..nlv { if chain_on_engine[j] == st.drafts.get(j).copied().unwrap_or(u32::MAX) { ce_match += 1; } }
 
         let dt = t0.elapsed().as_secs_f64();
         out.push_str(&format!(
@@ -3216,17 +4479,17 @@ fn run_probe_dflash2(args: &[String], dir: &str) {
             }
             println!("    candidate sets equal: {sets_ok}");
             // chain mechanics: feed the REFERENCE's (candidates, unary) through our chain
-            let mut cand_arr = [[0u32; 16]; 7];
-            let mut unary_arr = [[0.0f32; 16]; 7];
-            for p in 0..7 {
+            let mut cand_arr = [[0u32; 16]; gb10_inference::dflash2::oracle::MAX_SELECT_LEVELS];
+            let mut unary_arr = [[0.0f32; 16]; gb10_inference::dflash2::oracle::MAX_SELECT_LEVELS];
+            for p in 0..(cfg.block - 1) {
                 cand_arr[p].copy_from_slice(&g.candidates[p * 16..(p + 1) * 16]);
                 unary_arr[p].copy_from_slice(&g.unary[p * 16..(p + 1) * 16]);
             }
             let h_sel = &out.h[cfg.hidden..cfg.block * cfg.hidden];
             let chained = oracle.select_chain(h_sel, &cand_arr, &unary_arr, anchor);
-            let chain_path_ok = chained.tokens[..] == g.path[..];
+            let chain_path_ok = chained.tokens_v() == &g.path[..];
             println!("    chain-from-reference-candidates path exact: {chain_path_ok}");
-            let own_path: Vec<u32> = out.select.tokens.to_vec();
+            let own_path: Vec<u32> = out.select.tokens_v().to_vec();
             println!("    own-order path == reference path: {}", own_path == g.path);
             if f32_case {
                 check(&format!("golden {}: logits argmax 7/7", g.name), argmax_match == 7);
@@ -3263,10 +4526,10 @@ fn mirror_reference(
 ) -> MirrorRef {
     use gb10_inference::dflash2::mirror as m;
     let inv = m::inv_freq(cfg);
-    let (cos, sin) = m::rope_tables_half(cfg, &inv, c + gb10_inference::dflash2::BLOCK);
+    let (cos, sin) = m::rope_tables_half(cfg, &inv, c + gb10_inference::dflash2::block());
     let taps_bf16 = m::rb_clone(taps);
     let (_, th) = m::tap_project_mirror(cfg, &w.fc, &w.hidden_norm, &taps_bf16, c);
-    let block_pos: Vec<usize> = (c..c + gb10_inference::dflash2::BLOCK).collect();
+    let block_pos: Vec<usize> = (c..c + gb10_inference::dflash2::block()).collect();
     let emb = m::block_emb_mirror(cfg, synth, anchor);
     let mut ctx = Vec::new();
     for l in &w.layers {
@@ -3284,7 +4547,7 @@ fn mirror_reference(
             layer0 = Some(out);
         }
     }
-    let h_final = m::rb_clone(&m::rms_norm_rows(&h, &w.norm, gb10_inference::dflash2::BLOCK, cfg.hidden, cfg.rms_eps));
+    let h_final = m::rb_clone(&m::rms_norm_rows(&h, &w.norm, gb10_inference::dflash2::block(), cfg.hidden, cfg.rms_eps));
     MirrorRef {
         th,
         layer_hiddens,
@@ -3664,6 +4927,9 @@ fn build_spec_scheduler(gpu: gb10_inference::gpu::GpuModel, kv_stride: usize,
                         mtp_depth: usize, df2: Option<gb10_inference::dflash2::round::Df2Round>,
                         sink: Option<std::sync::Arc<gb10_inference::dflash2::capture::Df2TapSink>>,
                         prime: Option<std::sync::Arc<gb10_inference::dflash2::capture::Df2PrimeSink>>,
+                        dspark: Option<gb10_inference::dspark::round::DsparkRound>,
+                        dspark_sink: Option<std::sync::Arc<gb10_inference::dflash2::capture::Df2TapSink>>,
+                        dspark_prime: Option<std::sync::Arc<gb10_inference::dflash2::capture::Df2PrimeSink>>,
                         step_dump: Option<gb10_inference::dflash2::stepdump::StepDump>)
     -> gb10_inference::batch::BatchScheduler {
     use gb10_inference::batch::{BatchScheduler, MtpPolicy};
@@ -3671,7 +4937,7 @@ fn build_spec_scheduler(gpu: gb10_inference::gpu::GpuModel, kv_stride: usize,
     let (stx, srx) = tokio::sync::mpsc::unbounded_channel();
     std::mem::drop(stx);   // the bench drives admit directly
     BatchScheduler::with_df2(gpu, 1, kv_stride, eos, srx, policy, false, 0, false, false,
-                             df2, sink, prime, step_dump)
+                             df2, sink, prime, dspark, dspark_sink, dspark_prime, step_dump)
 }
 
 /// S5F — `--probe-df2-lossless`: the greedy bit-identity gate (workdoc §3.1, BINDING).
@@ -3758,9 +5024,20 @@ fn run_probe_df2_lossless(args: &[String]) {
 
     // One scheduler, three sources per prompt (Plain, DFlash2, Mtp) — same process, same load.
     use gb10_inference::batch::SpecBenchJob;
+    // DF2 block-16: the tree source is refused above block 8 (it needs up to 31 verify columns
+    // vs MAX_VERIFY 16), so the sweep SKIPS that arm rather than dying on the deliberate refusal
+    // — a gate that cannot run its own control is not a gate. `n_src` keeps the result indexing
+    // aligned with the arms that actually ran.
+    let tree_ok = gb10_inference::dflash2::block() == 8;
+    let n_src: usize = if tree_ok { 4 } else { 3 };
+    if !tree_ok {
+        println!("  [SKIP ] dflash2-tree arm: unsupported at --df2-block {} (needs <= 8)",
+                 gb10_inference::dflash2::block());
+    }
     let mut jobs = Vec::new();
     for (_, ptoks) in &prompts {
         for src in [SpecSource::Plain, SpecSource::DFlash2, SpecSource::DFlash2Tree, SpecSource::Mtp] {
+            if src == SpecSource::DFlash2Tree && !tree_ok { continue; }
             jobs.push(SpecBenchJob {
                 prompt: ptoks.clone(), max_new, temperature: 0.0, top_p: 1.0, top_k: 0,
                 seed: 0x5EED_0001, source: src,
@@ -3769,17 +5046,23 @@ fn run_probe_df2_lossless(args: &[String]) {
         }
     }
     let scheduler = build_spec_scheduler(gpu, max_seq_len, eos, SpecSource::Mtp, mtp_depth,
-                                         Some(round), Some(sink), Some(prime), None);
+                                         Some(round), Some(sink), Some(prime),
+                                         None, None, None, None);
     let rt = tokio::runtime::Builder::new_current_thread().enable_all()
         .build().expect("runtime");
     let (streams, _, _) = rt.block_on(scheduler.run_spec_bench(jobs, &[]));
-    assert_eq!(streams.len(), prompts.len() * 4);
+    assert_eq!(streams.len(), prompts.len() * n_src);
 
     let mut all_ok = true;
     for (pi, (pname, _)) in prompts.iter().enumerate() {
-        let (plain, df2s, tree, mtp) = (&streams[pi * 4], &streams[pi * 4 + 1], &streams[pi * 4 + 2], &streams[pi * 4 + 3]);
+        let (plain, df2s) = (&streams[pi * n_src], &streams[pi * n_src + 1]);
+        let (tree, mtp) = if tree_ok {
+            (&streams[pi * n_src + 2], &streams[pi * n_src + 3])
+        } else {
+            (&streams[pi * n_src], &streams[pi * n_src + 2])   // tree arm skipped: self-compare
+        };
         let eq_df2 = plain == df2s;
-        let eq_tree = plain == tree;
+        let eq_tree = !tree_ok || plain == tree;
         let eq_mtp = plain == mtp;
         let div = |a: &[u32], b: &[u32]| -> Option<usize> {
             a.iter().zip(b.iter()).position(|(x, y)| x != y)
@@ -3950,7 +5233,7 @@ fn run_bench_df2_sample_realq(args: &[String]) {
             round.refresh_block_pos().expect("df2 refresh");
             // A FRESH sampled draft per condition: the proposal distribution is part of the
             // condition under test (varied RNG streams across conditions).
-            let sel_seeds: Vec<u32> = (0..7).map(|j| rng_u32(base, RNG_DOM_DF2_SEL, j)).collect();
+            let sel_seeds: Vec<u32> = (0..gb10_inference::dflash2::levels()).map(|j| rng_u32(base, RNG_DOM_DF2_SEL, j)).collect();
             let dout = round.draft_round_dev_sample(a0, &sel_seeds, temp).expect("df2 sampled draft");
             let x_draft = dout.tokens[0];
             let q_draft = dout.q_rows[0];
@@ -3995,7 +5278,7 @@ fn run_bench_df2_matrix(args: &[String]) {
         .expect("--bench-df2-matrix needs --model-dir <trunk>").to_string();
     let spec_source = match parse_arg(args, "--spec-source").map(str::to_lowercase) {
         Some(s) => SpecSource::from_cli(&s)
-            .unwrap_or_else(|| panic!("--spec-source must be mtp|dflash2|dflash2-rq|dflash2-auto|dflash2-tree|none (got {s})")),
+            .unwrap_or_else(|| panic!("--spec-source must be mtp|dspark|dflash2|dflash2-rq|dflash2-auto|dflash2-tree|none (got {s})")),
         None => panic!("--bench-df2-matrix needs --spec-source {{mtp,dflash2,dflash2-rq,dflash2-auto,none}}"),
     };
     let temp: f32 = parse_arg(args, "--temp").and_then(|s| s.parse().ok()).unwrap_or(0.0);
@@ -4062,6 +5345,23 @@ fn run_bench_df2_matrix(args: &[String]) {
             }
         }
     } else { (None, None, None) };
+    // WI1: the DSpark source needs its own round wired in (before WI1 the scheduler got the
+    // dspark triple as None and the cells silently ran MTP — a NOT-a-dspark measurement).
+    // Same refuse-don't-fallback discipline as the DF2 arm: an unloadable drafter exits loudly.
+    let (ds_round, ds_sink, ds_prime) = if spec_source == gb10_inference::batch::SpecSource::Dspark {
+        let draft_dir = parse_arg(args, "--draft-dir")
+            .unwrap_or_else(|| panic!("--bench-df2-matrix --spec-source dspark needs --draft-dir \
+                                      <Qwen3.8-27B-DSpark artifact>"));
+        match load_dspark_round_dir(&mut gpu, max_seq_len, draft_dir, None) {
+            Some(x) => (Some(x.0), Some(x.1), Some(x.2)),
+            None => {
+                println!("RESULT: DSPARK_UNAVAILABLE — serving the DSpark cells via the MTP \
+                          fallback would NOT be a DSpark measurement; refusing the cell-group. \
+                          (See the [dspark] WARN above for the load failure.)");
+                std::process::exit(2);
+            }
+        }
+    } else { (None, None, None) };
 
     // One job per (domain prompt × rep). Seeds deterministic per (prompt, rep).
     // With --thinking/--parity, the MATH prompts are rendered through the model's chat template
@@ -4076,7 +5376,7 @@ fn run_bench_df2_matrix(args: &[String]) {
                 role: "user".to_string(), content: Some(text.to_string()), images: vec![],
                 tool_calls: None, tool_call_id: None, name: None, reasoning_content: None,
             }];
-            tokenizer.apply_chat_template(&msgs, None, thinking.as_deref())
+            tokenizer.apply_chat_template(&msgs, None, thinking.as_deref(), None, gb10_inference::tokenizer::ThinkingMode::On)
                 .map(|s| tokenizer.encode(&s, false).expect("encode chat prompt"))
                 .expect("chat template render")
         } else {
@@ -4119,11 +5419,17 @@ fn run_bench_df2_matrix(args: &[String]) {
     // (tau 5.5393 both arms). The blanket flip regressed chat_t1_off @T1.0 (37.4 -> 32.1 tok/s,
     // 1.010x -> 0.865x vs MTP) — the conditional keeps that cell on rq. `--df2-prose-lane rq`
     // restores the unconditional walk for every temp.
+    // DF2_CARRY: keep DFlash2 in the draft seat across a prefix-cache hit (default OFF until
+    // PLAN/DF2_CARRY_SPEC.md §7 is green). CLI flag per AGENTS §7; rides TpConfig (no side channel).
+    let df2_carry = matches!(parse_arg(args, "--df2-carry").unwrap_or("off"),
+                             "on" | "true" | "1" | "yes");
     let prose_lane_greedy = matches!(parse_arg(args, "--df2-prose-lane").unwrap_or("greedy-drafts"),
                                      "greedy-drafts" | "greedy" | "argmax");
     let mut scheduler = build_spec_scheduler(gpu, max_seq_len, eos, spec_source, mtp_depth,
-                                             round, sink, prime, step_dump);
+                                             round, sink, prime, ds_round, ds_sink, ds_prime,
+                                             step_dump);
     scheduler.set_prose_lane_greedy(prose_lane_greedy);
+    scheduler.set_df2_carry(df2_carry);
     let dump_armed = dump_dir.is_some();
     let dump_tags: Vec<String> = job_meta.iter()
         .map(|(pname, dom, r, _)| format!("{pname}_{dom}_r{r}")).collect();
@@ -4318,7 +5624,7 @@ fn run_probe_df2_tapcap(args: &[String]) {
 /// deltas are documented findings, not gates — drafts are verify-rejected either way).
 fn run_probe_df2_prime(args: &[String]) {
     use gb10_inference::dflash2::capture::{Df2PrimeSink, Df2TapSink};
-    use gb10_inference::dflash2::round::{Df2Round, RING, RING_STRIDE};
+    use gb10_inference::dflash2::round::{Df2Round, RING, ring_stride};
     use gb10_inference::dflash2::{BLOCK, HIDDEN, TAP_CONCAT_DIM};
     use gb10_inference::dflash2::synth::SyntheticTables;
     use half::bf16;
@@ -4353,11 +5659,11 @@ fn run_probe_df2_prime(args: &[String]) {
         t
     };
     // (a1) the PROVEN chunked path: upload_chunk + inject_dev in BLOCK chunks.
-    let mut staged: Vec<bf16> = vec![bf16::default(); TAP_CONCAT_DIM * BLOCK];
+    let mut staged: Vec<bf16> = vec![bf16::default(); TAP_CONCAT_DIM * gb10_inference::dflash2::block()];
     round.reset();
     let mut pos = 0usize;
     while pos < c {
-        let n = BLOCK.min(c - pos);
+        let n = gb10_inference::dflash2::block().min(c - pos);
         for mi in 0..n {
             for k in 0..TAP_CONCAT_DIM {
                 staged[mi * TAP_CONCAT_DIM + k] = taps_cm[(pos + mi) * TAP_CONCAT_DIM + k];
@@ -4389,7 +5695,7 @@ fn run_probe_df2_prime(args: &[String]) {
             let mut m = 0f32;
             for h in 0..8usize {
                 for d in 0..128usize {
-                    let v = buf[(row + h * RING_STRIDE as usize) * 128 + d].abs();
+                    let v = buf[(row + h * ring_stride() as usize) * 128 + d].abs();
                     if v > m { m = v; }
                 }
             }
@@ -4402,7 +5708,7 @@ fn run_probe_df2_prime(args: &[String]) {
                 let other = if ki == 0 { &ring_b[li].0 } else { &ring_b[li].1 };
                 for h in 0..8usize {
                     for d in 0..128usize {
-                        let idx = (row + h * RING_STRIDE as usize) * 128 + d;
+                        let idx = (row + h * ring_stride() as usize) * 128 + d;
                         n_tot += 1;
                         if buf[idx].to_bits() != other[idx].to_bits() {
                             n_mm += 1;
@@ -4458,10 +5764,10 @@ fn run_probe_df2_prime(args: &[String]) {
         pool.release_bf16(out, HIDDEN);
     }
     gpu.set_df2_capture_off();
-    let mut staged: Vec<bf16> = vec![bf16::default(); TAP_CONCAT_DIM * BLOCK];
+    let mut staged: Vec<bf16> = vec![bf16::default(); TAP_CONCAT_DIM * gb10_inference::dflash2::block()];
     let mut pos = 0usize;
     while pos < plen {
-        let n = BLOCK.min(plen - pos);
+        let n = gb10_inference::dflash2::block().min(plen - pos);
         for mi in 0..n {
             for k in 0..TAP_CONCAT_DIM {
                 staged[mi * TAP_CONCAT_DIM + k] = dcap[(pos + mi) * TAP_CONCAT_DIM + k];
@@ -4555,10 +5861,10 @@ fn run_probe_df2_graph(args: &[String]) {
     let taps_gen = SyntheticTables::new(gb10_inference::dflash2::SYNTH_TAP_SEED);
     let tap_scale = 1.0f32 / (TAP_CONCAT_DIM as f32).sqrt();
     let c = 512usize;
-    let mut staged: Vec<bf16> = vec![bf16::default(); TAP_CONCAT_DIM * BLOCK];
+    let mut staged: Vec<bf16> = vec![bf16::default(); TAP_CONCAT_DIM * gb10_inference::dflash2::block()];
     let mut pos = 0usize;
     while pos < c {
-        let n = BLOCK.min(c - pos);
+        let n = gb10_inference::dflash2::block().min(c - pos);
         for mi in 0..n {
             let row = taps_gen.row(SyntheticTables::TABLE_TAPS, (pos + mi) as u32, TAP_CONCAT_DIM, tap_scale);
             for k in 0..TAP_CONCAT_DIM { staged[mi * TAP_CONCAT_DIM + k] = bf16::from_f32(row[k]); }
@@ -4776,7 +6082,7 @@ fn run_probe_df2_round(args: &[String], draft_dir: &str) {
 
     let max_c = 4096usize;
     let t3 = std::time::Instant::now();
-    let max_c = 4096 + 8 * 110 + BLOCK;   // headroom for the perf loop's advance
+    let max_c = 4096 + 8 * 110 + gb10_inference::dflash2::block();   // headroom for the perf loop's advance
     let round_pin = if gb10_inference::dflash2::load::is_baked(draft_dir) { None } else { Some(gb10_inference::dflash2::REAL_SHA256) };
     let mut round = Df2Round::load_pinned(draft_dir, Some(gb10_inference::dflash2::round::BorrowedW::Nvfp4(head_p)), Some(gb10_inference::dflash2::round::BorrowedW::Nvfp4(embed_p)), max_c, round_pin)
         .expect("round load");
@@ -4805,13 +6111,13 @@ fn run_probe_df2_round(args: &[String], draft_dir: &str) {
                 staged[mi * TAP_CONCAT_DIM + k] = bf16::from_f32(taps[(base + mi) * TAP_CONCAT_DIM + k]);
             } }
         };
-        let mut staged: Vec<bf16> = vec![bf16::default(); TAP_CONCAT_DIM * BLOCK];
+        let mut staged: Vec<bf16> = vec![bf16::default(); TAP_CONCAT_DIM * gb10_inference::dflash2::block()];
         let c = 512usize;
         let taps = gen_taps(c);
         {
             let mut pos = 0usize;
             while pos < c {
-                let n = BLOCK.min(c - pos);
+                let n = gb10_inference::dflash2::block().min(c - pos);
                 staged_row(&mut staged, &taps, pos);
                 round.upload_chunk(&staged, n).unwrap();
                 round.inject_dev(n, None).unwrap();
@@ -4993,6 +6299,21 @@ fn run_probe_df2_round(args: &[String], draft_dir: &str) {
         Fixture { name: "synth C=4096", taps: gen_taps(4096), c: 4096 },
         Fixture { name: "captured C=64", taps: taps_a.clone(), c: 64 },
     ];
+    // DF2 block-16: a fixture narrower than the live block cannot exercise one full round
+    // (the incremental prime and the last-chunk slicing need at least block() columns), so it is
+    // dropped with a note rather than underflowing. Real-tap coverage survives at block 16 via the
+    // captured C=64 fixture.
+    let fixtures: Vec<Fixture> = fixtures.into_iter()
+        .filter(|fx| {
+            if fx.c >= gb10_inference::dflash2::block() { true } else {
+                println!("  [SKIP ] fixture {} ({} cols < block {}) — too narrow for this block",
+                         fx.name, fx.c, gb10_inference::dflash2::block());
+                false
+            }
+        })
+        .collect();
+    assert!(!fixtures.is_empty(), "no fixture is wide enough for block {}",
+            gb10_inference::dflash2::block());
     let anchors: [u32; 3] = [12345, 1, 248319];
 
     let pred_cb: Vec<bf16> = art.weights.predecessor_codebook.iter().map(|&x| bf16::from_f32(x)).collect();
@@ -5010,14 +6331,14 @@ fn run_probe_df2_round(args: &[String], draft_dir: &str) {
         let inv = m::inv_freq(&cfg);
         // RoPE tables for the FULL context (no truncation): the device indexes cos/sin by
         // ABSOLUTE position, so any window/truncation in the mirror is a mirror bug.
-        let (cos, sin) = m::rope_tables_half(&cfg, &inv, fx.c + BLOCK);
+        let (cos, sin) = m::rope_tables_half(&cfg, &inv, fx.c + gb10_inference::dflash2::block());
         let mut ctx_m: Vec<(Vec<f32>, Vec<f32>)> = Vec::new();
         for l in &art.weights.layers {
             ctx_m.push(m::round_draft_kv_dsp(&cfg, l, &th_m, fx.c, 0, &cos, &sin));
         }
         println!("    mirror ctx built in {:.1}s", tm.elapsed().as_secs_f32());
 
-        let mut staged: Vec<bf16> = vec![bf16::default(); TAP_CONCAT_DIM * BLOCK];
+        let mut staged: Vec<bf16> = vec![bf16::default(); TAP_CONCAT_DIM * gb10_inference::dflash2::block()];
         // the FULL mirror th (all c rows) for the per-chunk gate
         let (th_raw_all, th_all) = m::round_tap_project_dsp(&cfg, &art.weights.fc, &art.weights.hidden_norm, &taps_bf16, fx.c);
         let k4_all = m::round_draft_kv_dsp(&cfg, &art.weights.layers[gb10_inference::dflash2::N_LAYERS - 1], &th_all, fx.c, 0, &cos, &sin);
@@ -5025,7 +6346,7 @@ fn run_probe_df2_round(args: &[String], draft_dir: &str) {
         let mut pos = 0usize;
         let mut chunk_bad = 0usize;
         while pos < fx.c {
-            let n = BLOCK.min(fx.c - pos);
+            let n = gb10_inference::dflash2::block().min(fx.c - pos);
             for mi in 0..n {
                 for k in 0..TAP_CONCAT_DIM {
                     staged[mi * TAP_CONCAT_DIM + k] = bf16::from_f32(fx.taps[(pos + mi) * TAP_CONCAT_DIM + k]);
@@ -5096,11 +6417,11 @@ fn run_probe_df2_round(args: &[String], draft_dir: &str) {
             pos += n;
         }
         println!("    per-chunk gates (th all fixtures + layer-4 k @C=64, {} chunks): {chunk_bad} failing chunk-gates",
-                 fx.c.div_ceil(BLOCK));
+                 fx.c.div_ceil(gb10_inference::dflash2::block()));
         check(&format!("{}: nprev == c after incremental prime", fx.name), round.nprev() == fx.c);
 
         // the device th holds ONLY the last chunk's 8 rows (the incremental path)
-        let th_last = &th_m[(fx.c - BLOCK) * HIDDEN..];
+        let th_last = &th_m[(fx.c - gb10_inference::dflash2::block()) * HIDDEN..];
         let th_dev = round.dump_th().expect("th");
         let th_bit = th_dev == th_last;
         let th_rl = rel_l2(&th_dev, th_last);
@@ -5191,10 +6512,10 @@ fn run_probe_df2_round(args: &[String], draft_dir: &str) {
             let mut emb_worst = 0f64;
             for &anchor in &anchors {
                 let dev = round.embed_probe(anchor).expect("embed probe");
-                let mut emb16 = vec![bf16::default(); BLOCK * HIDDEN];
+                let mut emb16 = vec![bf16::default(); gb10_inference::dflash2::block() * HIDDEN];
                 m::embed_row_mma(&ep_pack, &ep_sc, HIDDEN, anchor as usize, ep_gs,
                                  &mut emb16[..HIDDEN]);
-                for r in 1..BLOCK {
+                for r in 1..gb10_inference::dflash2::block() {
                     m::embed_row_mma(&ep_pack, &ep_sc, HIDDEN,
                                      gb10_inference::dflash2::MASK_TOKEN_ID as usize, ep_gs,
                                      &mut emb16[r * HIDDEN..(r + 1) * HIDDEN]);
@@ -5215,7 +6536,7 @@ fn run_probe_df2_round(args: &[String], draft_dir: &str) {
                 println!("    embed dbg anchor 12345: dev {:?}…", &dev[..6.min(dev.len())]);
                 println!("    embed dbg anchor 12345: mir {:?}…", &mir[..6.min(mir.len())]);
                 // per-row rel-L2 (row 0 = anchor, rows 1..7 = MASK) + first differing element
-                for r in 0..BLOCK {
+                for r in 0..gb10_inference::dflash2::block() {
                     let dr = &dev[r * HIDDEN..(r + 1) * HIDDEN];
                     let mr = &mir[r * HIDDEN..(r + 1) * HIDDEN];
                     let rl = rel_l2(dr, mr);
@@ -5300,10 +6621,11 @@ fn run_probe_df2_round(args: &[String], draft_dir: &str) {
             let out = round.draft_round(anchor, 2048, false, false, true).expect("round");
             n_rounds += 1;
 
-            let block_pos: Vec<usize> = (fx.c..fx.c + BLOCK).collect();
-            let mut emb16 = vec![bf16::default(); BLOCK * HIDDEN];
+            let blk_live = gb10_inference::dflash2::block();
+            let block_pos: Vec<usize> = (fx.c..fx.c + blk_live).collect();
+            let mut emb16 = vec![bf16::default(); blk_live * HIDDEN];
             m::embed_row_mma(&ep_pack, &ep_sc, HIDDEN, anchor as usize, ep_gs, &mut emb16[..HIDDEN]);
-            for r in 1..BLOCK {
+            for r in 1..gb10_inference::dflash2::block() {
                 m::embed_row_mma(&ep_pack, &ep_sc, HIDDEN,
                                  gb10_inference::dflash2::MASK_TOKEN_ID as usize, ep_gs,
                                  &mut emb16[r * HIDDEN..(r + 1) * HIDDEN]);
@@ -5314,22 +6636,29 @@ fn run_probe_df2_round(args: &[String], draft_dir: &str) {
                 let o = m::mirror_layer_forward(&cfg, l, &h, &ctx_m[li].0, &ctx_m[li].1, &block_pos, &cos, &sin);
                 h = o.h3.clone();
             }
-            let h_final = m::rb_clone(&m::rms_norm_rows(&h, &art.weights.norm, BLOCK, HIDDEN, cfg.rms_eps));
+            // DF2 block-16: the mirror's h_final must have the LIVE block's row count, not the
+            // BLOCK const — otherwise the device (block rows) and mirror (8 rows) lengths differ.
+            let h_final = m::rb_clone(&m::rms_norm_rows(&h, &art.weights.norm,
+                                       gb10_inference::dflash2::block(), HIDDEN, cfg.rms_eps));
             let hf_rl = rel_l2(&out.h_final, &h_final);
 
-            let hsel: Vec<f32> = (1..BLOCK).flat_map(|r| h_final[r * HIDDEN..(r + 1) * HIDDEN].to_vec()).collect();
-            let lg_m = m::head_logits_mirror(&head_bf16, &hsel, 7, HIDDEN, hp_gs, VOCAB);
+            let hsel: Vec<f32> = (1..gb10_inference::dflash2::block()).flat_map(|r| h_final[r * HIDDEN..(r + 1) * HIDDEN].to_vec()).collect();
+            let lg_m = m::head_logits_mirror(&head_bf16, &hsel, blk_live - 1, HIDDEN, hp_gs, VOCAB);
             let lg_d = out.logits.as_ref().unwrap();
             let lg_rl = rel_l2(lg_d, &lg_m);
 
+            // The walk reads hp rows for the levels only (the device's m8 tiles write a full
+            // block() of columns; the trailing column is garbage-but-unread at block 8, and at
+            // block 16 the 15th/16th column likewise). Mirror the READ width, not the write width.
             let hp_m = m::rb_clone(&m::linear_gemm_dsp(&art.weights.hidden_projection, &hsel,
-                                                       gb10_inference::dflash2::SELECTOR_RANK, HIDDEN, 7));
+                                                       gb10_inference::dflash2::SELECTOR_RANK, HIDDEN,
+                                                       gb10_inference::dflash2::block() - 1));
             let hp_d = out.hp.as_ref().unwrap();
             let hp_bit = *hp_d == hp_m;
 
             // GATE E: top16 EXACT on IDENTICAL logits (device bf16 logits through the mirror)
             let mut e_ok = true;
-            for p in 0..7 {
+            for p in 0..out.tokens.len() {
                 let row: Vec<f32> = (0..VOCAB).map(|v| lg_d[p * VOCAB + v]).collect();
                 let (vals, ids) = oracle.top16(&row);
                 for k in 0..16 {
@@ -5340,21 +6669,23 @@ fn run_probe_df2_round(args: &[String], draft_dir: &str) {
             if e_ok { n_exact_top16 += 1; }
 
             // GATE F: walk EXACT on identical (device hp, device cand, device unary)
+            // DF2 block-16: the live level count comes from the round output itself.
+            let nlv_r = out.tokens.len();
             let (tok_m, sc_m) = m::round_walk_mirror(hp_d, &out.candidates, &out.unary, anchor,
                                                      &pred_cb, &succ_cb,
-                                                     gb10_inference::dflash2::SELECTOR_RANK);
+                                                     gb10_inference::dflash2::SELECTOR_RANK, nlv_r);
             let f_bit = tok_m == out.tokens && sc_m == out.scores;
             if f_bit { n_exact_walk += 1; }
 
             // GATE G: end-to-end mirror path (mirror logits -> mirror top16 -> mirror walk)
-            let mut cand_m = vec![0u32; 7 * 16];
-            let mut un_m = vec![0f32; 7 * 16];
-            for p in 0..7 {
+            let mut cand_m = vec![0u32; nlv_r * 16];
+            let mut un_m = vec![0f32; nlv_r * 16];
+            for p in 0..nlv_r {
                 let (vals, ids) = oracle.top16(&lg_m[p * VOCAB..(p + 1) * VOCAB]);
                 for k in 0..16 { cand_m[p * 16 + k] = ids[k]; un_m[p * 16 + k] = vals[k]; }
             }
             let (tok_e2e, _) = m::round_walk_mirror(&hp_m, &cand_m, &un_m, anchor, &pred_cb, &succ_cb,
-                                                    gb10_inference::dflash2::SELECTOR_RANK);
+                                                    gb10_inference::dflash2::SELECTOR_RANK, nlv_r);
             let g_eq = tok_e2e == out.tokens;
             if g_eq { n_exact_path += 1; }
             println!("    anchor {anchor}: h_final {hf_rl:.3e} | logits {lg_rl:.3e} | hp bitwise {hp_bit} | top16 {} | walk {} | path {}",
@@ -5372,10 +6703,10 @@ fn run_probe_df2_round(args: &[String], draft_dir: &str) {
     println!("\n== R3: negative controls ==");
     let prime = |round: &mut Df2Round, taps: &[f32], c: usize, stop: usize| {
         round.reset();
-        let mut staged: Vec<bf16> = vec![bf16::default(); TAP_CONCAT_DIM * BLOCK];
+        let mut staged: Vec<bf16> = vec![bf16::default(); TAP_CONCAT_DIM * gb10_inference::dflash2::block()];
         let mut pos = 0usize;
         while pos < stop {
-            let n = BLOCK.min(stop - pos);
+            let n = gb10_inference::dflash2::block().min(stop - pos);
             for mi in 0..n {
                 for k in 0..TAP_CONCAT_DIM {
                     staged[mi * TAP_CONCAT_DIM + k] = bf16::from_f32(taps[(pos + mi) * TAP_CONCAT_DIM + k]);
@@ -5568,7 +6899,7 @@ let div_idx = outs.iter().enumerate().skip(1).find(|(_, o)| {
         prime(&mut round, &taps, c, c);
         round.refresh_block_pos().unwrap();
         let _ = round.draft_round(12345, 2048, false, false, false).unwrap(); // warm
-        let mut staged: Vec<bf16> = vec![bf16::default(); TAP_CONCAT_DIM * BLOCK];
+        let mut staged: Vec<bf16> = vec![bf16::default(); TAP_CONCAT_DIM * gb10_inference::dflash2::block()];
         for mi in 0..8 {
             for k in 0..TAP_CONCAT_DIM {
                 staged[mi * TAP_CONCAT_DIM + k] = bf16::from_f32(taps[(c - 8 + mi) * TAP_CONCAT_DIM + k]);
@@ -5603,7 +6934,7 @@ let div_idx = outs.iter().enumerate().skip(1).find(|(_, o)| {
         let c = 512usize;
         let taps = gen_taps(c);
         prime(&mut round, &taps, c, c - 8);
-        let mut staged: Vec<bf16> = vec![bf16::default(); TAP_CONCAT_DIM * BLOCK];
+        let mut staged: Vec<bf16> = vec![bf16::default(); TAP_CONCAT_DIM * gb10_inference::dflash2::block()];
         for mi in 0..8 {
             for k in 0..TAP_CONCAT_DIM {
                 staged[mi * TAP_CONCAT_DIM + k] = bf16::from_f32(taps[(c - 8 + mi) * TAP_CONCAT_DIM + k]);
@@ -6153,6 +7484,8 @@ fn mem_budget_report(model_dir: &str, cfg: &gb10_inference::qwen::Config,
         KM::Bf16 => (2.0, false),
         KM::Q4 => (0.75, true),
         KM::K8v4 => ((hd / 16) as f64 * 32.0 / (2.0 * hd as f64), true),
+        // k8v8: 20 B per 16 elems on BOTH channels = 40/32 = 1.25 B/elem (vs bf16 2.0).
+        KM::K8v8 => (1.25, true),
         KM::Tq => {
             let row = if std::env::var("GB10_KV_TQ").ok().as_deref() == Some("3") { 118.0 } else { 102.0 };
             (row / (2.0 * hd as f64), true)
@@ -6184,7 +7517,7 @@ fn mem_budget_report(model_dir: &str, cfg: &gb10_inference::qwen::Config,
             .and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok()))
         .map(|kb| kb * 1024).unwrap_or(0);
     let fmt = |b: f64| format!("{b:.1}");
-    let kv_label = match kv_mode { KM::Bf16 => "bf16", KM::Q4 => "q4", KM::Tq => "tq", KM::K8v4 => "k8v4" };
+    let kv_label = match kv_mode { KM::Bf16 => "bf16", KM::Q4 => "q4", KM::Tq => "tq", KM::K8v4 => "k8v4", KM::K8v8 => "k8v8" };
     eprintln!("[mem-budget] {} ({}), max-seq-len {max_seq_len}, batch {max_batch}, kv-cache {}:",
               std::path::Path::new(model_dir).file_name().unwrap_or_default().to_string_lossy(),
               if tp { "TP=2, rank-local" } else { "single node" }, kv_label);
@@ -6233,6 +7566,7 @@ fn node_serve_tp(dir: &std::path::Path, head_ip: std::net::IpAddr, mut stream: s
     // became the straggler (the "32K anomaly" — 34.6 GB/token of bf16 per-head re-reads at 26K)
     // and every serve-mode "q4" number was really a mixed q4-head/bf16-node number.
     if tpc.no_decode_graphs { std::env::set_var("GB10_NO_DECODE_GRAPHS", "1"); }
+    if tpc.fp8_prefill { std::env::set_var("GB10_FP8_PREFILL", "1"); }
     if tpc.cpu_sample { std::env::set_var("RUST_INFER_CPU_SAMPLE", "1"); }
     if tpc.no_verify_graph { std::env::set_var("GB10_NO_VERIFY_GRAPH", "1"); }
     // The 4-bit KV cache must match on BOTH ranks (the caches are all-reduced-consistent).
@@ -6242,6 +7576,7 @@ fn node_serve_tp(dir: &std::path::Path, head_ip: std::net::IpAddr, mut stream: s
     if tpc.kv_tq { std::env::set_var("GB10_KV_TQ", if tpc.kv_tq_b3 { "3" } else { "1" }); }
     // k8v4 KV (int8-K + q4-V) — same SPMD rule; mutually exclusive with the two above.
     if tpc.kv_k8v4 { std::env::set_var("GB10_KV_K8V4", "1"); }
+    if tpc.kv_k8v8 { std::env::set_var("GB10_KV_K8V8", "1"); }
     // FFN-epilogue fusion (E14) must match on BOTH ranks — one-sided fusion rounds the residual
     // differently and the all-reduce mixes divergent hiddens. None = default ON (both sides).
     match tpc.fuse_residual {
@@ -6275,13 +7610,28 @@ fn node_serve_tp(dir: &std::path::Path, head_ip: std::net::IpAddr, mut stream: s
     // S4F DFlash2 tap capture (--df2-capture): both ranks capture or neither — the sink feeds
     // the drafter's fc; config-shipped beats env drift.
     if tpc.df2_capture { std::env::set_var("GB10_DF2_CAPTURE", "1"); }
+    // DF2 block-16: install the HEAD's block on this node BEFORE the early round load below.
+    // SPMD-critical: the round's MASK row count and the verify column count are collective, so a
+    // one-sided block desyncs the verify all-reduce (and the round would size different buffers).
+    // An absent field on the wire means an older head => the serde default 8.
+    gb10_inference::dflash2::set_block(tpc.df2_block)
+        .unwrap_or_else(|e| panic!("node: shipped df2_block {}: {e}", tpc.df2_block));
+    // DF2_CARRY: the node applies the head's value (never resolved locally — SPMD). The
+    // scheduler install below is the only consumer, so there is nothing to install here; the
+    // value is read from `tpc` at the node's own `set_df2_carry` call site.
+    println!("NODE — DF2 block = {} (from the head's config)", gb10_inference::dflash2::block());
     // S9F (TP-DF2 leg): the head's resolved spec source ships on the config; when it is a DF2
     // variant the node installs GB10_DF2_TP=1 BEFORE its load so attach_tp keeps the FULL
     // lm_head for the round (the rank-local half is vocab-sharded). SPMD-relevant: a one-sided
     // capture is a weight-handle mismatch that drafts different tokens on the node.
-    if gb10_inference::batch::is_df2_src(
-        gb10_inference::batch::SpecSource::from_cli(&tpc.spec_source).unwrap_or(gb10_inference::batch::SpecSource::Mtp)) {
-        std::env::set_var("GB10_DF2_TP", "1");
+    // WI1: DSPARK borrows the same full-vocab head — same arming (see the head-side comment).
+    {
+        let src = gb10_inference::batch::SpecSource::from_cli(&tpc.spec_source)
+            .unwrap_or(gb10_inference::batch::SpecSource::Mtp);
+        if gb10_inference::batch::is_df2_src(src)
+            || src == gb10_inference::batch::SpecSource::Dspark {
+            std::env::set_var("GB10_DF2_TP", "1");
+        }
     }
     // E12/E8/E9 escapes: SPMD-relevant — the fold changes the MoE launch sequence, the E8 shard
     // changes the WEIGHT LAYOUT at load, and E9 changes the launch attributes; a one-sided escape
@@ -6300,6 +7650,7 @@ fn node_serve_tp(dir: &std::path::Path, head_ip: std::net::IpAddr, mut stream: s
         let cfg = gb10_inference::qwen::Config::from_config_json(
             &format!("{}/config.json", dir.to_string_lossy().trim_end_matches('/')))?;
         let km = if tpc.kv_tq { gb10_inference::gpu::KVCacheMode::Tq }
+                 else if tpc.kv_k8v8 { gb10_inference::gpu::KVCacheMode::K8v8 }
                  else if tpc.kv_k8v4 { gb10_inference::gpu::KVCacheMode::K8v4 }
                  else if tpc.kv_quant { gb10_inference::gpu::KVCacheMode::Q4 }
                  else { gb10_inference::gpu::KVCacheMode::Bf16 };
@@ -6357,6 +7708,30 @@ fn node_serve_tp(dir: &std::path::Path, head_ip: std::net::IpAddr, mut stream: s
                 }
             }
         } else { None };
+    // WI1 (TP-DSpark leg): the node loads the DSpark round EARLY under the same contract as the
+    // DF2 early load — the shipped blob-cache dir, the head's CalibTable outcome decides keep/drop.
+    let early_dspark: Option<(gb10_inference::dspark::round::DsparkRound,
+                              std::sync::Arc<gb10_inference::dflash2::capture::Df2TapSink>,
+                              std::sync::Arc<gb10_inference::dflash2::capture::Df2PrimeSink>)> =
+        if matches!(node_src, gb10_inference::batch::SpecSource::Dspark) {
+            if tpc.df2_draft_dir.is_empty() {
+                eprintln!("NODE — no DSpark draft artifact was shipped (df2_draft_dir empty) — \
+                           matching the head's MTP fallback via the CalibTable outcome");
+            }
+            match load_dspark_round_dir(&mut gpu, tpc.max_seq_len, &tpc.df2_draft_dir,
+                                        tpc.df2_sha_pin.as_deref()) {
+                Some(r) => {
+                    println!("NODE — DSpark round RESIDENT (spec-source=dspark, draft-dir={}) — \
+                              SPMD with the head", tpc.df2_draft_dir);
+                    Some(r)
+                }
+                None => {
+                    eprintln!("NODE — DSpark round load FAILED (draft-dir {}) — will match the \
+                               head's CalibTable outcome below", tpc.df2_draft_dir);
+                    None
+                }
+            }
+        } else { None };
 
     // SPMD calibration. The node MUST execute the identical forward sequence — the all-reduces are
     // barriers the head waits on — but DISCARDS its tables: both ranks drive MtpPolicy from the
@@ -6390,12 +7765,41 @@ fn node_serve_tp(dir: &std::path::Path, head_ip: std::net::IpAddr, mut stream: s
     // node's artifact is broken while the head's is fine — a one-sided round would desync the
     // verify all-reduces; refuse loudly. df2_round=false → drop the speculative load + disarm
     // the tap capture (both ranks serve MTP — the head's fallback, lane-branch consistent).
+    // WI1: reconcile the early DSpark round with the head's (generic) round bit. The bit means
+    // "SOME speculative round is resident on the head" — for a DSpark serve it refers to the
+    // DSpark round (bail if ours failed to load: one-sided round = verify-all-reduce desync),
+    // and for a DF2-family serve it refers to the DF2 round (the DF2 reconciliation below owns
+    // that case — None here is the EXPECTED state, not a failure). The unguarded (true, None)
+    // bail broke every DF2 TP serve after the WI1 landing (the node refused, the head's
+    // watchdog killed the session) — regression class: path-under-change tested, sibling
+    // path not; both arms now gated on their own source.
+    let dspark_round = match (df2_round, early_dspark) {
+        (true, Some(x)) => Some(x),
+        (true, None) if matches!(node_src, gb10_inference::batch::SpecSource::Dspark) =>
+            anyhow::bail!(
+                "NODE — the head ships the speculative round as resident but the DSpark round \
+                 FAILED to load here — a one-sided round would desync the verify all-reduces; \
+                 refusing to serve"),
+        (true, None) => None,   // DF2-family serve: the head's bit refers to ITS round
+        (false, Some(mut x)) => {
+            x.0.reset();
+            eprintln!("NODE — head's speculative round did NOT load — dropping the DSpark round; \
+                       serving the MTP fallback in lockstep with the head");
+            None
+        }
+        (false, None) => None,
+    };
     let (df2_round, df2_sink, df2_prime) = match (df2_round, early_round) {
         (true, Some(x)) => (Some(x.0), Some(x.1), Some(x.2)),
-        (true, None) => anyhow::bail!(
+        (true, None) if gb10_inference::batch::is_df2_src(node_src) => anyhow::bail!(
             "NODE — the head ships df2_round=true but the DFlash2 round FAILED to load here \
              — a one-sided round would desync the verify all-reduces; refusing to serve \
              (fix the artifact on this node)"),
+        // WI1: the head's round bit is GENERIC — "some speculative round is resident on the
+        // head". A non-DF2 source (dspark) never attempts a DFlash2 load, so None here is
+        // the EXPECTED state (the dspark reconciliation above handled that source), not a
+        // one-sided-round failure.
+        (true, None) => (None, None, None),
         (false, Some(x)) => {
             drop(x);
             gpu.set_df2_capture_off();
@@ -6405,12 +7809,39 @@ fn node_serve_tp(dir: &std::path::Path, head_ip: std::net::IpAddr, mut stream: s
         }
         (false, None) => (None, None, None),
     };
+    let (dr, ds, dp) = match dspark_round {
+        Some(x) => (Some(x.0), Some(x.1), Some(x.2)),
+        None => (None, None, None),
+    };
     let mut scheduler = gb10_inference::batch::BatchScheduler::with_df2(
         gpu, tpc.max_batch, tpc.max_seq_len, tpc.eos.clone(), srx, policy,
         tpc.prefix_cache, tpc.ngram_draft, tpc.tree_draft, tpc.mtp_lanes,
-        df2_round, df2_sink, df2_prime, None);
+        df2_round, df2_sink, df2_prime, dr, ds, dp, None);
+    // P14 (TP-v1 leg): the DFlash v1 BLOCK lane must exist on EVERY rank. The node replays the
+    // head's identical `decode_step` (SPMD mirror), and `dflash_lane_step` is part of that step:
+    // a node without the lane would take the MTP branch instead, drafting different tokens AND
+    // issuing a different collective sequence. The artifact arrives through the cluster sync's
+    // blob cache (the head ships `df2_draft_dir`, the config's path is rewritten to the cache) —
+    // the same slot the DF2 round and DSpark use, so no local copy is needed on the node.
+    if matches!(node_src, gb10_inference::batch::SpecSource::DFlash) {
+        if tpc.df2_draft_dir.is_empty() {
+            anyhow::bail!("NODE — the head resolved --spec-source dflash but shipped NO drafter \
+                           artifact (df2_draft_dir empty). A node without the v1 lane would \
+                           desync every verify all-reduce — refusing to serve");
+        }
+        if let Err(e) = scheduler.install_dflash_lane(&tpc.df2_draft_dir) {
+            anyhow::bail!("NODE — DFlash v1 lane install failed for {} ({e:#}); a one-sided lane \
+                           would desync every verify all-reduce — refusing to serve",
+                          tpc.df2_draft_dir);
+        }
+        println!("NODE — DFlash v1 lane RESIDENT (spec-source=dflash, draft-dir={}) — SPMD with the head",
+                 tpc.df2_draft_dir);
+    }
     // P3(b) L1: mirror the head's prose-lane routing (SPMD — the node runs the identical decode_step).
     scheduler.set_prose_lane_greedy(tpc.df2_prose_lane_greedy);
+    scheduler.set_df2_carry(tpc.df2_carry);
+    // P11 W5a: mirror the head's prefill schedule (SPMD — the op order must match the head's).
+    scheduler.set_pf_inline(tpc.pf_sched_inline);
     // PLAN/25 Phase 0: run the coverage-trace op sequence in lockstep with the head when the
     // session was launched with --df2-step-dump; the node's step_dump stays None (no records).
     scheduler.set_cov_trace(tpc.df2_step_dump);
@@ -6443,6 +7874,10 @@ fn run_dsv4_server_tp(args: &[String], model_dir: &str, port: u16) {
     let wait = std::time::Duration::from_secs(
         parse_arg(args, "--discover-wait").and_then(|s| s.parse().ok()).unwrap_or(3));
     let mut tpc = gb10_inference::tp::TpConfig::from_env();
+    if std::env::var("GB10_TPC_DEBUG").is_ok() {
+        eprintln!("[tpc-debug] serve from_env: kv_k8v8={} kv_k8v4={} env={:?}",
+                  tpc.kv_k8v8, tpc.kv_k8v4, std::env::var("GB10_KV_K8V8").ok());
+    }
     tpc.mode_serve = true;
     // Same flag as qwen serving; the serve loops resolve env GB10_MAX_SEQ_LEN > this > 4096.
     tpc.max_seq_len = parse_arg(args, "--max-seq-len").and_then(|s| s.parse::<usize>().ok()).unwrap_or(4096);
@@ -6462,6 +7897,29 @@ fn run_dsv4_server_tp(args: &[String], model_dir: &str, port: u16) {
     // draft-logits divergence would desync the acceptance SPMD sequence). LOSSLESS preserved.
     tpc.dspark_fp8_head = matches!(parse_arg(args, "--dspark-fp8-head").unwrap_or("on"),
                                     "on" | "true" | "1" | "yes");
+    // F8/P1: --fp8-prefill <on|off> — native e4m3 W8A8 tensor-core prefill GEMM for FP8
+    // trunks (1.35x TP2 / 1.63x TP1 prefill at 1500 MHz; engine cross-check 2.5e-3..1.8e-2
+    // rel-L2). DEFAULT OFF until the owner's release gate; GB10_FP8_PREFILL stays as the
+    // diagnostics/back-compat alias. Requires --mxfp4=on (allow_pf4), batch >= 256, %128
+    // geometry. Rides TpConfig so the zero-config node dispatches identically (SPMD).
+    if let Some(v) = parse_arg(args, "--fp8-prefill") {
+        tpc.fp8_prefill = matches!(&v[..], "on" | "true" | "1" | "yes");
+    }
+    if tpc.fp8_prefill {
+        std::env::set_var("GB10_FP8_PREFILL", "1");
+    }
+    // E5 (512K mandate): --rope-yarn-factor <f> — TRUNK YaRN rope override (default 1.0 =
+    // legacy tables byte-identical). f=2 on the 256K-native trunk extends the rope tables to
+    // 512K rows with the vLLM-convention per-dim ramp + mscale — the same math the dspark
+    // oracle validated (yaarn_freqs). Rides TpConfig so the node builds the same tables.
+    tpc.rope_yarn_factor = parse_arg(args, "--rope-yarn-factor").and_then(|v| v.parse::<f32>().ok())
+        .filter(|f| *f >= 1.0).unwrap_or(1.0);
+    // Single-box serves have no TpConfig (that's the --tp channel), so mirror the parsed flag
+    // into the env — build_rope_tables resolves env-first. Startup-time set_var, before any
+    // threads that could race it; under --tp the value ALSO rides TpConfig to the node.
+    if tpc.rope_yarn_factor > 1.0 {
+        std::env::set_var("GB10_ROPE_YARN_FACTOR", tpc.rope_yarn_factor.to_string());
+    }
     // item 3.3/3.4: --dspark-depth N pins the drafted-row count (None = ADAPTIVE). The pin is
     // the adaptive-depth DISABLE path — N=block reproduces the pre-3.3 fixed-depth behavior
     // bit-identically. Rides TpConfig so both ranks draft the same width (SPMD).
@@ -6546,6 +8004,29 @@ fn run_cluster_head(args: &[String]) {
     // TpConfig for SPMD).
     tpc.dspark_fp8_head = matches!(parse_arg(args, "--dspark-fp8-head").unwrap_or("on"),
                                     "on" | "true" | "1" | "yes");
+    // F8/P1: --fp8-prefill <on|off> — native e4m3 W8A8 tensor-core prefill GEMM for FP8
+    // trunks (1.35x TP2 / 1.63x TP1 prefill at 1500 MHz; engine cross-check 2.5e-3..1.8e-2
+    // rel-L2). DEFAULT OFF until the owner's release gate; GB10_FP8_PREFILL stays as the
+    // diagnostics/back-compat alias. Requires --mxfp4=on (allow_pf4), batch >= 256, %128
+    // geometry. Rides TpConfig so the zero-config node dispatches identically (SPMD).
+    if let Some(v) = parse_arg(args, "--fp8-prefill") {
+        tpc.fp8_prefill = matches!(&v[..], "on" | "true" | "1" | "yes");
+    }
+    if tpc.fp8_prefill {
+        std::env::set_var("GB10_FP8_PREFILL", "1");
+    }
+    // E5 (512K mandate): --rope-yarn-factor <f> — TRUNK YaRN rope override (default 1.0 =
+    // legacy tables byte-identical). f=2 on the 256K-native trunk extends the rope tables to
+    // 512K rows with the vLLM-convention per-dim ramp + mscale — the same math the dspark
+    // oracle validated (yaarn_freqs). Rides TpConfig so the node builds the same tables.
+    tpc.rope_yarn_factor = parse_arg(args, "--rope-yarn-factor").and_then(|v| v.parse::<f32>().ok())
+        .filter(|f| *f >= 1.0).unwrap_or(1.0);
+    // Single-box serves have no TpConfig (that's the --tp channel), so mirror the parsed flag
+    // into the env — build_rope_tables resolves env-first. Startup-time set_var, before any
+    // threads that could race it; under --tp the value ALSO rides TpConfig to the node.
+    if tpc.rope_yarn_factor > 1.0 {
+        std::env::set_var("GB10_ROPE_YARN_FACTOR", tpc.rope_yarn_factor.to_string());
+    }
     let dspark = args.iter().any(|a| a == "--bench-dspark" || a == "--dspark");
     // item 3.3: --dspark-depth N pins the drafted-row count (None = adaptive). Rides TpConfig so
     // the zero-config node drafts the same width as the head (SPMD — a width mismatch diverges
@@ -6677,6 +8158,15 @@ fn tp_serve(model_dir: &str, ctx: anyhow::Result<gb10_inference::tp::TpContext>,
         else if let Some(d) = accept { TpBranch::Accept(d) }
         else if std::env::var("GB10_TP_MTP").is_ok() || tpc.map(|c| c.mtp).unwrap_or(false) {
             TpBranch::Mtp
+        }
+        // Phase-7 F9 gate: the TP batch-invariance probe (SPMD, both ranks).
+        else if std::env::var("GB10_TP_BINV_TP").is_ok()
+            || tpc.map(|c| c.binv_tp).unwrap_or(false) {
+            TpBranch::BinvTp
+        }
+        else if std::env::var("GB10_TP_STATE_TP").is_ok()
+            || tpc.map(|c| c.state_tp).unwrap_or(false) {
+            TpBranch::StateTp
         } else {
             let step_probe = match std::env::var("GB10_TP_STEP_PROBE") {
                 Ok(d) => Some(d.parse().unwrap_or(4)),
@@ -6807,6 +8297,28 @@ fn tp_serve(model_dir: &str, ctx: anyhow::Result<gb10_inference::tp::TpContext>,
                         .map_err(|e| anyhow::anyhow!("prfx dump: {e}"))?;
                     println!("PRFX -> {}", path);
                 }
+            }
+            return Ok(());
+        }
+        // Phase-7 F9 gate: verify-width sweep through the REAL sharded verify path. Both
+        // ranks run it in SPMD lockstep (the all-reduces pair up); the head prints the
+        // verdict. Failure bails loudly on BOTH ranks.
+        TpBranch::BinvTp => {
+            let mut pool = gb10_inference::gpu::Pool::new(gpu.dev().clone());
+            let _ = &mut pool;
+            let ok = gpu.probe_binv_tp(&prompt, max_seq_len, gb10_inference::gpu::MAX_VERIFY);
+            if !ok {
+                anyhow::bail!("PROBE-BINV-TP FAIL — col 0 of a wide verify is not bit-identical to N=1");
+            }
+            return Ok(());
+        }
+        // Phase-7: the GDN decode-vs-verify state probe on the SHARDED path (the
+        // single-process --probe-state gate cannot see the TP-only residual).
+        TpBranch::StateTp => {
+            let mut pool = gb10_inference::gpu::Pool::new(gpu.dev().clone());
+            let ok = gpu.probe_state_tp(&mut pool, &prompt, max_seq_len, gb10_inference::gpu::MAX_VERIFY);
+            if !ok {
+                anyhow::bail!("PROBE-STATE-TP FAIL — verify and decode GDN state differ on the sharded path");
             }
             return Ok(());
         }
@@ -8857,19 +10369,20 @@ fn run_probe_dflash(args: &[String]) {
         .filter(|s| !s.starts_with("--"));
     let model_dir = parse_arg(args, "--model-dir")
         .expect("--probe-dflash requires --model-dir <DIR>");
-    let input = df::read_probe_input(std::path::Path::new(ctx_file), tokens_json.map(std::path::Path::new))
+    let dcfg = df::DflashCfg::load(std::path::Path::new(model_dir)).expect("read drafter config.json");
+    let input = df::read_probe_input(std::path::Path::new(ctx_file), tokens_json.map(std::path::Path::new), &dcfg)
         .expect("read ctx-features file");
-    let max_pos = input.plen + input.steps.len() + df::BLOCK + 16;
+    let max_pos = input.plen + input.steps.len() + dcfg.block + 16;
     let mut d = df::DflashDrafter::load_from_dir(std::path::Path::new(model_dir), max_pos)
         .expect("dflash load");
-    eprintln!("[dflash] Hy3-DFlash-B8 drafter: {} layers, h={}, heads {}:{} hd {}, inter {}, vocab {}, rms_eps {}, rope_theta {}",
-              d.layers.len(), d.h, d.nh, d.nkv, d.hd, d.inter, d.vocab, d.rms_eps, d.rope_theta);
+    eprintln!("[dflash] drafter: {} layers, h={}, heads {}:{} hd {}, inter {}, vocab {}, rms_eps {}, rope_theta {}, block {} (config-driven)",
+              d.layers.len(), d.h, d.nh, d.nkv, d.hd, d.inter, d.vocab, d.rms_eps, d.rope_theta, d.block);
     eprintln!("[dflash] ctx file {}: plen={}, {} step(s)", ctx_file, input.plen, input.steps.len());
     let mut pool = gb10_inference::gpu::Pool::new(d.dev.clone());
     let out_path = format!("{}.logits.bin", ctx_file);
     let mut dump: Vec<f32> = Vec::new();
     for (i, step) in input.steps.iter().enumerate() {
-        let mut kv = df::DflashKv::new(&d, step.ctx_len + df::BLOCK);
+        let mut kv = df::DflashKv::new(&d, step.ctx_len + d.block);
         let ctx_bf: Vec<half::bf16> = step.ctx.iter().map(|&x| half::bf16::from_f32(x)).collect();
         let ctx_dev = d.dev.htod_sync_copy(&ctx_bf).expect("upload ctx feature");
         let t0 = std::time::Instant::now();
@@ -8882,10 +10395,10 @@ fn run_probe_dflash(args: &[String]) {
         let top1 = d.top1(&logits);
         dump.extend_from_slice(&logits);
         println!("[dflash] step {i}: pos_start={} ctx_len={} block={} forward {ms:.2} ms",
-                 step.pos_start, step.ctx_len, df::BLOCK);
+                 step.pos_start, step.ctx_len, d.block);
         println!("[dflash] step {i} top-1: {}", top1.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(" "));
         if let Some(chain) = &step.chain {
-            let acc: Vec<bool> = (0..df::BLOCK)
+            let acc: Vec<bool> = (0..d.block)
                 .map(|k| chain.get(step.pos_start + k).map(|&t| t == top1[k]).unwrap_or(false))
                 .collect();
             println!("[dflash] step {i} accept (top-1 == chain[plen+i+k]): {}",
@@ -12149,17 +13662,17 @@ fn resolve_spec_source(args: &[String]) -> gb10_inference::batch::SpecSource {
         None => SpecSource::DFlash2Auto,
         Some(s) => match SpecSource::from_cli(&s) {
             Some(src) => src,
-            None => { eprintln!("--spec-source must be mtp|dflash2|dflash2-rq|dflash2-auto|dflash2-tree|none (got {s:?})"); std::process::exit(1); }
+            None => { eprintln!("--spec-source must be mtp|dspark|dflash2|dflash2-rq|dflash2-auto|dflash2-tree|none (got {s:?})"); std::process::exit(1); }
         },
     }
 }
 
 fn run_server(args: &[String]) {
-    // Validate the DF2 draft-dir rule FIRST — an explicit DFlash2 --spec-source without a valid
-    // --draft-dir must stop HERE, before any model load or GPU work (resolve_df2_draft_dir is
-    // pure: exits 2 on the violation, returns the dir otherwise; every downstream consumer
-    // re-resolves the identical value).
-    let _ = resolve_df2_draft_dir(args);
+    // Validate the draft-dir rule FIRST — an explicit drafter --spec-source without a valid
+    // --draft-dir must stop HERE, before any model load or GPU work (resolve_draft_dir is pure:
+    // exits 2 on the violation, returns the dir otherwise; every downstream consumer re-resolves
+    // the identical value from the same flag).
+    let _ = resolve_draft_dir(args, Some(resolve_spec_source(args)));
     // PLAN/25 Phase 0: the coverage-trace dump (--df2-step-dump <dir> / GB10_DF2_STEP_DUMP).
     // Diagnostic-only: with it unset the server is byte-identical to the standing path. A dump
     // dir we cannot create is an operator error — refuse loudly rather than serve silently
@@ -12190,8 +13703,26 @@ fn run_server(args: &[String]) {
     };
 
     let port = parse_arg(args, "--port").and_then(|s| s.parse::<u16>().ok()).unwrap_or(8000);
+    // E5 (512K mandate): --rope-yarn-factor <f> — trunk YaRN override, mirrored into the env
+    // BEFORE the model load (rope tables build at load; single-box has no TpConfig channel).
+    // Under --tp the value also rides TpConfig to the node (SPMD — both ranks' tables match).
+    if let Some(f) = parse_arg(args, "--rope-yarn-factor").and_then(|v| v.parse::<f32>().ok()) {
+        if f >= 1.0 { std::env::set_var("GB10_ROPE_YARN_FACTOR", f.to_string()); }
+    }
     let max_seq_len = parse_arg(args, "--max-seq-len").and_then(|s| s.parse::<usize>().ok()).unwrap_or(4096);
     let max_batch = parse_arg(args, "--max-batch").and_then(|s| s.parse::<usize>().ok()).unwrap_or(8);
+    // W3 (Phase 13): fail FAST on an unsupported KV-mode x lane-width combination — before the
+    // model load and before any node contact. Used to surface as a panic inside the attention
+    // dispatch after a full load (owner's TP4 k8v8 repro).
+    {
+        let tp_for_check = parse_tp_world(args).unwrap_or(1) as usize;
+        if let gb10_inference::kv_cache::KvLaneVerdict::Reject(msg) =
+            gb10_inference::kv_cache::kv_lane_check(parse_arg(args, "--kv-cache"), max_batch, tp_for_check)
+        {
+            eprintln!("error: {msg}");
+            std::process::exit(2);
+        }
+    }
     // TP serving (TP item A): sync the model + config to ONE --node, bring up the RDMA link, and
     // run this same server with its BatchScheduler in SPMD lockstep with the node's mirror.
     // `--tp [N]` is the single authority for the rank count (bare --tp = 2; absent = no TP run).
@@ -12200,9 +13731,18 @@ fn run_server(args: &[String]) {
     // S9F (TP-DF2 leg): set GB10_DF2_TP BEFORE the model load — the shard-at-load path's Q4
     // assembly reads it in the worker (the round's full-lm_head capture); attach_tp's
     // tp_shard_weights reads it later for the non-shard-at-load path. The node installs the
-    // same env from the shipped config before ITS load.
-    if tp && gb10_inference::batch::is_df2_src(resolve_spec_source(args)) {
-        std::env::set_var("GB10_DF2_TP", "1");
+    // same env from the shipped config before ITS load. WI1: the DSPARK source needs the SAME
+    // arming — its round borrows the identical full-vocab head/embed (the round's head GEMM
+    // reads all v rows); without it both ranks borrow the E7 vocab shard (the node's
+    // two-stage head quantize then hits the full-m vs shard-len shape assert — TP=2 boot
+    // crash 2026-09-06; before the two-stage landing the same miss was the acceptance-0.0%
+    // class). DSpark is NOT in is_df2_src (that's the DFlash2 family), so it is added here.
+    {
+        let src = resolve_spec_source(args);
+        if tp && (gb10_inference::batch::is_df2_src(src)
+                  || src == gb10_inference::batch::SpecSource::Dspark) {
+            std::env::set_var("GB10_DF2_TP", "1");
+        }
     }
 
     // DSV4 (DeepSeek-V4) serving rides the SAME interface as every other model:
@@ -12320,6 +13860,8 @@ fn run_server(args: &[String]) {
             tpc.mtp_force = mtp_force_pre;
             tpc.mtp_depth_pin = mtp_depth_pre;
             tpc.no_decode_graphs = std::env::var("GB10_NO_DECODE_GRAPHS").is_ok();
+                    tpc.fp8_prefill = std::env::var("GB10_FP8_PREFILL").is_ok();
+        tpc.fp8_prefill = std::env::var("GB10_FP8_PREFILL").is_ok();
             tpc.cpu_sample = std::env::var("RUST_INFER_CPU_SAMPLE").is_ok();
             tpc.eos = tok_pre.stop_token_ids(pre.eos_token_id);
             tpc.calib_prompt = tok_pre.encode("The capital of France is", true)
@@ -12332,7 +13874,8 @@ fn run_server(args: &[String]) {
             // MANDATORY user-supplied path (owner rule: no default, no fallback constant; a bad
             // path stops the app). The head's resolved dir ships on the config AND the artifact
             // bytes ride the sync (cluster.rs DraftManifest) into the node's blob cache.
-            tpc.df2_draft_dir = resolve_df2_draft_dir(args).unwrap_or_default();
+            tpc.df2_draft_dir = resolve_draft_dir(args, Some(resolve_spec_source(args)))
+                .unwrap_or_default();
             // S9F+ (2026-08-29): ship the --sha256 artifact-pin override (None = published
             // REAL_SHA256) so the node loads the same artifact under the same pin — a one-sided
             // pin would be a round-load mismatch between ranks.
@@ -12341,6 +13884,13 @@ fn run_server(args: &[String]) {
             // side channel). DEFAULT OFF until the Phase D quad truth flips it.
             tpc.df2_round_shard = matches!(parse_arg(args, "--df2-round-shard").unwrap_or("on"),
                                            "on" | "true" | "1" | "yes");
+            // DF2 block-16: ship the resolved block so every rank sizes the identical round and
+            // verify (SPMD — a one-sided block is a collective mismatch).
+            tpc.df2_block = gb10_inference::dflash2::block();
+            // DF2_CARRY: ship the prefix-cache carry toggle (SPMD-critical — a one-sided carry
+            // would desync the verify all-reduce; every rank must make the same admit decision).
+            tpc.df2_carry = matches!(parse_arg(args, "--df2-carry").unwrap_or("off"),
+                                     "on" | "true" | "1" | "yes");
             // P3(b) L1: prose-lane routing (SPMD-critical — the node runs the identical decode_step).
             tpc.df2_prose_lane_greedy = matches!(parse_arg(args, "--df2-prose-lane").unwrap_or("greedy-drafts"),
                                                  "greedy-drafts" | "greedy" | "argmax");
@@ -12392,6 +13942,7 @@ fn run_server(args: &[String]) {
                 }
             };
             let km = if matches!(std::env::var("GB10_KV_TQ").ok().as_deref(), Some("1") | Some("3")) { gb10_inference::gpu::KVCacheMode::Tq }
+                     else if std::env::var("GB10_KV_K8V8").ok().as_deref() == Some("1") { gb10_inference::gpu::KVCacheMode::K8v8 }
                      else if std::env::var("GB10_KV_K8V4").ok().as_deref() == Some("1") { gb10_inference::gpu::KVCacheMode::K8v4 }
                      else if std::env::var("GB10_KV_QUANT").is_ok() { gb10_inference::gpu::KVCacheMode::Q4 }
                      else { gb10_inference::gpu::KVCacheMode::Bf16 };
@@ -12430,10 +13981,16 @@ fn run_server(args: &[String]) {
         // for rotations past the end of the tables. Going UP to the model max is fully supported (KV is
         // ~64 KB/token â 256K/batch-2 â 34 GB, fine on 128 GB, just slow to prefill); going beyond is not.
         let model_max = cfg.max_position_embeddings;
-        let max_seq_len = if max_seq_len > model_max {
-            eprintln!("[warn] --max-seq-len {} exceeds the model max_position_embeddings {} â clamping to {}.",
-                      max_seq_len, model_max, model_max);
-            model_max
+        // E5 (512K mandate): a trunk YaRN factor > 1 EXTENDS the rope tables (build_rope_tables
+        // sizes them to factor x native), so the seq-len ceiling rises with it - clamp against
+        // the extended ceiling, not the native one. No yarn -> native clamp, unchanged.
+        let yarn = std::env::var("GB10_ROPE_YARN_FACTOR").ok()
+            .and_then(|v| v.parse::<f32>().ok()).filter(|f| *f >= 1.0).unwrap_or(1.0f32);
+        let eff_max = ((model_max as f64) * (yarn as f64)).ceil() as usize;
+        let max_seq_len = if max_seq_len > eff_max {
+            eprintln!("[warn] --max-seq-len {} exceeds the model max {} (effective {} at rope yarn factor {}) - clamping to {}.",
+                      max_seq_len, model_max, eff_max, yarn, eff_max);
+            eff_max
         } else { max_seq_len };
         println!("Context: --max-seq-len {} (model max {}). KV cache ~{:.1} GB at batch {}.",
                  max_seq_len, model_max,
@@ -12493,6 +14050,9 @@ fn run_server(args: &[String]) {
         // past the end of its own turn and hallucinate the next one: a fabricated `user` message, a new
         // `<think>` block, sometimes a second conflicting tool call. See QwenTokenizer::stop_token_ids.
         let eos = tokenizer.stop_token_ids(config_eos);
+        // A3: AppState needs its own copy of the stop set (the original `eos` is moved into the
+        // TP config below).
+        let stop_ids_for_state = eos.clone();
         println!("Stop tokens: {:?}  (config.json advertises {})", eos, config_eos);
 
         // Serving-option values, parsed once here so the TP config (below) and BatchScheduler::new
@@ -12502,6 +14062,8 @@ fn run_server(args: &[String]) {
         let ngram_draft: usize = parse_arg(args, "--ngram-draft").and_then(|s| s.parse().ok()).unwrap_or(0);
         let tree_draft = matches!(parse_arg(args, "--tree-draft").unwrap_or("off"), "on"|"true"|"1"|"yes");
         let mtp_lanes = matches!(parse_arg(args, "--mtp-lanes").unwrap_or("off"), "on"|"true"|"1"|"yes");
+        // P11 W5a: --prefill-sched <inline|cursor> (default cursor = the scheduler default-ON).
+        let pf_sched_inline = parse_arg(args, "--prefill-sched").map(|s| s == "inline").unwrap_or(false);
 
         // TP=2 serving bring-up (TP item A). Order matters and mirrors the node's `node_serve_tp`:
         // ship the model + config, bring up the RDMA link, attach TP — from here on EVERY forward
@@ -12537,9 +14099,11 @@ fn run_server(args: &[String]) {
                     tpc.ngram_draft = ngram_draft;
                     tpc.tree_draft = tree_draft;
                     tpc.mtp_lanes = mtp_lanes;
+                    tpc.pf_sched_inline = pf_sched_inline;
                     tpc.mtp_force = mtp_force;
                     tpc.mtp_depth_pin = mtp_depth;
                     tpc.no_decode_graphs = std::env::var("GB10_NO_DECODE_GRAPHS").is_ok();
+                    tpc.fp8_prefill = std::env::var("GB10_FP8_PREFILL").is_ok();
                     tpc.cpu_sample = std::env::var("RUST_INFER_CPU_SAMPLE").is_ok();
                     tpc.no_verify_graph = std::env::var("GB10_NO_VERIFY_GRAPH").is_ok();
                     // --device-loop (device-resident token loop): OFF by default until gated.
@@ -12552,14 +14116,24 @@ fn run_server(args: &[String]) {
                     // S9F (TP-DF2 leg): same as the pre-TP path — ship the resolved source +
                     // draft dir so the node's policy and round load match the head's.
                     tpc.spec_source = resolve_spec_source(args).cli_name().to_string();
-                    // MANDATORY user-supplied path (same rule as the pre-TP fill above).
-                    tpc.df2_draft_dir = resolve_df2_draft_dir(args).unwrap_or_default();
+                    // MANDATORY user-supplied path (same rule as the pre-TP fill above). The
+                    // WI1 DSpark source resolves through its own resolver (mandatory when
+                    // --spec-source dspark); both ride df2_draft_dir (the shipped-artifact slot).
+                    // ONE flag for every source (dflash2 | dspark | dflash): the resolved dir is
+                    // the generic shipped-artifact slot the node loads from its blob cache.
+                    tpc.df2_draft_dir = resolve_draft_dir(args, Some(resolve_spec_source(args)))
+                        .unwrap_or_default();
                     // S9F+ (2026-08-29): ship the --sha256 artifact-pin override (same as the
                     // pre-TP fill — the node must load the same artifact under the same pin).
                     tpc.df2_sha_pin = parse_arg(args, "--sha256").map(str::to_string);
                     // P2: the round-sharding toggle (same resolution as the pre-TP fill above).
                     tpc.df2_round_shard = matches!(parse_arg(args, "--df2-round-shard").unwrap_or("on"),
                                                    "on" | "true" | "1" | "yes");
+                    // DF2 block-16: same as the pre-TP fill above (SPMD).
+                    tpc.df2_block = gb10_inference::dflash2::block();
+                    // DF2_CARRY: same as the pre-TP fill above (SPMD).
+                    tpc.df2_carry = matches!(parse_arg(args, "--df2-carry").unwrap_or("off"),
+                                             "on" | "true" | "1" | "yes");
                     // P3(b) L1: prose-lane routing (SPMD-critical — the node runs the identical decode_step).
                     tpc.df2_prose_lane_greedy = matches!(parse_arg(args, "--df2-prose-lane").unwrap_or("greedy-drafts"),
                                                          "greedy-drafts" | "greedy" | "argmax");
@@ -12632,10 +14206,10 @@ fn run_server(args: &[String]) {
         // requested; an absent/failed artifact degrades to the MTP fallback (never a hard failure).
         let df2 = if gb10_inference::batch::is_df2_src(spec_source) {
             // Mandatory only for an EXPLICIT DF2 --spec-source; the resolved default falls back
-            // to MTP when no --draft-dir was supplied (resolve_df2_draft_dir -> None).
+            // to MTP when no --draft-dir was supplied (resolve_draft_dir -> None).
             let args = std::env::args().collect::<Vec<_>>();
             let sha_pin = parse_arg(&args, "--sha256");
-            match resolve_df2_draft_dir(&args) {
+            match resolve_draft_dir(&args, Some(spec_source)) {
                 Some(d) => load_df2_round_dir(&mut gpu, max_seq_len, &d, sha_pin),
                 None => None,
             }
@@ -12644,6 +14218,23 @@ fn run_server(args: &[String]) {
             println!("[df2] DFlash2 round RESIDENT (spec-source={}) — serving via the S4F \
                       integrated round (b==1 lanes); MTP remains the fallback (standing directive)",
                      spec_source.cli_name());
+        }
+        // WI1: the DSpark drafter (--spec-source dspark). Same fail-soft load contract; the
+        // residency line is the startup-log proof the acceptance gate greps for.
+        let dspark = if matches!(spec_source, gb10_inference::batch::SpecSource::Dspark) {
+            let args = std::env::args().collect::<Vec<_>>();
+            match resolve_draft_dir(&args, Some(spec_source)) {
+                Some(d) => {
+                    let sha_pin = parse_arg(&args, "--sha256");
+                    load_dspark_round_dir(&mut gpu, max_seq_len, &d, sha_pin)
+                }
+                None => None,
+            }
+        } else { None };
+        if dspark.is_some() {
+            println!("[dspark] DSpark round RESIDENT (spec-source=dspark) — serving via the WI1 \
+                      Qwen3.8-27B-DSpark round (b==1 lanes); MTP remains the fallback (standing \
+                      directive)");
         }
         // TP serving: ship the head's cost tables to EVERY node. Each node has already run the
         // identical SPMD calibration forwards (and discarded its own tables); every rank's MtpPolicy
@@ -12654,7 +14245,12 @@ fn run_server(args: &[String]) {
             let ctx_r: Vec<(u32, Vec<(u32, f32)>)> = mtp_r.iter()
                 .map(|&(c, ref t)| (c as u32, t.iter().map(|&(d, r)| (d as u32, r)).collect()))
                 .collect();
-            let calib = gb10_inference::tp_serve::ServingMsg::CalibTable { ctx_r, df2_round: df2.is_some() };
+            // WI1: df2_round is the GENERIC round-residency bit — a resident DSpark round
+            // means the node must hold one too (a one-sided round is a lane-branch mismatch).
+            let calib = gb10_inference::tp_serve::ServingMsg::CalibTable {
+                ctx_r,
+                df2_round: df2.is_some() || dspark.is_some(),
+            };
             for s in streams.iter_mut() {
                 gb10_inference::tp_serve::send_serving(s, &calib)
                     .expect("ship MTP calib table to node");
@@ -12713,14 +14309,39 @@ fn run_server(args: &[String]) {
             Some((r, s, p)) => (Some(r), Some(s), Some(p)),
             None => (None, None, None),
         };
+        let (dspark_round, dspark_sink, dspark_prime) = match dspark {
+            Some((r, s2, p2)) => (Some(r), Some(s2), Some(p2)),
+            None => (None, None, None),
+        };
         let mut scheduler = gb10_inference::batch::BatchScheduler::with_df2(
             gpu, max_batch, max_seq_len, eos, srx, policy, prefix_cache, ngram_draft, tree_draft, mtp_lanes,
-            df2_round, df2_sink, df2_prime, cov_dump);
+            df2_round, df2_sink, df2_prime, dspark_round, dspark_sink, dspark_prime, cov_dump);
+        // P14: the DFlash v1 lane (--spec-source dflash). The artifact is REQUIRED and the install is
+        // loud: a missing dir or a failed load refuses to start rather than silently serving MTP.
+        if matches!(spec_source, gb10_inference::batch::SpecSource::DFlash) {
+            // Same single resolver every other source uses; for an explicit `dflash` source it is
+            // MANDATORY (it exits 2 with the named remedy rather than serving MTP silently).
+            let d = resolve_draft_dir(&args, Some(spec_source))
+                .expect("resolve_draft_dir is mandatory for --spec-source dflash");
+            if let Err(e) = scheduler.install_dflash_lane(&d) {
+                eprintln!("FATAL: DFlash v1 lane install failed for {d}: {e:#}");
+                std::process::exit(2);
+            }
+            println!("[dflash] v1 lane RESIDENT (spec-source=dflash) — greedy b==1 lanes; unprimed \
+                      requests (prefix-cache reuse) are served by MTP and logged");
+        }
+        // P11 W5a: the prefill-schedule escape (default = cursor, the owner-blessed default-ON).
+        scheduler.set_pf_inline(pf_sched_inline);
         // P3(b) L1: prose-lane routing (default rq = sampled real-q selector; greedy-drafts =
         // argmax drafts + the existing sampled-verify path). Affects the DFlash2Auto General domain.
         scheduler.set_prose_lane_greedy(
             matches!(parse_arg(args, "--df2-prose-lane").unwrap_or("greedy-drafts"),
                      "greedy-drafts" | "greedy" | "argmax"));
+        // DF2_CARRY: keep DFlash2 in the draft seat across a prefix-cache hit (default off).
+        // NOTE this must be set on the SERVING scheduler — the bench path builds its own.
+        scheduler.set_df2_carry(
+            matches!(parse_arg(args, "--df2-carry").unwrap_or("off"),
+                     "on" | "true" | "1" | "yes"));
         // If the scheduler dies, the server must DIE WITH IT. It used to be a bare tokio::spawn: a panic
         // inside (an OOM, say) killed the task silently, and the HTTP layer went on accepting requests
         // and answering every one of them with ZERO TOKENS, forever. A loud crash is recoverable; a
@@ -12821,6 +14442,23 @@ fn run_server(args: &[String]) {
             None => None,
         };
 
+        // --tool-call-format <xml|json>: Froggeric-class templates accept a `tool_call_format`
+        // kwarg; 'json' selects the model's NATIVE Qwen tool-call syntax (what our server's
+        // tool parser handles). Templates that ignore the variable are unaffected.
+        let mut tokenizer = tokenizer;
+        if let Some(fmt) = parse_arg(args, "--tool-call-format") {
+            match fmt {
+                "xml" | "json" => tokenizer.tool_call_format = Some(fmt.to_string()),
+                other => {
+                    eprintln!("--tool-call-format must be xml|json (got '{other}')");
+                    std::process::exit(1);
+                }
+            }
+        }
+        // Froggeric-class agentic guard: thinking auto-disables when the request carries tools.
+        if args.iter().any(|a| a == "--auto-disable-thinking-with-tools") {
+            tokenizer.auto_disable_think_tools = true;
+        }
         let state = AppState {
             scheduler: stx,
             tokenizer: Arc::new(tokenizer),
@@ -12840,7 +14478,16 @@ fn run_server(args: &[String]) {
                         std::process::exit(1);
                     }
                 }),
-            // --output-prompts [cap]: absent = off; bare flag = 6000-char rendered-prompt
+            // W1 (Phase 13): `--thinking auto|on|off`. Auto is the default and passes NOTHING to
+            // the chat template, so the model's own chat_template.jinja decides — this is the fix
+            // that lets a customer-edited template (thinking defaulted OFF) actually take effect.
+            // A request's `chat_template_kwargs.enable_thinking` overrides this per call.
+            thinking: parse_arg(args, "--thinking").map(|s| {
+                gb10_inference::tokenizer::ThinkingMode::parse(s).unwrap_or_else(|| {
+                    eprintln!("--thinking must be auto|on|off (got '{s}')");
+                    std::process::exit(1);
+                })
+            }).unwrap_or(gb10_inference::tokenizer::ThinkingMode::Auto),
             // excerpt; explicit numeric arg overrides the cap.
             output_prompts: args.iter().position(|a| a == "--output-prompts")
                 .map(|i| args.get(i + 1).and_then(|v| v.parse::<usize>().ok()).unwrap_or(6000))
@@ -12854,8 +14501,63 @@ fn run_server(args: &[String]) {
             vision_gpu: vision_gpu.clone(),
             vision_cpu,
             otel: otel_sink,
+            stop_ids: stop_ids_for_state,
         };
 
+        // Phase-2 A3: ONE boot line that pins the rendering/penalty configuration this process
+        // actually runs under. Every Phase-1 report had to infer these from campaign notes, and
+        // the ledger's config fingerprint could not tell two legs apart without them (te_hard2
+        // vs te_hard3). Log line only — nothing here changes behaviour.
+        {
+            let (tpl_origin, tpl_sha, tpl_bytes) = state.tokenizer.template_meta.clone()
+                .unwrap_or_else(|| ("<none: legacy hand-rolled template>".to_string(),
+                                    "<none>".to_string(), 0));
+            // P10 W3a (PLAN/PRODCONFIG_TABLE.md §2): the fields above are tokenizer/serving state.
+            // The record block a PERFORMANCE leg needs also carries the LANE, TOPOLOGY and DRAFT
+            // knobs — without them an FP8 trunk cannot be told from an NVFP4 one, TP2 from TP4,
+            // depth 4 from depth 8, block 8 from block 16 (the doc's §0.2 finding: rule 11's
+            // "config of record = its [boot] line" was UNSATISFIABLE as written). These are the
+            // RESOLVED values where a resolver exists (`--mtp=auto` prints what is configured),
+            // and `<default:...>` marks a flag that was not passed, so a default is never silently
+            // read as an explicit choice (the `--df2-round-shard` default-on trap of K2 §W0').
+            let tp_world_boot = parse_tp_world(args).unwrap_or(1);
+            let nodes_boot = parse_arg(args, "--nodes").unwrap_or("<none>");
+            let kvb = parse_arg(args, "--kv-cache").unwrap_or("<default:bf16>");
+            let mtp_boot = parse_arg(args, "--mtp").unwrap_or("<default:auto>");
+            let mtp_depth_boot = parse_arg(args, "--mtp-depth").unwrap_or("<default:auto>");
+            let spec_src_boot = parse_arg(args, "--spec-source").unwrap_or("<default:mtp>");
+            let df2_block_boot = parse_arg(args, "--df2-block")
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| format!("<default:{}>", gb10_inference::dflash2::block()));
+            let df2_carry_boot = parse_arg(args, "--df2-carry").unwrap_or("<default:off>");
+            let df2_shard_boot = parse_arg(args, "--df2-round-shard").unwrap_or("<default:on>");
+            let mtp_lanes_boot = matches!(parse_arg(args, "--mtp-lanes").unwrap_or("off"),
+                                          "on" | "true" | "1" | "yes");
+            let pf_sched_boot = parse_arg(args, "--prefill-sched").unwrap_or("cursor");
+            let fp8_pf_boot = parse_arg(args, "--fp8-prefill").unwrap_or("<default:off>");
+            let draft_boot = parse_arg(args, "--draft-dir").unwrap_or("<none>");
+            eprintln!("[boot] model_dir={} template={} template_sha256={} template_bytes={} \
+                       tool_call_format={} reasoning_effort_default={} thinking={} \
+                       auto_disable_thinking_with_tools={} presence_penalty_default={} \
+                       rep_penalty_default={} freq_penalty_default={} max_seq_len={} \
+                       prefix_cache={} max_batch={} stop_ids={:?} \
+                       trunk_dir={} tp_world={} nodes={} kv_cache={} mtp={} mtp_depth={} \
+                       spec_source={} df2_block={} df2_carry={} df2_round_shard={} mtp_lanes={} \
+                       prefill_sched={} fp8_prefill={} draft_dir={} tripwire={:?} pool_census={}",
+                tokenizer_path, tpl_origin, tpl_sha, tpl_bytes,
+                state.tokenizer.tool_call_format.as_deref().unwrap_or("<template-default:xml>"),
+                state.reasoning_effort.as_deref().unwrap_or("<template-default:medium>"),
+                state.thinking.as_str(),
+                state.tokenizer.auto_disable_think_tools,
+                state.default_presence_penalty, state.default_rep_penalty,
+                state.default_frequency_penalty, state.max_seq_len, state.prefix_cache,
+                max_batch, state.stop_ids,
+                parse_arg(args, "--model-dir").unwrap_or("<none>"),
+                tp_world_boot, nodes_boot, kvb, mtp_boot, mtp_depth_boot,
+                spec_src_boot, df2_block_boot, df2_carry_boot, df2_shard_boot, mtp_lanes_boot,
+                pf_sched_boot, fp8_pf_boot, draft_boot,
+                gb10_inference::gpu::tripwire_get(), gb10_inference::gpu::census_on());
+        }
         let app = create_router(state);
         let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await.unwrap();
         println!("OpenAI-compatible server running on http://0.0.0.0:{}", port);

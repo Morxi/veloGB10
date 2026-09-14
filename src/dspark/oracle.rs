@@ -348,7 +348,10 @@ impl DsparkOracle {
 
     // -- primitive numerics (fixed order, deterministic) --------------------
 
-    /// qwen3 zero-centered RMSNorm: `(x / rms(x)) * (1 + w)` over the LAST axis of each row.
+    /// RMSNorm `(x / rms(x)) * w` over the LAST axis of each row — FULL GAINS (the artifact
+    /// stores w≈1; SpecForge trains with HF `Qwen3RMSNorm` = plain `w·x`, and the checkpoint
+    /// values confirm: every drafter norm weight has mean ≈ +1.0, while the TRUNK's are ≈ 0
+    /// under its own `(1+w)` convention. The two checkpoints differ — §7 norm-convention trap).
     fn rms_norm_rows(&self, x: &[f32], w: &[f32], rows: usize, n: usize) -> Vec<f32> {
         let eps = self.cfg.rms_eps;
         let mut out = vec![0.0f32; rows * n];
@@ -361,7 +364,7 @@ impl DsparkOracle {
             let inv = 1.0f32 / (sum_sq / n as f32 + eps).sqrt();
             let or = &mut out[r * n..(r + 1) * n];
             for (i, &v) in xr.iter().enumerate() {
-                or[i] = v * inv * (1.0f32 + w[i]);
+                or[i] = v * inv * w[i];
             }
         }
         out
@@ -382,7 +385,7 @@ impl DsparkOracle {
                 }
                 let inv = 1.0f32 / (sum_sq / hd as f32 + eps).sqrt();
                 for d in 0..hd {
-                    x[base + d] *= inv * (1.0f32 + w[d]);
+                    x[base + d] *= inv * w[d];
                 }
             }
         }
@@ -408,8 +411,10 @@ impl DsparkOracle {
         out
     }
 
-    /// Apply rotary (rotate_half) to the LAST `head_dim` dims of each `(row, head)` slice.
-    /// `positions` has one entry per row. `freqs` is the YaRN table (DECISION H).
+    /// Apply rotary to the LAST `head_dim` dims of each `(row, head)` slice — NEOX/`rotate_half`
+    /// pairing `(j, j+half)` with angle `pos * freq[j]` (SpecForge `dflash.py` imports
+    /// `rotate_half` from HF qwen3; vLLM's `get_rope` default `is_neox_style=True` agrees —
+    /// BOTH references are half-split, NOT interleaved).
     fn rope_apply(
         &self,
         x: &mut [f32],
@@ -429,26 +434,35 @@ impl DsparkOracle {
                 for j in 0..half {
                     let c = cos[p * half + j];
                     let s = sin[p * half + j];
-                    let re = x[base + 2 * j];
-                    let im = x[base + 2 * j + 1];
-                    x[base + 2 * j] = re * c - im * s;
-                    x[base + 2 * j + 1] = re * s + im * c;
+                    let x1 = x[base + j];
+                    let x2 = x[base + half + j];
+                    x[base + j] = x1 * c - x2 * s;
+                    x[base + half + j] = x2 * c + x1 * s;
                 }
             }
         }
     }
 
-    /// Precompute (grow) the cos/sin tables up to `max_pos` positions (deterministic).
+    /// Precompute (grow) the cos/sin tables up to `max_pos` positions (deterministic). The
+    /// YaRN mscale (`0.1·ln(factor)+1` — vLLM `yarn_get_mscale`, folded into the cos/sin
+    /// cache by `YaRNScalingRotaryEmbedding._compute_cos_sin_cache`) multiplies BOTH tables:
+    /// q and k both scale by mscale, so attention scores scale by mscale². Without it the
+    /// softmax runs too flat by ×1.813 at factor 32.
     fn rope_tables(&self, max_pos: usize) -> (Vec<f32>, Vec<f32>) {
         let half = self.cfg.head_dim / 2;
+        let mscale = if self.cfg.rope_factor > 1.0 {
+            0.1f32 * self.cfg.rope_factor.ln() + 1.0f32
+        } else {
+            1.0f32
+        };
         let mut cos = vec![0.0f32; max_pos * half];
         let mut sin = vec![0.0f32; max_pos * half];
         for p in 0..max_pos {
             let pf = p as f32;
             for i in 0..half {
                 let ang = pf * self.freqs[i];
-                cos[p * half + i] = ang.cos();
-                sin[p * half + i] = ang.sin();
+                cos[p * half + i] = ang.cos() * mscale;
+                sin[p * half + i] = ang.sin() * mscale;
             }
         }
         (cos, sin)
@@ -627,22 +641,27 @@ impl DsparkOracle {
         self.rms_norm_rows(&h, &self.weights.norm, block, hidden)
     }
 
-    /// K-DSP3 ref: the left→right Markov chain (DECISION L). `logits0` `[block, vocab]`;
-    /// `h` is accepted for API symmetry (unused — the latents come from `W1[d[k-1]]`).
-    pub fn markov_chain(&self, logits0: &[f32], _h: &[f32]) -> MarkovOut {
+    /// The left→right Markov chain, REFERENCE semantics (vLLM `speculator.py::_sample_sequential`
+    /// + `dspark.py::apply_block_logits`): the bias `W2 @ W1[prev]` is added at EVERY position
+    /// 0..6, teacher-forced — `prev` is seeded with the ANCHOR token (the input id at query
+    /// offset 0), then each sampled draft. `logits0` `[block, vocab]`.
+    pub fn markov_chain(&self, logits0: &[f32], anchor: u32) -> MarkovOut {
         let vocab = self.cfg.vocab;
         let rank = self.cfg.markov_rank;
         let block = self.cfg.block;
         debug_assert_eq!(logits0.len(), block * vocab);
         let mut tokens = [0u32; 7];
-        tokens[0] = argmax(&logits0[0..vocab]) as u32;
         let mut latents = vec![0.0f32; (block - 1) * rank];
-        for k in 1..block {
-            let prev = tokens[k - 1] as usize;
-            let w1row = &self.weights.w1[prev * rank..(prev + 1) * rank];
-            latents[(k - 1) * rank..k * rank].copy_from_slice(w1row);
-            // logits_k = logits0_k + W2 @ W1[d[k-1]], argmax (greedy, DECISION E).
+        let mut prev = anchor as usize;
+        for k in 0..block {
+            if k > 0 {
+                // latents[k-1] = W1[d[k-1]] (the confidence head's rows — semantics unchanged).
+                latents[(k - 1) * rank..k * rank]
+                    .copy_from_slice(&self.weights.w1[prev * rank..(prev + 1) * rank]);
+            }
+            // logits_k = logits0_k + W2 @ W1[prev], argmax (greedy, DECISION E).
             let base = &logits0[k * vocab..(k + 1) * vocab];
+            let w1row = &self.weights.w1[prev * rank..(prev + 1) * rank];
             let mut best = f32::NEG_INFINITY;
             let mut best_i = 0usize;
             for o in 0..vocab {
@@ -657,6 +676,7 @@ impl DsparkOracle {
                 }
             }
             tokens[k] = best_i as u32;
+            prev = best_i;
         }
         MarkovOut { tokens, latents }
     }
@@ -714,7 +734,7 @@ impl DsparkOracle {
         }
         let h = self.block_forward(&emb, &kv, l);
         let logits0 = self.lm_head(&h, block);
-        let mo = self.markov_chain(&logits0, &h);
+        let mo = self.markov_chain(&logits0, ctx.anchor);
         let co = self.confidence(&h, &mo.latents, ctx.confidence_threshold);
         RoundOut {
             th,
@@ -779,7 +799,10 @@ pub fn truncate(survival: &[f32; 6], threshold: f32) -> u8 {
 
 /// HF-canonical YaRN inverse-frequency table (DECISION H). `rdim` = head_dim (full rotary). The
 /// correction-range math is python-f64 (`find_correction_dim` / `find_correction_range`) exactly as
-/// the transformers reference computes it; the ramp/mask are torch-f32 op order.
+/// the transformers/vLLM reference computes it — `low = floor(find(beta_fast))`,
+/// `high = ceil(find(beta_slow))` (vLLM `common.py::yarn_find_correction_range(low_rot=beta_fast,
+/// high_rot=beta_slow)`); the earlier version had the two betas SWAPPED, which inverted the
+/// ramp (interpolated dims extrapolated and vice versa). The ramp/mask are torch-f32 op order.
 pub fn yaarn_freqs(
     rdim: usize,
     base: f32,
@@ -801,9 +824,11 @@ pub fn yaarn_freqs(
         dim * ((orig_ctx as f64) / (num_rot * 2.0 * std::f64::consts::PI)).ln()
             / (2.0 * (base as f64).ln())
     };
-    // find_correction_range(beta_fast, beta_slow): low = floor(find(high_rot)), high = ceil(find(low_rot)).
-    let low = find(beta_slow as f64).floor().max(0.0) as i32;
-    let high = find(beta_fast as f64).ceil().min(dim - 1.0) as i32;
+    // find_correction_range(beta_fast, beta_slow): low = floor(find(beta_fast)),
+    // high = ceil(find(beta_slow)) — beta_fast(32) yields the SMALLER dim (it counts more
+    // rotations), so low < high with this order (vLLM passes (low_rot=beta_fast, high_rot=beta_slow)).
+    let low = find(beta_fast as f64).floor().max(0.0) as i32;
+    let high = find(beta_slow as f64).ceil().min(dim - 1.0) as i32;
     let (minv, maxv) = if low == high {
         (low as f32, low as f32 + 0.001)
     } else {

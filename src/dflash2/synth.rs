@@ -214,7 +214,7 @@ pub fn generate(dir: &str, seed: u64) -> Result<GenSummary, anyhow::Error> {
             "rope_type": "default"
         },
         "dflash_config": {
-            "block_size": crate::dflash2::BLOCK,
+            "block_size": crate::dflash2::block(),
             "conv_group_size": crate::dflash2::CONV_GROUP,
             "conv_kernel_size": crate::dflash2::CONV_KERNEL,
             "mask_token_id": crate::dflash2::MASK_TOKEN_ID,

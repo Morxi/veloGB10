@@ -126,7 +126,7 @@ pub struct GenSummary {
 fn gen_tensor(rng: &mut SynthRng, name: &str, shape: &[usize], rank: usize) -> Vec<u8> {
     let n: usize = shape.iter().product();
     let mut bytes = Vec::with_capacity(n * 2);
-    if name == "confidence.bias" {
+    if name == "confidence_head.proj.bias" {
         bytes.extend_from_slice(&bf16::from_f32(0.0).to_le_bytes());
         return bytes;
     }
@@ -137,7 +137,7 @@ fn gen_tensor(rng: &mut SynthRng, name: &str, shape: &[usize], rank: usize) -> V
         }
         return bytes;
     }
-    let scale = if name.starts_with("markov.") {
+    let scale = if name.starts_with("markov_head.") {
         1.0f32 / (rank as f32).sqrt()
     } else {
         1.0f32 / (shape[1] as f32).sqrt()

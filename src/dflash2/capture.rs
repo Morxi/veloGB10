@@ -36,7 +36,7 @@
 use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr};
 use std::sync::Arc;
 
-use crate::dflash2::{BLOCK, HIDDEN, TAP_CONCAT_DIM, TAP_LAYERS};
+use crate::dflash2::{block, HIDDEN, TAP_CONCAT_DIM, TAP_LAYERS};
 
 /// The DFlash2 tap sink: drafter-owned staging, written by the trunk at draft time only.
 ///
@@ -51,7 +51,7 @@ impl Df2TapSink {
     /// AGENTS §2.2; a partial round's never-written columns must read as 0, and the first
     /// draft round may run with C < 8 committed positions).
     pub fn new(dev: &Arc<CudaDevice>) -> Self {
-        Self::new_cols(dev, BLOCK)
+        Self::new_cols(dev, block())
     }
     /// PLAN/25 Phase 1: a WIDE staging for the tree-verify capture (`cols` up to MAX_VERIFY —
     /// a tree verifies more columns than the chain's 8; the accepted path is gathered out of

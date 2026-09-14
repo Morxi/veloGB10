@@ -18,6 +18,8 @@
 //! 1,924,404,480 params). Binding semantics: `ref/dflash/dflash/model.py` (the vendor
 //! reference; where docs disagree, the code wins — see the oracle's DECISIONS ledger).
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 pub mod oracle;
 pub mod synth;
 pub mod load;
@@ -44,7 +46,58 @@ pub const INTER: usize = 17_408;
 /// Number of draft-backbone layers (all `sliding_attention`).
 pub const N_LAYERS: usize = 5;
 /// Draft block length: anchor + 7× MASK = 8 positions, 7 draft tokens in one forward.
+/// This is the DEFAULT; the live value is [`block()`] (see `--df2-block 8|16`).
 pub const BLOCK: usize = 8;
+/// Bit layout of the packed `window_B` launch word shared with `gpu_kernels.cu`'s
+/// `DF2_WB_SHIFT`/`DF2_WB_MASK`: `(window << SHIFT) | block`. The field MUST be wide enough for
+/// the block (16 needs 5 bits) or a block-16 launch decodes B=0 and the band attention breaks.
+/// Keep this in lockstep with the `#define`s at the top of kernels/gpu_kernels.cu.
+pub const DF2_WB_SHIFT: usize = 5;
+
+/// The largest draft block this build supports. 16 is the verify ceiling (`gpu::MAX_VERIFY`):
+/// a block-16 round emits anchor + 15 MASK and verifies 16 columns, which is exactly MAX_VERIFY.
+/// Wider is refused at the CLI rather than silently falling to the prefill dequant path.
+pub const MAX_BLOCK: usize = 16;
+
+/// The process-wide DFlash2 draft block. Written ONCE from the resolved `--df2-block` before any
+/// [`round::Df2Round`] is constructed, then read by every sizing and launch site in this module.
+///
+/// Why a process global rather than a field threaded through the round: the block appears in ~120
+/// places across `round.rs`/`gpu.rs` (allocation sizes, launch dims, loop bounds, packed launch
+/// words). A single accessor means there is no site that can disagree with the others, and with
+/// the value left at 8 every allocation and launch is bit-for-bit today's — so block-8 serving
+/// identity is structural, not something that has to be re-verified site by site.
+static DF2_BLOCK: AtomicUsize = AtomicUsize::new(BLOCK);
+
+/// The live draft block (8 by default, 16 under `--df2-block 16`). Always in `2..=MAX_BLOCK`.
+#[inline]
+pub fn block() -> usize {
+    DF2_BLOCK.load(Ordering::Relaxed)
+}
+
+/// The live chain length = `block() - 1` (7 by default, 15 at block 16): the number of MASK rows
+/// in the round, of draft tokens it emits, and of levels the selector walk runs.
+#[inline]
+pub fn levels() -> usize {
+    block() - 1
+}
+
+/// Install the draft block. Idempotent for the same value; refuses anything outside 8 or 16.
+/// Must be called before any DFlash2 round/buffer is constructed.
+pub fn set_block(b: usize) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        b == BLOCK || b == MAX_BLOCK,
+        "--df2-block must be 8 or 16 (got {b}); 16 is the verify ceiling (MAX_VERIFY), and the \
+         draft artifacts are block-agnostic so no re-bake is needed"
+    );
+    let prev = DF2_BLOCK.swap(b, Ordering::Relaxed);
+    anyhow::ensure!(
+        prev == BLOCK || prev == b,
+        "df2 block already set to {prev}, cannot change to {b} after construction"
+    );
+    Ok(())
+}
+
 /// The MASK token id filling the 7 undrafted block positions (config `dflash_config`).
 pub const MASK_TOKEN_ID: u32 = 248_070;
 /// Vocabulary size (embed/lm_head are borrowed from the target at runtime; not in the checkpoint).
@@ -69,7 +122,7 @@ pub const SLIDING_WINDOW: usize = 2048;
 /// (128 + 2056 + 32) x 4 = 8,864 B — never approaches the 48 KiB dynamic default cap
 /// (the old `(HEAD_DIM + ntot + 32) * 4` capped ctx at 12120).
 pub fn band_smem(window: usize, ntot: usize) -> usize {
-    let scores_len = if window + BLOCK < ntot { window + BLOCK } else { ntot };
+    let scores_len = if window + block() < ntot { window + block() } else { ntot };
     (HEAD_DIM + scores_len + 32) * 4
 }
 /// S10R (2026-08-21) — the SAFE absolute-context bound for the round is now the MODEL's

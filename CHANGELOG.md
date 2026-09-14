@@ -3,6 +3,62 @@
 High-level release notes for veloGB10. Minor bug fixes and small optimizations are grouped under
 generic language where they aren't individually notable.
 
+## v0.6.0 — DFlash v1 drafter lane, DSpark, tool-render parity, TP/FP8 correctness
+
+A large release: a new drafter serving lane, a new draft-model family, reference-exact tool
+rendering, and a broad sweep of TP/FP8/losslessness correctness fixes.
+
+### Drafters & speculation
+- **DFlash v1 drafter lane** (`--spec-source dflash`) — the v1 drafter is now config-driven and
+  wired into the API serving path, including under **TP=2/TP=4** (SPMD lane on every rank + artifact
+  shipping). The draft round's attention was DRAM-bound on ~144× redundant KV traffic; a tiled
+  DFlash attention kernel fixes it.
+- **DSpark drafter support** — new kernel module `gpu_dspark` and a native DSpark round, with a
+  signed ring-identity guard for the prefix carry.
+- **DF2 block-16** — runtime `--df2-block 8|16`. Measured at TP=4: **+23.03% pooled / +9.47%
+  row-medians** on the mission prompt set (GO on that workload; NO-GO on the recipe's own payload).
+  Opt-in — the default stays block 8.
+- **DF2 carry across a prefix-cache hit** — keeps DFlash2 in the draft seat across a cache hit
+  (flag-gated, default off; measured slower at TP=4).
+- **One artifact flag for every drafter**: `--draft-dir`; `--spec-source` is the only selector.
+
+### Tool calling & template rendering
+- **Reference-exact tool rendering** — `serde_json` and `minijinja` now preserve key insertion order
+  (`preserve_order`). Without it the `<tools>` block was re-sorted and diverged from the reference
+  (transformers/vLLM) at byte 83 on every tool-using turn (−345/−1,346 tokens on 12/52 tools).
+- JSON-schema handling made explicit (loud floor) and tool-call serialization reworked.
+
+### Serving & scheduler
+- **Two-lane prefill cursor** (`--prefill-sched <inline|cursor>`) — the prefill window loop moved out
+  of `admit()` into the step loop.
+- Scheduler fixes: a silent request drop in the TP head path, and slot exhaustion now fails loudly.
+- k8v8 multi-lane fast-fail; thinking toggle; `/health` telemetry.
+
+### TP correctness
+- **MTP head kept replicated under TP** — F6 sharding broke the draft chain (a TP=2/TP=4 serving
+  regression).
+- **F9 fix**: warm prefix-reuse stream divergence (TP2 FP8 27B).
+- Batch-invariant verify-attention partition under TP + a binv probe.
+- Shard block-128 FP8 (`W::Fp8Blk`) on the in-place path.
+- TP-mode GDN state probe (`StateTp`) + logits/extent probe fixes for the sharded path.
+
+### FP8 & losslessness
+- **pf8 prefill OOB class fixed** — the full-attention / batch-mixer prefill-width W8A8 lane output
+  buffers are padded to tp64 (FIX #2, #2b, #3, #4).
+- **`ignore_eos` / `min_new` honored on every spec-path emit loop** (12 sites) — the stop rule is a
+  property of the request, not the serving path (fixes the d2/d4-vs-d0 early-stop ladder failures).
+- Depth-2 attention key partition keyed on the request constant; residual depth-2 verify losslessness
+  diagnostics.
+
+### Safety & observability
+- **Release-live tripwire** — a pool/OOB tripwire with `--pool-census` and `--tripwire-selftest`.
+- **`DISPATCH_ASSERT`** — the wide-verify dispatch rule as a machine-checked test.
+- New `tel` module + telemetry reporting (e.g. dflash2-tree as its own `/health` mode).
+
+### Launchers
+- TP=4 production launcher (world=4) + a DRYRUN-asserting test; an NVFP4 TP=2 production launcher
+  with a boot-identity line on both lanes. Minor bug fixes and optimizations.
+
 ## v0.5.5 — FP8 prefill levers on, prompt-truncation + max_tokens fixes
 
 - **FP8 prefill levers now on by default.** The tensor-core flash-attention prefill

@@ -103,10 +103,10 @@ fn assign(w: &mut DsparkWeights, name: &str, v: Vec<f32>) -> Result<(), anyhow::
         "fc.weight" => w.fc = v,
         "hidden_norm.weight" => w.hidden_norm = v,
         "norm.weight" => w.norm = v,
-        "markov.W1.weight" => w.w1 = v,
-        "markov.W2.weight" => w.w2 = v,
-        "confidence.weight" => w.confidence_w = v,
-        "confidence.bias" => w.confidence_b = v[0],
+        "markov_head.markov_w1.weight" => w.w1 = v,
+        "markov_head.markov_w2.weight" => w.w2 = v,
+        "confidence_head.proj.weight" => w.confidence_w = v,
+        "confidence_head.proj.bias" => w.confidence_b = v[0],
         _ => {
             // layer tensors: `layers.{i}.{suffix}`
             let rest = name.strip_prefix("layers.").ok_or_else(|| anyhow::anyhow!("bad name {name}"))?;

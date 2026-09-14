@@ -23,14 +23,20 @@ env_logger = "0.10"
 half = { version = "2.4", features = ["bytemuck"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 base64 = "0.22"
-serde_json = "1"
+# preserve_order: tool definitions are rendered by the chat template's `tojson` filter and the
+# reference (transformers/vLLM) preserves the request's key insertion order (Python dicts).
+# Without this serde_json sorts keys and our <tools> block diverged from the reference at
+# byte 83 on every tool-using turn (RENDER_AUDIT.md 2.1: -345/-1,346 tokens on 12/52 tools).
+serde_json = { version = "1", features = ["preserve_order"] }
 bytemuck = "1.14"
 # Random generation
 rand = "0.8"
 # Tokenizer
 tokenizers = "0.19"
 # Chat template rendering (loads each model's own chat_template.jinja)
-minijinja = "2.21"
+# preserve_order: same reason as serde_json above - minijinja's internal ValueMap must keep the
+# insertion order of the JSON it was built from, or `tool | tojson` re-sorts the schema keys.
+minijinja = { version = "2.21", features = ["preserve_order"] }
 # HTTP server
 axum = { version = "0.7", features = ["ws"] }
 serde = { version = "1.0", features = ["derive"] }

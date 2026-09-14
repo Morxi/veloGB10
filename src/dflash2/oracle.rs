@@ -186,7 +186,7 @@ impl Default for Dflash2Config {
             inter: crate::dflash2::INTER,
             vocab: crate::dflash2::VOCAB,
             n_layers: crate::dflash2::N_LAYERS,
-            block: crate::dflash2::BLOCK,
+            block: crate::dflash2::block(),
             mask_token_id: crate::dflash2::MASK_TOKEN_ID,
             rope_theta: crate::dflash2::ROPE_THETA,
             rms_eps: crate::dflash2::RMS_EPS,
@@ -331,17 +331,33 @@ pub struct ConvPrepared {
     pub dyn_hold: Vec<f32>,
 }
 
+/// Array capacity for the selector result: the largest supported block-1 (16-1 = 15).
+pub const MAX_SELECT_LEVELS: usize = crate::dflash2::MAX_BLOCK - 1;
+
 /// Selector result (DECISION L).
 #[derive(Clone)]
 pub struct SelectOut {
-    /// The 7 draft tokens (the greedy chain path over the 7 MASK positions).
-    pub tokens: [u32; 7],
+    /// DF2 block-16: the LIVE level count = `cfg.block - 1` (7 at block 8, 15 at block 16).
+    /// The arrays below are sized to [`MAX_SELECT_LEVELS`] so every index stays in bounds at
+    /// either block; **only the first `nlevels` rows are meaningful** — consumers must slice,
+    /// never assume 7.
+    pub nlevels: usize,
+    /// The draft tokens (the greedy chain path over the MASK positions).
+    pub tokens: [u32; MAX_SELECT_LEVELS],
     /// The top-16 candidate token ids per position (the deterministic order, DECISION L).
-    pub candidates: [[u32; 16]; 7],
+    pub candidates: [[u32; 16]; MAX_SELECT_LEVELS],
     /// The candidate unary logits per position (aligned with `candidates`).
-    pub unary: [[f32; 16]; 7],
+    pub unary: [[f32; 16]; MAX_SELECT_LEVELS],
     /// The final chain scores per position (post codebook term; diagnostics for S4F).
-    pub scores: [[f32; 16]; 7],
+    pub scores: [[f32; 16]; MAX_SELECT_LEVELS],
+}
+
+impl SelectOut {
+    /// The meaningful prefix of each array (length `nlevels`).
+    #[inline] pub fn tokens_v(&self) -> &[u32] { &self.tokens[..self.nlevels] }
+    #[inline] pub fn candidates_v(&self) -> &[[u32; 16]] { &self.candidates[..self.nlevels] }
+    #[inline] pub fn unary_v(&self) -> &[[f32; 16]] { &self.unary[..self.nlevels] }
+    #[inline] pub fn scores_v(&self) -> &[[f32; 16]] { &self.scores[..self.nlevels] }
 }
 
 /// Full-round output (the convenience `run_round`).
@@ -381,7 +397,20 @@ impl Dflash2Oracle {
             weights.layers.len(),
             cfg.n_layers
         );
-        anyhow::ensure!(cfg.block == 8, "the draft block is fixed at 8 positions (anchor + 7×MASK)");
+        // DF2 block-16: the block is runtime now (8 default, 16 opt-in). The oracle is block-
+        // generic (it iterates cfg.block / cfg.block - 1), so the gate only has to reject values
+        // this build cannot verify, and it must agree with the live global or the oracle would
+        // silently model a different block than the engine runs.
+        anyhow::ensure!(
+            cfg.block == crate::dflash2::block(),
+            "oracle block {} != live block {} (--df2-block)",
+            cfg.block, crate::dflash2::block()
+        );
+        anyhow::ensure!(
+            cfg.block == crate::dflash2::BLOCK || cfg.block == crate::dflash2::MAX_BLOCK,
+            "the draft block must be 8 or 16 (anchor + block-1 MASK); got {}",
+            cfg.block
+        );
         anyhow::ensure!(
             cfg.num_heads % cfg.num_kv_heads == 0,
             "GQA requires num_heads % num_kv_heads == 0"
@@ -923,10 +952,11 @@ impl Dflash2Oracle {
     /// succ_codebook[cand[k]][r]`, first-index argmax, predecessor ← chosen candidate.
     pub fn select_path(&self, h_sel: &[f32], logits: &[f32], anchor: u32) -> SelectOut {
         let vocab = self.cfg.vocab;
-        debug_assert_eq!(logits.len(), 7 * vocab);
-        let mut candidates = [[0u32; 16]; 7];
-        let mut unary = [[0.0f32; 16]; 7];
-        for p in 0..7 {
+        let n = self.cfg.block - 1;      // DF2 block-16: live levels, not a constant 7
+        debug_assert_eq!(logits.len(), n * vocab);
+        let mut candidates = [[0u32; 16]; MAX_SELECT_LEVELS];
+        let mut unary = [[0.0f32; 16]; MAX_SELECT_LEVELS];
+        for p in 0..n {
             let (vals, ids) = self.top16(&logits[p * vocab..(p + 1) * vocab]);
             unary[p] = vals;
             candidates[p] = ids;
@@ -940,20 +970,21 @@ impl Dflash2Oracle {
     pub fn select_chain(
         &self,
         h_sel: &[f32],
-        candidates: &[[u32; 16]; 7],
-        unary: &[[f32; 16]; 7],
+        candidates: &[[u32; 16]; MAX_SELECT_LEVELS],
+        unary: &[[f32; 16]; MAX_SELECT_LEVELS],
         anchor: u32,
     ) -> SelectOut {
         let hidden = self.cfg.hidden;
         let rank = self.cfg.selector_rank;
         let k = self.cfg.selector_top_k;
-        debug_assert_eq!(h_sel.len(), 7 * hidden);
-        // hidden_projection once for all 7 positions (model.py:526).
-        let hp = self.linear(&self.weights.hidden_projection, h_sel, rank, hidden, 7);
-        let mut tokens = [0u32; 7];
-        let mut scores_out = [[0.0f32; 16]; 7];
+        let n = self.cfg.block - 1;      // DF2 block-16: live levels
+        debug_assert_eq!(h_sel.len(), n * hidden);
+        // hidden_projection once for all n positions (model.py:526).
+        let hp = self.linear(&self.weights.hidden_projection, h_sel, rank, hidden, n);
+        let mut tokens = [0u32; MAX_SELECT_LEVELS];
+        let mut scores_out = [[0.0f32; 16]; MAX_SELECT_LEVELS];
         let mut predecessor = anchor;
-        for p in 0..7 {
+        for p in 0..n {
             let ids = &candidates[p];
             let vals = &unary[p];
             // a[r] = pred_codebook[prev][r] * hp[p][r] (model.py:532).
@@ -984,7 +1015,7 @@ impl Dflash2Oracle {
             tokens[p] = tok;
             predecessor = tok;
         }
-        SelectOut { tokens, candidates: *candidates, unary: *unary, scores: scores_out }
+        SelectOut { nlevels: n, tokens, candidates: *candidates, unary: *unary, scores: scores_out }
     }
 
     /// Convenience: the whole round (model.py:573-605 + 243-258) — tap_project →
@@ -1011,9 +1042,10 @@ impl Dflash2Oracle {
             ));
         }
         let (layer_hiddens, h) = self.backbone_forward(&emb, &kv, c);
-        // the 7 MASK positions = block rows 1..7 (model.py:249).
+        // the MASK positions = block rows 1..block (model.py:249) — block-1 of them.
+        let nl = block - 1;
         let h_sel = &h[hidden..block * hidden];
-        let logits = self.logits(h_sel, 7);
+        let logits = self.logits(h_sel, nl);
         let select = self.select_path(h_sel, &logits, ctx.anchor);
         RoundOut { th, layer_hiddens, h, logits, select }
     }

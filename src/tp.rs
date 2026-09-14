@@ -28,9 +28,15 @@ const DEFAULT_RDMA_DEV: &str = "rocep1s0f1";
 // env var present → env wins; else this process-global config (if installed); else default (same
 // default as the no-env behavior). Flags are presence-based, matching the old `is_ok()` semantics.
 
+/// Wire default for `df2_block` when an older peer omits the field: the shipped block (8).
+fn df2_block_default() -> usize { crate::dflash2::BLOCK }
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct TpConfig {
-    pub config_version: u32,          // = 14 (v14: + df2_step_dump, the Phase-0 coverage-trace SPMD flag;
+    pub config_version: u32,          // = 17 (v17: + pf_sched_inline, the P11 --prefill-sched escape;
+                                      //      v16: + df2_carry, the DFlash2 prefix-cache carry;
+                                      //      v15: + df2_block, the DFlash2 runtime draft block;
+                                      //      v14: + df2_step_dump, the Phase-0 coverage-trace SPMD flag;
                                        //     v13: + df2_round_shard, the P2 round-sharding flag;
                                        //     v12: + spec_source/df2_draft_dir, the TP-DF2 leg
                                        //     — S9F; v11: + decode_ctx, the DecodeCtx probe branch riding
@@ -38,7 +44,7 @@ pub struct TpConfig {
                                        //     sharding flag; v9:
                                       //     + topology, the full rank->RoCE-IP map, and
                                       //     node_rank, the per-node rank shipped by the head;
-                                      //     v8: + world, the TP rank count; v7: + kv_k8v4, the
+                                      //     v9: + kv_k8v8 (int8 K+V blocks); v8: + world, the TP rank count; v7: + kv_k8v4, the
                                       //     int8-K / q4-V cache mode; reduce_fuse rode v6,
                                       //     gpu_recv rode v5)
     pub world: u32,                   // TP rank count — the --tp CLI flag is the only authority (bare = 2)
@@ -74,8 +80,19 @@ pub struct TpConfig {
     pub ngram_draft: usize,           // head's --ngram-draft
     pub tree_draft: bool,             // head's --tree-draft
     pub mtp_lanes: bool,              // head's --mtp-lanes
+    /// P11 W5a — head's --prefill-sched. false (default) = the CURSOR schedule (one prefill window
+    /// per scheduler iteration; SCHEDULER_2LANE, owner-blessed default-ON). true = "inline": drain
+    /// the whole prefill inside admission (the pre-P10 posture; max decode gap = the full prefill).
+    /// Scheduler-only (kernel ORDER, not numerics), but the node mirror must resolve the SAME value
+    /// or the SPMD op sequence diverges — so it rides the config. #[serde(default)] keeps an older
+    /// peer's config parseable (missing => cursor).
+    #[serde(default)]
+    pub pf_sched_inline: bool,        // head's --prefill-sched inline
     pub mtp_force: Option<bool>,      // head's --mtp=on|off (None = auto)
     pub mtp_depth_pin: Option<usize>, // head's --mtp-depth
+    pub fp8_prefill: bool,          // head's GB10_FP8_PREFILL (native e4m3 prefill GEMM
+                                    // lane; node installs the env so both ranks dispatch
+                                    // identically — a head-only lane would split-brain TP2)
     pub no_decode_graphs: bool,       // head's GB10_NO_DECODE_GRAPHS (env-read; node installs as env)
     pub cpu_sample: bool,             // head's RUST_INFER_CPU_SAMPLE (env-read; node installs as env)
     pub no_verify_graph: bool,        // head's GB10_NO_VERIFY_GRAPH (env-read; node installs as env)
@@ -85,6 +102,9 @@ pub struct TpConfig {
     /// head's GB10_KV_K8V4=1 (int8-K + q4-V k8v4 cache; node installs as env). Mutually exclusive
     /// with kv_quant/kv_tq — the cache layout must match on both ranks (SPMD).
     pub kv_k8v4: bool,                // head's GB10_KV_K8V4 (k8v4 KV cache; node installs as env)
+    /// int8 K+V per-16-block cache (20 B/16 both channels) — the direct-read substrate for the
+    /// p8b verify kernel. VALUE-based like kv_k8v4: only GB10_KV_K8V8=1 enables it.
+    pub kv_k8v8: bool,                // head's GB10_KV_K8V8 (k8v8 KV cache; node installs as env)
     pub fuse_residual: Option<bool>,  // head's GB10_FUSE_RESIDUAL (None = default ON; node installs as env)
     pub device_loop: bool,            // head's --device-loop (device-resident token loop; node installs as env)
     pub gpu_recv: Option<bool>,       // v2 GPU-direct all-reduce receive (GB10_TP_GPU_RECV; node installs as env)
@@ -134,6 +154,8 @@ pub struct TpConfig {
     /// the head (a draft-logits divergence would desync the acceptance/verify SPMD sequence).
     /// Draft-side only — LOSSLESS preserved, acceptance may shift at near-ties.
     pub dspark_fp8_head: bool,
+    /// E5: trunk YaRN rope factor (1.0 = legacy; see GpuModel::build_rope_tables).
+    pub rope_yarn_factor: f32,
     /// E29-B3 DFlash drafter: GB10_TP_DFLASH=1 routes the one-shot Generate through the
     /// draft-8-verify-accept loop. SPMD-relevant: the drafter runs on rank 0 ONLY (the node
     /// never loads it); the 7 draft tokens are shipped to the node over the link before the
@@ -201,6 +223,18 @@ pub struct TpConfig {
     /// Phase D quad truth flips it.
     #[serde(default)]
     pub df2_round_shard: bool,
+    /// DF2 block-16: the head's resolved `--df2-block` (8 default, 16 opt-in). SPMD — every rank
+    /// must resolve the SAME block, because the round's 15 MASK rows and the verify's 16 columns
+    /// are collective: a one-sided block would desync the verify all-reduce. Absent/0 on the wire
+    /// (an old head) means the default 8 via `df2_block_default()`.
+    #[serde(default = "df2_block_default")]
+    pub df2_block: usize,
+    /// DF2_CARRY: keep DFlash2 in the draft seat across a prefix-cache hit (default OFF until
+    /// `PLAN/DF2_CARRY_SPEC.md` §7 is green). SPMD — every rank must make the SAME admit
+    /// decision, or the carried lane would desync the verify all-reduce. Absent (an old head)
+    /// means off via serde's `bool` default.
+    #[serde(default)]
+    pub df2_carry: bool,
     /// head's --df2-step-dump (PLAN/25 Phase 0 coverage trace). SPMD: the node mirror must run
     /// the identical trace op sequence (eager keep-logits verify, logging MTP chain) — it sets
     /// `cov_trace` from this flag and leaves `step_dump` None (only the head writes records).
@@ -216,14 +250,27 @@ pub struct TpConfig {
     /// to every node at sync (no env side channel).
     #[serde(default)]
     pub df2_prose_lane_greedy: bool,
+    /// Phase-7 F9 gate: GB10_TP_BINV_TP / the head's --probe-binv-tp — run the TP
+    /// batch-invariance probe (verify-width sweep N=1..MAX_VERIFY through the real
+    /// sharded verify path) instead of generation. SPMD-critical: a one-sided flag would
+    /// run the probe on one rank and generation on the other, i.e. mismatched all-reduce
+    /// epochs; it rides TpConfig plus the branch selector like every other probe.
+    #[serde(default)]
+    pub binv_tp: bool,
+    /// Phase-7: GB10_TP_STATE_TP — run the GDN decode-vs-verify state probe on the sharded
+    /// path (the `--probe-state` gate is world=1 only). SPMD: both ranks run the identical
+    /// forwards and compare their own state slices.
+    #[serde(default)]
+    pub state_tp: bool,
 }
 
 impl TpConfig {
     /// Snapshot the GB10_TP_* env vars (flags = presence; probes/depth = parse). Serving fields get
     /// their v1-compatible defaults — a bench config is indistinguishable from before.
     pub fn from_env() -> Self {
+        eprintln!("[from_env] GB10_KV_K8V8={:?}", std::env::var("GB10_KV_K8V8").ok());
         TpConfig {
-            config_version: 14,
+            config_version: 17,
             // TP rank count. The --tp CLI flag is the single authority for a TP run (bare --tp = 2,
             // --tp N = N); `from_env` only snapshots the bench `--head` path, which is always TP=2.
             // GB10_TP_WORLD is deliberately NOT read here — one source of truth, zero ambiguity.
@@ -254,9 +301,11 @@ impl TpConfig {
             ngram_draft: 0,
             tree_draft: false,
             mtp_lanes: false,
+            pf_sched_inline: false,
             mtp_force: None,
             mtp_depth_pin: None,
             no_decode_graphs: false,
+            fp8_prefill: false,
             cpu_sample: false,
             no_verify_graph: std::env::var("GB10_NO_VERIFY_GRAPH").is_ok(),
             kv_quant: std::env::var("GB10_KV_QUANT").is_ok(),
@@ -267,6 +316,7 @@ impl TpConfig {
             kv_tq_b3: std::env::var("GB10_KV_TQ").ok().as_deref() == Some("3"),
             // VALUE-based like kv_tq: only GB10_KV_K8V4=1 enables the k8v4 mode.
             kv_k8v4: std::env::var("GB10_KV_K8V4").ok().as_deref() == Some("1"),
+            kv_k8v8: std::env::var("GB10_KV_K8V8").ok().as_deref() == Some("1"),
             fuse_residual: std::env::var("GB10_FUSE_RESIDUAL").ok().map(|v| v != "0"),
             device_loop: std::env::var("GB10_DEVICE_LOOP").map_or(false, |v| matches!(v.as_str(), "1" | "on" | "true")),
             gpu_recv: std::env::var("GB10_TP_GPU_RECV").ok().map(|v| v != "0"),
@@ -281,6 +331,7 @@ impl TpConfig {
             mxfp4_mtp_native: std::env::var("GB10_MXFP4_MTP_NATIVE").is_ok(),
             server_dspark: false,
             dspark_fp8_head: std::env::var("GB10_DSPARK_FP8_LOGITS").is_ok(),
+            rope_yarn_factor: 1.0,
             dflash: std::env::var("GB10_TP_DFLASH").is_ok(),
             df2_capture: std::env::var("GB10_DF2_CAPTURE").is_ok(),
             // E12/E8/E9 escapes: VALUE-based like GB10_KV_TQ — only the explicit disable
@@ -305,8 +356,12 @@ impl TpConfig {
             df2_draft_dir: String::new(),
             df2_sha_pin: None,
             df2_round_shard: false,
+            df2_block: crate::dflash2::BLOCK,
+            df2_carry: false,
             df2_step_dump: false,
             df2_prose_lane_greedy: false,
+            binv_tp: std::env::var("GB10_TP_BINV_TP").is_ok(),
+            state_tp: std::env::var("GB10_TP_STATE_TP").is_ok(),
         }
     }
 }
@@ -326,12 +381,14 @@ pub fn set_tp_config(c: TpConfig) {
                mtp_depth={:?} batch_probe={:?} step_probe={:?} mode_serve={} accept={:?} capture={:?} \
                dspark={} dspark_depth={:?} exact_gemm={} server_dspark={} fp8_head={} splitk_gemm={} \
                mxfp4={} mxfp4_mtp_native={} dflash={} moe_fold={} e8_shard={} e9_fold={} \
-               gpu_recv={:?} reduce_fuse={:?} df2_round_shard={} df2_prose_lane_greedy={}",
+               gpu_recv={:?} reduce_fuse={:?} df2_round_shard={} df2_block={} df2_carry={} df2_prose_lane_greedy={}",
               c.world, c.shard_mixers, c.shard_mtp, c.graph, c.fp32_partials, c.trace, c.mtp,
               c.mtp_depth, c.batch_probe, c.step_probe, c.mode_serve, c.accept, c.capture,
               c.dspark, c.dspark_depth, c.exact_gemm, c.server_dspark, c.dspark_fp8_head,
               c.splitk_gemm, c.mxfp4, c.mxfp4_mtp_native, c.dflash, c.moe_fold, c.e8_shard, c.e9_fold,
-              c.gpu_recv, c.reduce_fuse, c.df2_round_shard, c.df2_prose_lane_greedy);
+              c.gpu_recv, c.reduce_fuse, c.df2_round_shard, c.df2_block, c.df2_carry, c.df2_prose_lane_greedy);
+    // Phase-9 A.2: publish the boot context the status route reports (tp width, df2 block).
+    crate::tel::set_boot(c.world as usize, c.df2_block as usize);
     if TP_CONFIG.set(c).is_err() {
         eprintln!("[tp] WARNING: TP config already installed — keeping the first");
     }
@@ -621,6 +678,8 @@ pub enum TpBranch {
     StepProbe(usize),
     BatchProbe(usize),
     DecodeCtx(usize),
+    BinvTp,
+    StateTp,
     Generate,
 }
 
@@ -636,6 +695,8 @@ impl TpBranch {
             TpBranch::StepProbe(d) => 0x40 ^ (*d as u8),
             TpBranch::BatchProbe(n) => 0x50 ^ (*n as u8),
             TpBranch::DecodeCtx(c) => 0x60 ^ (*c as u8),
+            TpBranch::BinvTp => 0x70,
+            TpBranch::StateTp => 0x71,
         }
     }
 }

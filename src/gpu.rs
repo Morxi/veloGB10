@@ -47,6 +47,51 @@ static XCHAIN_UNBOUNDED: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 // long done, so localization is unaffected.
 static XCHAIN_SUPPRESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub fn xchain_set_suppressed(on: bool) { XCHAIN_SUPPRESS.store(on, std::sync::atomic::Ordering::Relaxed); }
+
+// ===== Phase-8 F9 localization: the per-layer residual tap (probe-only) =====
+// `verify_state_diff` arms this when GB10_STATE_TAP=1: every `forward_batch_dev` call (decode)
+// and every eager `verify_forward_core_topo` call (verify) appends one record, and each layer
+// iteration snapshots the post-FFN residual (dtoh — syncs the stream; diagnostics only). The
+// probe then compares verify column t against decode step t PER LAYER, so the FIRST divergent
+// layer + column localizes the TP-only decode-vs-verify residual (the F9 residual defect).
+// Inert unless armed (one relaxed atomic load per call / per layer).
+pub struct StateTapCall {
+    pub tag: &'static str,
+    pub width: usize,
+    /// [layer] post-FFN residual, bf16, column-major [col][h] (width columns).
+    pub layers: Vec<Vec<half::bf16>>,
+    /// (convo, core) per GDN layer in visit order: the post-conv qkv rows and the GDN core out.
+    pub gdn: Vec<(Vec<half::bf16>, Vec<half::bf16>)>,
+    /// Post-delta_step s_state snapshot per GDN layer (both slots; small widths only).
+    pub s: Vec<Vec<f32>>,
+}
+static STATE_TAP: parking_lot::Mutex<Vec<StateTapCall>> = parking_lot::Mutex::new(Vec::new());
+static STATE_TAP_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub fn state_tap_arm() {
+    STATE_TAP_ARMED.store(true, std::sync::atomic::Ordering::SeqCst);
+    STATE_TAP.lock().clear();
+}
+pub fn state_tap_disarm() { STATE_TAP_ARMED.store(false, std::sync::atomic::Ordering::SeqCst); }
+pub fn state_tap_active() -> bool { STATE_TAP_ARMED.load(std::sync::atomic::Ordering::Relaxed) }
+pub fn state_tap_call(tag: &'static str, width: usize) {
+    if !state_tap_active() { return; }
+    STATE_TAP.lock().push(StateTapCall { tag, width, layers: Vec::new(), gdn: Vec::new(), s: Vec::new() });
+}
+pub fn state_tap_layer(v: Vec<half::bf16>) {
+    if !state_tap_active() { return; }
+    if let Some(c) = STATE_TAP.lock().last_mut() { c.layers.push(v); }
+}
+/// GDN internals: (conv-output qkv rows, core output) for the GDN layer just launched.
+pub fn state_tap_gdn(convo: Vec<half::bf16>, core: Vec<half::bf16>) {
+    if !state_tap_active() { return; }
+    if let Some(c) = STATE_TAP.lock().last_mut() { c.gdn.push((convo, core)); }
+}
+/// Post-delta s_state snapshot (both slots, local extent) for the GDN layer just launched.
+pub fn state_tap_s(s: Vec<f32>) {
+    if !state_tap_active() { return; }
+    if let Some(c) = STATE_TAP.lock().last_mut() { c.s.push(s); }
+}
+pub fn state_tap_take() -> Vec<StateTapCall> { std::mem::take(&mut *STATE_TAP.lock()) }
 /// RAII guard: suppress xchain for the duration of a CUDA-graph capture function (warmup included),
 /// restoring on drop. The dtoh the capture sink performs is capture-illegal AND capture-poisoning
 /// (the enqueue attempt invalidates the stream even when it early-returns), so suppression must
@@ -239,6 +284,20 @@ pub fn xchain_capture_reset() {
 /// Probe-only: drain the capture sink (per forward call, prefill first).
 pub fn xchain_capture_take() -> Vec<XChainCapture> {
     XCHAIN.get_or_init(Default::default).lock().drain(..).collect()
+}
+
+// Phase-8 F9 xhash: per-column FNV of the FINAL hidden from the decode path
+// (forward_decode_logits -> forward_batch_dev) and the verify path (verify_forward).
+// Debug-only (GB10_F9_XHASH=1); bench_mtp correlates them to find the first bit-divergent
+// position (which can precede the first token flip by hundreds of tokens).
+pub static F9XHASH: std::sync::Mutex<Vec<(u8, usize, usize, Vec<u64>)>> = std::sync::Mutex::new(Vec::new());
+static F9XCALL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! { static F9X_CUR: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+thread_local! { static F9X_ATTN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+fn f9_xhash_active() -> bool { std::env::var("GB10_F9_XHASH").is_ok() }
+fn f9_x_new_call() -> usize {
+    let id = F9XCALL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    F9X_CUR.with(|c| c.set(id)); id
 }
 
 /// One-load cross-chain dump (--probe-mxfp4-xchain2): the subset of a pass the cross-load
@@ -754,6 +813,11 @@ pub struct GpuModel {
     /// kvq_row_bytes). The K readers dequantize via the fp32(fp16 scale) path (u32 int8 loads);
     /// the V channel is byte-for-byte the q4 signed-nibble layout (EXPERT_KV_K8V4_RESPONSE.md §3).
     kv_k8v4: bool,
+    /// int8 K+V per-16-block cache (GB10_KV_K8V8=1 / --kv-cache k8v8): both channels the k8v4
+    /// K layout (16 B codes + 2 B fp16 scale, 20 B/16). The decode/verify path reads it
+    /// DIRECTLY (gqa_attn_verify_e_k8v8 — the p8b kernel); prefill dequants to bf16 scratch
+    /// (dequant_kv_k8v4, channel-agnostic) like the other packed modes.
+    kv_k8v8: bool,
     /// TQ host tables (uploaded once, the cos/sin-table pattern): a single f32 buffer
     /// [Pi | PiT | S | ST | cb2(4) | cb3(8) | qjl_scale] — see build_tq_tables and the TQ_TAB_*
     /// offsets in gpu_batch.cu.
@@ -821,6 +885,14 @@ pub struct GpuModel {
     // armed — OnceLock keeps the two constructor init-lists untouched).
     sv_t20: std::sync::OnceLock<cudarc::driver::CudaSlice<u64>>,   // [MAX_VERIFY * 20] packed (p<<32)|tok
     sv_t20_scratch: std::sync::OnceLock<cudarc::driver::CudaSlice<half::bf16>>, // [MAX_VERIFY * vocab]
+    /// W2 (Phase 13): per-POSITION schema-mask scratch for the verify paths
+    /// ([MAX_VERIFY][mask_words_for(vocab)] u32 + [MAX_VERIFY] i32 flags). The two AtomicU64s are
+    /// the ACTIVE-mask pointers (0 = none) so the struct stays Sync; the buffers themselves are
+    /// allocated with the model (a few hundred KB) and only written when a schema is armed.
+    vmask_words: cudarc::driver::CudaSlice<u32>,
+    vmask_flags: cudarc::driver::CudaSlice<i32>,
+    vmask_words_ptr: std::sync::atomic::AtomicU64,
+    vmask_flags_ptr: std::sync::atomic::AtomicU64,
     mr_tok: cudarc::driver::CudaSlice<i32>, // [MAX_VERIFY] batched re-prime tokens
     mr_pos: cudarc::driver::CudaSlice<i32>, // [MAX_VERIFY] batched re-prime positions
     /// E13 verify-graph: persistent per-replay inputs/outputs for the captured chain verify.
@@ -843,6 +915,12 @@ pub struct GpuModel {
     gdn_slot_tables: std::sync::Mutex<std::collections::HashMap<u64, (cudarc::driver::CudaSlice<u64>, i32)>>,
     /// bf16 scratch for dequantize-then-cuBLAS on the PREFILL path. Grown to the largest tensor.
     deq_scratch: std::sync::Mutex<Option<(B, usize)>>,
+    /// F8 parity lane (2026-09-07): W8A8 e4m3 prefill GEMM state.
+    /// `fp8e_map`: W::Fp8Blk packed-storage ptr -> e4m3 k32 A-frag panels (one-time on-device
+    /// repack by fp8_repack_e_b; the decode kernel keeps reading the ORIGINAL k16 layout).
+    /// `fp8e_scratch`: (Bq e4m3 panels, Xs f32 scales) grown to the largest chunk.
+    fp8e_map: std::sync::Mutex<std::collections::HashMap<u64, cudarc::driver::CudaSlice<u8>>>,
+    fp8e_scratch: std::sync::Mutex<Option<(cudarc::driver::CudaSlice<u8>, cudarc::driver::CudaSlice<f32>)>>,
     /// fp32 split-K partials for `gemm_mma_fp4_splitk_b` (SPLITK_MAX_TILES x SPLITK_MAX_S x 256).
     /// Preallocated at load: the decode/verify path is CUDA-graph captured, where a fresh alloc is
     /// illegal. Fixed address, reused by every split GEMM — the partial+reduce pair is always
@@ -906,6 +984,14 @@ pub struct GpuModel {
     /// the round's `prime_window` can seed the ctx ring with the PROMPT's taps (the 8-column
     /// staging only ever holds the last verify's span). `None` = dead path.
     df2_prime: Option<std::sync::Arc<crate::dflash2::capture::Df2PrimeSink>>,
+    /// WI1 DSpark tap sinks — the DF2 trio, byte-for-byte in structure, at the DSpark tap
+    /// layers `dspark::TAP_LAYERS` = [4,16,28,40,52]. All three default to None (dead
+    /// branches); the server arms exactly the set the chosen spec-source needs, so DSpark and
+    /// DFlash2 taps can coexist (independent buffers, different layer sets) — the acceptance
+    /// probe runs both arms back-to-back in one process.
+    dspark_capture: Option<std::sync::Arc<crate::dflash2::capture::Df2TapSink>>,
+    dspark_capture_tree: Option<std::sync::Arc<crate::dflash2::capture::Df2TapSink>>,
+    dspark_prime: Option<std::sync::Arc<crate::dflash2::capture::Df2PrimeSink>>,
     /// E29-B3: the TARGET's FULL-vocab bf16 lm_head [v, h] (rank 0 only, GB10_TP_DFLASH=1),
     /// captured at load BEFORE the vocab-parallel shard slices it away. The draft path needs the
     /// full head (the rank-local half is vocab-sharded); None on the node (it never drafts).
@@ -916,10 +1002,23 @@ pub struct GpuModel {
     /// round's draft head GEMM needs all v rows; the rank-local shard keeps only v/world).
     /// None = the normal (possibly sharded) `lm_head` is used — single-node and non-DF2 TP.
     df2_full_head: Option<W>,
+    /// F8-CATCHUP: in-memory NVFP4-MMA copy of a BF16 borrowed head (built lazily on the first
+    /// round borrow; see `df2_q_head_borrow`). The verify path NEVER touches this — the serving
+    /// `lm_head` stays exactly as loaded, so greedy losslessness is structural. Escape hatch for
+    /// A/B: GB10_NO_DF2_QHEAD=1 keeps the bf16 `gemm_binv_b` path.
+    df2_q_head: std::sync::OnceLock<Option<W>>,
 }
 
 /// Widest verify the persistent stochastic scratch is sized for (matches GEMM_BINV_NMAX).
 pub const MAX_VERIFY: usize = 16;
+
+/// W2 one-shot diagnostics (armed-mask shape, printed once each per process).
+static MASK_DIAG_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static VMASK_DIAG_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// W2: u32 words needed for one vocabulary bitset (bit t = token t allowed).
+#[inline]
+pub const fn mask_words_for(vocab: usize) -> usize { (vocab + 31) / 32 }
 /// TurboQuant KV row stride (bytes) — the d=128 layout: K row = 52 B, V row = 50 B padded to 52
 /// so both caches share one row size (see HY3_TURBOQUANT_KV_PLAN.md + /tmp/tq_ref2/REPORT.md).
 /// MUST match `TQ_ROW_BYTES` in kernels/gpu_batch.cu.
@@ -941,7 +1040,7 @@ pub const TQ_ROTATE_SMEM_BYTES: u32 = 128 * 4;
 /// and k8v4 (GB10_KV_K8V4=1) are mutually exclusive (asserted at load); the MTP draft cache is
 /// always Bf16 (the draft KV stays bf16 by decree — HY3_TURBOQUANT_KV_PLAN.md §6).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum KVCacheMode { Bf16, Q4, Tq, K8v4 }
+pub enum KVCacheMode { Bf16, Q4, Tq, K8v4, K8v8 }
 /// SM count of the GB10 (DGX Spark) — the "48-SM GPU" of the launch-geometry notes throughout.
 /// The persistent-grid serving GEMM (`gemm_mma_fp4_b`) sizes its grid from it.
 pub const GB10_SMS: usize = 48;
@@ -2054,6 +2153,35 @@ impl GpuModel {
         self.df2_prime = None;
     }
 
+    // ---- WI1: the DSpark twins (same shapes, dspark::TAP_LAYERS layers) ----
+
+    /// Diagnostic: the DSpark tap-layer index shift (GB10_DSPARK_TAP_SHIFT, default 0). The
+    /// artifact's target_layer_ids semantics (post-FFN residual of layer l = hidden_states[l+1])
+    /// vs (the layer's input = hidden_states[l]) differ by exactly one capture site; the shift
+    /// lets the serving acceptance measurement decide which the trainer used.
+    pub fn dspark_tap_shift() -> i32 {
+        static S: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+        *S.get_or_init(|| {
+            std::env::var("GB10_DSPARK_TAP_SHIFT").ok().and_then(|v| v.parse::<i32>().ok()).unwrap_or(0)
+        })
+    }
+
+    pub fn set_dspark_capture(&mut self, sink: std::sync::Arc<crate::dflash2::capture::Df2TapSink>) {
+        self.dspark_capture = Some(sink);
+    }
+    pub fn set_dspark_capture_off(&mut self) {
+        self.dspark_capture = None;
+    }
+    pub fn set_dspark_capture_tree(&mut self, sink: std::sync::Arc<crate::dflash2::capture::Df2TapSink>) {
+        self.dspark_capture_tree = Some(sink);
+    }
+    pub fn set_dspark_prime_sink(&mut self, sink: std::sync::Arc<crate::dflash2::capture::Df2PrimeSink>) {
+        self.dspark_prime = Some(sink);
+    }
+    pub fn set_dspark_prime_off(&mut self) {
+        self.dspark_prime = None;
+    }
+
     /// S4F: the TRUNK's lm_head + embed_tokens as device pointers for the DFlash2 round's
     /// borrowed head / block-input embed gather, in either supported trunk dtype:
     /// `BorrowedW::Nvfp4` (MMA-repacked qweight/scales + per-tile f32 gs — the serving quant's
@@ -2077,12 +2205,91 @@ impl GpuModel {
                 _ => None,
             }
         };
-        let head = match &self.df2_full_head {
-            Some(h) => ptrs(h)?,
-            None => ptrs(self.lm_head.as_ref()?)?,
+        // F8-CATCHUP two-stage draft head (DEFAULT ON since the 2026-09-06 battery): a Bf16
+        // borrow costs the round a 2.54 GB `gemm_binv_b` pass (measured 13.5 ms = 45% of the
+        // round). The two-stage path (coarse NVFP4 0.68 GB -> top-256 shortlist -> EXACT bf16
+        // re-rank vs the original hiddens) measured OUTPUT-EXACT (served-text sha byte-identical
+        // to the bf16 head) on FOUR paired cells — cod1 chat ×3 (+3.1%), synthetic (+4.7%),
+        // gsm1 math (+4.2%), ~4.6K-token long-context (+3.3%) — with acceptance/τ at bf16 level.
+        // The plain NVFP4-head path (no re-rank) measured a τ wash and is NOT used by default.
+        // Escape hatch (diagnostic): GB10_NO_DF2_Q2STAGE=1 keeps the bf16 `gemm_binv_b` path;
+        // GB10_DF2_QHEAD alone (without Q2STAGE) still selects the plain NVFP4 head for A/B.
+        let head_w: &W = match &self.df2_full_head {
+            Some(h) => h,
+            None => self.lm_head.as_ref()?,
+        };
+        // Semantics: default = two-stage; GB10_NO_DF2_Q2STAGE=1 = plain bf16 escape hatch;
+        // GB10_DF2_QHEAD=1 (without the NO_ escape) = plain NVFP4 head, no re-rank (A/B arm).
+        let is_bf16_borrow = matches!(head_w, W::Bf16(_));
+        let q2s_off = std::env::var("GB10_NO_DF2_Q2STAGE").is_ok();
+        let want_2stage = is_bf16_borrow && !q2s_off;
+        let want_plain_q = is_bf16_borrow && !q2s_off && std::env::var("GB10_DF2_QHEAD").is_ok();
+        let head = if want_2stage || want_plain_q {
+            match self.df2_q_head_borrow() {
+                Some(W::Nvfp4 { qweight, scales, gs, .. }) if want_2stage => {
+                    let W::Bf16(b) = head_w else {
+                        unreachable!("TwoStage arm requires a Bf16 borrow");
+                    };
+                    BorrowedW::TwoStage {
+                        q: crate::dflash2::round::Nvfp4Ptrs {
+                            qweight: *qweight.device_ptr() as u64,
+                            scales: *scales.device_ptr() as u64,
+                            gs: *gs.device_ptr() as u64,
+                        },
+                        bf16_ptr: *b.device_ptr() as u64,
+                    }
+                }
+                Some(w) => ptrs(w)?,
+                None => ptrs(head_w)?,
+            }
+        } else {
+            ptrs(head_w)?
         };
         let embed = ptrs(&self.embed)?;
         Some((head, embed))
+    }
+
+    /// F8-CATCHUP: the lazily-built NVFP4-MMA copy of a Bf16 borrowed head (None when the head
+    /// is not Bf16 — quantized trunks already draft from their packed head). One ~4 s host
+    /// round-trip at first borrow; every later round reads 0.68 GB instead of 2.54 GB.
+    fn df2_q_head_borrow(&self) -> Option<&W> {
+        self.df2_q_head.get_or_init(|| self.build_df2_q_head()).as_ref()
+    }
+
+    fn build_df2_q_head(&self) -> Option<W> {
+        // TP FIX (2026-09-06, caught by the WI0 plain-server TP=2 boot): the quantize source
+        // MUST be the same full-vocab tensor the borrow hands the round. Under TP the serving
+        // `lm_head` is the rank-local vocab shard (E7, v/world rows), while `df2_full_head`
+        // holds the FULL pre-shard head (S9F twin, bf16-head class). Quantizing the shard
+        // with the full `m` fired quantize_nvfp4's shape assert and crashed BOTH ranks at
+        // TP=2 boot (master dea4249+; single-node was unaffected — shard == full there).
+        let head_src: &W = match &self.df2_full_head {
+            Some(h) => h,
+            None => self.lm_head.as_ref()?,
+        };
+        let b = match head_src {
+            W::Bf16(b) => b,
+            _ => return None, // quantized full head: the borrow already uses it directly
+        };
+        let (m, k) = (self.cfg.vocab_size, self.cfg.hidden_size);
+        if m % 16 != 0 || k % 16 != 0 {
+            return None;
+        }
+        eprintln!("[df2] quantizing borrowed head bf16->NVFP4-mma in memory ({m} x {k}) — one-time");
+        let t0 = std::time::Instant::now();
+        let host: Vec<half::bf16> = self.dev.dtoh_sync_copy(b).ok()?;
+        crate::quant::set_repack_threading(true);
+        let t = crate::quant::quantize_nvfp4(&host, m, k);
+        drop(host);
+        let (wt, st) = crate::quant::repack_nvfp4_mma(&t.qweight, &t.scales, m, k);
+        let inv_gs = 1.0 / t.global_scale; // kernel convention: gs = 1/global_scale per 16-row tile
+        let gsv = vec![inv_gs; m / 16];
+        let qweight = self.dev.htod_sync_copy(&wt).ok()?;
+        let scales = self.dev.htod_sync_copy(&st).ok()?;
+        let gs = self.dev.htod_sync_copy(&gsv).ok()?;
+        eprintln!("[df2] head quantized in {:.1}s ({} MB packed, was {} MB bf16) — draft head now reads ~1/3.7x",
+                  t0.elapsed().as_secs_f32(), wt.len() / 1_000_000, m * k * 2 / 1_000_000);
+        Some(W::Nvfp4 { qweight, scales, gs, m, k })
     }
 
     /// S10' §4 — is this trunk dimension-compatible with the DFlash2 round? The round (the
@@ -2144,7 +2351,13 @@ impl GpuModel {
         unsafe { blas.set_stream(Some(&stream))?; }
         Self::init_ptx(&dev)?;
         let (k, bk) = Self::load_batch_kernels(&dev)?;
-        let (cos_table, sin_table) = Self::build_rope_tables(&dev, &host.config)?;
+        // E5: trunk YaRN override — env-first (single-box), then the shipped TpConfig (node).
+        let mut cfg_host = host.config.clone();
+        cfg_host.rope_yarn_factor = std::env::var("GB10_ROPE_YARN_FACTOR").ok()
+            .and_then(|v| v.parse::<f32>().ok()).filter(|f| *f >= 1.0)
+            .or(crate::tp::tp_config().map(|c| c.rope_yarn_factor))
+            .unwrap_or(1.0);
+        let (cos_table, sin_table) = Self::build_rope_tables(&dev, &cfg_host)?;
         let sc_pos = dev.alloc_zeros::<i32>(MAX_VERIFY).unwrap();
         let sc_rope = dev.alloc_zeros::<i32>(MAX_VERIFY).unwrap();
         let sc_slot = dev.alloc_zeros::<i32>(MAX_VERIFY).unwrap();
@@ -2169,6 +2382,10 @@ impl GpuModel {
         let mut mtp_sids = dev.alloc_zeros::<i32>(MAX_VERIFY).unwrap();
         dev.memset_zeros(&mut mtp_sids).unwrap();
         let deq_scratch = std::sync::Mutex::new(None);
+        let fp8e_map: std::sync::Mutex<std::collections::HashMap<u64, cudarc::driver::CudaSlice<u8>>> = std::sync::Mutex::new(std::collections::HashMap::new());
+        let fp8e_scratch: std::sync::Mutex<Option<(cudarc::driver::CudaSlice<u8>, cudarc::driver::CudaSlice<f32>)>> = std::sync::Mutex::new(None);
+        let fp8e_map: std::sync::Mutex<std::collections::HashMap<u64, cudarc::driver::CudaSlice<u8>>> = std::sync::Mutex::new(std::collections::HashMap::new());
+        let fp8e_scratch: std::sync::Mutex<Option<(cudarc::driver::CudaSlice<u8>, cudarc::driver::CudaSlice<f32>)>> = std::sync::Mutex::new(None);
         let splitk_partials = dev.alloc_zeros::<f32>(SPLITK_MAX_TILES * SPLITK_MAX_S * 256).unwrap();
         // R9 (world>2): fp32 upcast scratch for the no-rounding all-reduce. Sized for the widest
         // single-slot reduction (TP_SLOT_BYTES/4 fp32 elems = the whole ring slot in fp32).
@@ -2216,10 +2433,12 @@ impl GpuModel {
 
         // Load MTP head if present
         let mtp = Self::load_mtp_gpu(&host, &dev)?;
-        let (kv_quant, kv_tq, kv_tq_b3, kv_k8v4) = Self::kv_modes_from_env();
+        let (kv_quant, kv_tq, kv_tq_b3, kv_k8v4, kv_k8v8) = Self::kv_modes_from_env();
         let tq_tables = Self::build_tq_tables(&dev)?;
         dev.synchronize()?;
-        Ok(Self { dev, blas, stream, cfg, embed, lm_head, final_norm, layers, mtp, k, bk, cos_table, sin_table, sc_pos, sc_rope, sc_slot, sc_winsrc, sc_parent, sc_path, sc_tok, sc_pstart, moe_ids, moe_wts, moe_g, moe_g_pf, sc_i1a, sc_i1b, sv_pf, sv_ki, sv_sd, sv_cand, sv_p, sv_r, mr_tok, mr_pos, verify_params, verify_resid, verify_graphs, gdn_slot_tables, sv_t20: std::sync::OnceLock::new(), sv_t20_scratch: std::sync::OnceLock::new(), deq_scratch, splitk_partials, tp_f32_scratch, mtp_sids, draft_head: None, draft_ids: Vec::new(), lm_head_sharded: false, tp_sharded_at_load: false, gdn_chunk_raw_fn: gdn_chunk_load_raw_fn(), gdn_chunk_tc_raw_fn: gdn_chunk_tc_load_raw_fn(), kv_quant, kv_tq, kv_tq_b3, kv_k8v4, tq_tables, mxfp4: None, tp_rank: 0, tp_world: 1, tp_ctx_dptr: 0, head_visits: None, dflash_tap: None, df2_capture: None, df2_capture_tree: None, df2_prime: None, dflash_lm_head: None, df2_full_head: None })
+        let vmask_words = dev.htod_sync_copy(&vec![0u32; mask_words_for(cfg.vocab_size) * MAX_VERIFY]).unwrap();
+        let vmask_flags = dev.htod_sync_copy(&vec![0i32; MAX_VERIFY]).unwrap();
+        Ok(Self { dev, blas, stream, cfg, embed, lm_head, final_norm, layers, mtp, k, bk, cos_table, sin_table, sc_pos, sc_rope, sc_slot, sc_winsrc, sc_parent, sc_path, sc_tok, sc_pstart, moe_ids, moe_wts, moe_g, moe_g_pf, sc_i1a, sc_i1b, sv_pf, sv_ki, sv_sd, sv_cand, sv_p, sv_r, mr_tok, mr_pos, verify_params, verify_resid, verify_graphs, gdn_slot_tables, sv_t20: std::sync::OnceLock::new(), sv_t20_scratch: std::sync::OnceLock::new(), vmask_words, vmask_flags, vmask_words_ptr: std::sync::atomic::AtomicU64::new(0), vmask_flags_ptr: std::sync::atomic::AtomicU64::new(0), deq_scratch, fp8e_map, fp8e_scratch, splitk_partials, tp_f32_scratch, mtp_sids, draft_head: None, draft_ids: Vec::new(), lm_head_sharded: false, tp_sharded_at_load: false, gdn_chunk_raw_fn: gdn_chunk_load_raw_fn(), gdn_chunk_tc_raw_fn: gdn_chunk_tc_load_raw_fn(), kv_quant, kv_tq, kv_tq_b3, kv_k8v4, kv_k8v8, tq_tables, mxfp4: None, tp_rank: 0, tp_world: 1, tp_ctx_dptr: 0, head_visits: None, dflash_tap: None, df2_capture: None, df2_capture_tree: None, df2_prime: None, dspark_capture: None, dspark_capture_tree: None, dspark_prime: None, dflash_lm_head: None, df2_full_head: None, df2_q_head: std::sync::OnceLock::new() })
     }
 
     /// Stream-load from safetensors directly as bf16 — no f32 intermediate.
@@ -2407,6 +2626,12 @@ impl GpuModel {
         let (k, bk) = Self::load_batch_kernels(&dev)?;
         let t_ptx = t_ptx0.elapsed();
         let t_rope0 = std::time::Instant::now();
+        // E5: trunk YaRN override — env-first (single-box), then the shipped TpConfig (node).
+        let mut cfg = cfg;
+        cfg.rope_yarn_factor = std::env::var("GB10_ROPE_YARN_FACTOR").ok()
+            .and_then(|v| v.parse::<f32>().ok()).filter(|f| *f >= 1.0)
+            .or(crate::tp::tp_config().map(|c| c.rope_yarn_factor))
+            .unwrap_or(1.0);
         let (cos_table, sin_table) = Self::build_rope_tables(&dev, &cfg)?;
         let t_rope = t_rope0.elapsed();
         let sc_pos = dev.alloc_zeros::<i32>(MAX_VERIFY).unwrap();
@@ -2433,6 +2658,8 @@ impl GpuModel {
         let mut mtp_sids = dev.alloc_zeros::<i32>(MAX_VERIFY).unwrap();
         dev.memset_zeros(&mut mtp_sids).unwrap();
         let deq_scratch = std::sync::Mutex::new(None);
+        let fp8e_map: std::sync::Mutex<std::collections::HashMap<u64, cudarc::driver::CudaSlice<u8>>> = std::sync::Mutex::new(std::collections::HashMap::new());
+        let fp8e_scratch: std::sync::Mutex<Option<(cudarc::driver::CudaSlice<u8>, cudarc::driver::CudaSlice<f32>)>> = std::sync::Mutex::new(None);
         let splitk_partials = dev.alloc_zeros::<f32>(SPLITK_MAX_TILES * SPLITK_MAX_S * 256).unwrap();
         // R9 (world>2): fp32 upcast scratch for the no-rounding all-reduce. Sized for the widest
         // single-slot reduction (TP_SLOT_BYTES/4 fp32 elems = the whole ring slot in fp32).
@@ -3956,6 +4183,22 @@ impl GpuModel {
                 None
             };
 
+        // P14 DFlash v1 tap sink: active whenever the v1 drafter directory is configured
+        // (the drafter-dir env knob) — the drafter's conditioning IS the target's hidden states at the
+        // artifact's `target_layer_ids`, so the sink cannot be sized before that config is read.
+        // Rank 0 only (the drafter is a rank-0 citizen; the captures are rank-local D2Ds).
+        // Reading the config here (JSON only, no tensors) is what makes a second artifact a
+        // config change: nothing in the trunk hard-codes 5 taps / 4096 / block 8 any more.
+        if let Some(ddir) = crate::draft_dir_env() {
+            if !ddir.is_empty() && sal.map(|r| r == 0).unwrap_or(true) {
+                let dcfg = crate::dflash::DflashCfg::load(std::path::Path::new(&ddir))?;
+                eprintln!("[dflash] v1 tap sink (rank-0): {} taps {:?}, block {}, h {}",
+                          dcfg.nctx(), dcfg.tap_layers, dcfg.block, cfg.hidden_size);
+                dflash_tap_out = Some(crate::dflash::DflashTapSink::new(
+                    &dev, cfg.hidden_size, dcfg.tap_layers.clone()));
+            }
+        }
+
         // Mirror of attach_tp's rule: a QUANTIZED untied head was vocab-sharded at load.
         let mut lm_head_sharded_lc = sal.is_some()
             && matches!(lm_head, Some(W::Nvfp4 { .. }) | Some(W::Fp8 { .. }));
@@ -4015,11 +4258,8 @@ impl GpuModel {
                 eprintln!("[tp] rank {rank} — bf16 lm_head vocab-sharded ({v} -> {hv} rows)");
                 // E29-B3 tap sink: rank 0 only (the node stays a plain SPMD participant; the
                 // D2D captures are rank-local and barrier-free, so the TP lockstep is untouched).
-                let dflash_tap = if dflash_active {
-                    Some(crate::dflash::DflashTapSink::new(&dev, cfg.hidden_size))
-                } else { None };
+                // (P14: the v1 tap sink is created above, from the artifact's config — not here.)
                 dflash_full_lm_head = dflash_full;
-                dflash_tap_out = dflash_tap;
             }
         }
 
@@ -4059,10 +4299,12 @@ impl GpuModel {
 
         mem_probe("post-pipeline");
         let mxfp4 = crate::mxfp4::Mxfp4State::build(mxfp4_mode, omma_map, allow_bf16, mixer4, &dev, &cfg)?;
-        let (kv_quant, kv_tq, kv_tq_b3, kv_k8v4) = Self::kv_modes_from_env();
+        let (kv_quant, kv_tq, kv_tq_b3, kv_k8v4, kv_k8v8) = Self::kv_modes_from_env();
         let tq_tables = Self::build_tq_tables(&dev)?;
         mem_probe("post-mxfp4-build");
-        Ok((Self { dev, blas, stream, cfg: cfg.clone(), embed, lm_head, final_norm, layers, mtp, k, bk, cos_table, sin_table, sc_pos, sc_rope, sc_slot, sc_winsrc, sc_parent, sc_path, sc_tok, sc_pstart, moe_ids, moe_wts, moe_g, moe_g_pf, sc_i1a, sc_i1b, sv_pf, sv_ki, sv_sd, sv_cand, sv_p, sv_r, mr_tok, mr_pos, verify_params, verify_resid, verify_graphs, gdn_slot_tables, sv_t20: std::sync::OnceLock::new(), sv_t20_scratch: std::sync::OnceLock::new(), deq_scratch, splitk_partials, tp_f32_scratch, mtp_sids, draft_head, draft_ids, lm_head_sharded: lm_head_sharded_lc, gdn_chunk_raw_fn: gdn_chunk_load_raw_fn(), gdn_chunk_tc_raw_fn: gdn_chunk_tc_load_raw_fn(), tp_sharded_at_load: sal.is_some(), kv_quant, kv_tq, kv_tq_b3, kv_k8v4, tq_tables, mxfp4, tp_rank: 0, tp_world: world, tp_ctx_dptr: 0, head_visits: None, dflash_tap: dflash_tap_out, df2_capture: df2_capture_out, df2_capture_tree: None, df2_prime: None, dflash_lm_head: dflash_full_lm_head, df2_full_head: df2_full_head_lc }, cfg))
+        let vmask_words = dev.htod_sync_copy(&vec![0u32; mask_words_for(cfg.vocab_size) * MAX_VERIFY]).unwrap();
+        let vmask_flags = dev.htod_sync_copy(&vec![0i32; MAX_VERIFY]).unwrap();
+        Ok((Self { dev, blas, stream, cfg: cfg.clone(), embed, lm_head, final_norm, layers, mtp, k, bk, cos_table, sin_table, sc_pos, sc_rope, sc_slot, sc_winsrc, sc_parent, sc_path, sc_tok, sc_pstart, moe_ids, moe_wts, moe_g, moe_g_pf, sc_i1a, sc_i1b, sv_pf, sv_ki, sv_sd, sv_cand, sv_p, sv_r, mr_tok, mr_pos, verify_params, verify_resid, verify_graphs, gdn_slot_tables, sv_t20: std::sync::OnceLock::new(), sv_t20_scratch: std::sync::OnceLock::new(), vmask_words, vmask_flags, vmask_words_ptr: std::sync::atomic::AtomicU64::new(0), vmask_flags_ptr: std::sync::atomic::AtomicU64::new(0), deq_scratch, fp8e_map, fp8e_scratch, splitk_partials, tp_f32_scratch, mtp_sids, draft_head, draft_ids, lm_head_sharded: lm_head_sharded_lc, gdn_chunk_raw_fn: gdn_chunk_load_raw_fn(), gdn_chunk_tc_raw_fn: gdn_chunk_tc_load_raw_fn(), tp_sharded_at_load: sal.is_some(), kv_quant, kv_tq, kv_tq_b3, kv_k8v4, kv_k8v8, tq_tables, mxfp4, tp_rank: 0, tp_world: world, tp_ctx_dptr: 0, head_visits: None, dflash_tap: dflash_tap_out, df2_capture: df2_capture_out, df2_capture_tree: None, df2_prime: None, dspark_capture: None, dspark_capture_tree: None, dspark_prime: None, dflash_lm_head: dflash_full_lm_head, df2_full_head: df2_full_head_lc, df2_q_head: std::sync::OnceLock::new() }, cfg))
     }
 
     fn init_ptx(dev: &Arc<CudaDevice>) -> anyhow::Result<()> {
@@ -4121,9 +4363,9 @@ impl GpuModel {
             "write_kv_b","compact_kv_b","sigmoid_gate_b","split_qgate_b",
             "gather_rope_b","embed_gather_b","argmax_b","gemm_binv_argmax_b","argmax_part_b",
             "conv1d_prefill","conv1d_prefill_state","delta_step_prefill","gdn_chunk_prefill_b","gdn_prep_b","attn_softmax_tile","attn_finalize","attn_tile_init","attn_prefill_fa_b","attn_prefill_fa_sc_b","write_kv_prefill","gqa_attn_prefill",
-            "rep_penalty_b","rep_penalty_f32_b","gqa_attn_splitk","gqa_attn_reduce","sample_b","sample_f32_b","concat_b",
+            "rep_penalty_b","rep_penalty_f32_b","logit_mask_b","logit_mask_f32_b","gqa_attn_splitk","gqa_attn_reduce","sample_b","sample_f32_b","concat_b",
             "gemm_binv_b","gemm_binv_f32_b","sample_prob_b","spec_verify_b","spec_verify_f32_b","spec_verify_realq_b","df2_topk20_dump_b","nll_b","argmax_f32_b","verify_chain_params_b",
-            "gemm_mma_fp4_b","gemm_mma_fp8_b","gemm_mma_fp8_blk_b","gemm_mma_fp4_splitk_b","gemm_mma_splitk_reduce_b","gemm_dsv4_fp8_bsb","dequant_fp4_tiled_b","dequant_fp8_tiled_b","dequant_fp8_blk_tiled_b",
+            "gemm_mma_fp4_b","gemm_mma_fp8_b","gemm_mma_fp8_blk_b","fp8_repack_e_b","fp8_blk_scales_b","fp8_pack_b","fp8_quant_pack_b","gemm_fp8_prefill_e_b","gemm_mma_fp4_splitk_b","gemm_mma_splitk_reduce_b","gemm_dsv4_fp8_bsb","dequant_fp4_tiled_b","dequant_fp8_tiled_b","dequant_fp8_blk_tiled_b",
             "embed_gather_fp4_tiled_b","embed_gather_fp8_tiled_b","bw_read_b",
             "split_gdn_b","split_qkv_b",
             "moe_router_topk_b","moe_router_topk_sigmoid_b","moe_router_topk_sigmoid_f32_b","moe_experts_b","moe_experts_fp4_b","moe_shared_combine_b",
@@ -4138,9 +4380,10 @@ impl GpuModel {
             "gemm_moe_grouped_mma_fp4","gemm_moe_grouped_mma_fp4_x2","gemm_moe_grouped_mma_fp4_u4","gemm_moe_grouped_mma_fp4_x4","moe_combine_grouped_b",
             "gemm_moe_grouped_mma_fp4_fold","gemm_moe_grouped_mma_fp4_x4_fold","moe_combine_grouped_fold_b",
             "write_kv_b_q4","write_kv_prefill_q4","compact_kv_q4","dequant_kv_q4","gqa_attn_splitk_q4",
-            "gqa_attn_splitk_q4_gq","gqa_attn_splitk_gq",
+            "gqa_attn_splitk_q4_gq","gqa_attn_splitk_gq","gqa_attn_verify_e","gqa_attn_verify_e_p3","gqa_attn_reduce_e",
             "write_kv_b_k8v4","write_kv_prefill_k8v4","compact_kv_k8v4","dequant_kv_k8v4",
             "gqa_attn_splitk_k8v4","gqa_attn_splitk_k8v4_gq",
+            "write_kv_b_k8v8","write_kv_prefill_k8v8","compact_kv_k8v8","gqa_attn_verify_e_k8v8",
             "write_kv_b_tq","write_kv_prefill_tq","rotate_q_tq","compact_kv_tq","dequant_kv_tq",
             "dequant_kv_tq_full","gqa_attn_splitk_tq","gqa_attn_splitk_tq_gq","gqa_attn_splitk_tq_dbg_scores",
             "tp_mask_rows","tp_gate_copy_signal","tp_wait_add","tp_wait_add_g","tp_wait_add_4way","tp_reduce_resnorm_b",
@@ -4178,7 +4421,7 @@ impl GpuModel {
     /// (b=3 K, the quality fix) enable the TQ path, and only `GB10_KV_K8V4=1` enables the k8v4
     /// path; `=0` (or unset) restores the current path byte-for-byte (the task's escape-hatch
     /// acceptance).
-    fn kv_modes_from_env() -> (bool, bool, bool, bool) {
+    fn kv_modes_from_env() -> (bool, bool, bool, bool, bool) {
         let q4 = std::env::var("GB10_KV_QUANT").is_ok();
         let (tq, b3) = match std::env::var("GB10_KV_TQ").ok().as_deref() {
             Some("3") => (true, true),
@@ -4186,25 +4429,56 @@ impl GpuModel {
             _ => (false, false),
         };
         let k8v4 = std::env::var("GB10_KV_K8V4").ok().as_deref() == Some("1");
+        let k8v8 = std::env::var("GB10_KV_K8V8").ok().as_deref() == Some("1");
+        assert!(!(k8v8 && (q4 || tq || k8v4)),
+                "GB10_KV_K8V8 is mutually exclusive with the q4/TQ/k8v4 cache layouts (one KV \
+                 layout per process; mixing would double-book the cache buffers)");
         assert!(!(q4 && tq) && !(q4 && k8v4) && !(tq && k8v4),
                 "GB10_KV_QUANT, GB10_KV_TQ and GB10_KV_K8V4 are mutually exclusive — the \
                  TurboQuant cache is the 3.5-bit successor of the q4 layout and k8v4 is the \
                  int8-K successor (EXPERT_KV_K8V4_RESPONSE.md); pick one");
-        (q4, tq, b3, k8v4)
+        (q4, tq, b3, k8v4, k8v8)
     }
 
     fn build_rope_tables(dev: &Arc<CudaDevice>, cfg: &crate::qwen::Config) -> anyhow::Result<(S, S)> {
         let rdim = cfg.rotary_dim;
         let half = rdim / 2;
         let theta = cfg.rope_theta;
-        let max_pos = cfg.max_position_embeddings;
+        // E5 (512K mandate): `rope_yarn_factor > 1` switches the TRUNK tables to YaRN — the
+        // same per-dim ramp math the dspark oracle ships (yaarn_freqs, validated against
+        // vLLM's yarn_scaling_rope) — and extends the tables to factor × native rows (the
+        // kernels index rows by ABSOLUTE position; a 512K serve on native 256K tables reads
+        // past the end). mscale = 0.1·ln(factor)+1 folds into cos/sin exactly like the draft
+        // and vLLM. factor 1.0 (default) leaves the legacy tables byte-identical.
+        let factor = cfg.rope_yarn_factor;
+        let max_pos = if factor > 1.0 {
+            let rows = (cfg.max_position_embeddings as f64 * factor as f64).ceil() as usize;
+            eprintln!("[rope] YaRN factor {factor}: {rows} rows (native {}), mscale {:.4}",
+                      cfg.max_position_embeddings, 0.1 * factor.ln() + 1.0);
+            rows
+        } else {
+            cfg.max_position_embeddings
+        };
         let mut cos_t = vec![0.0f32; max_pos * rdim];
         let mut sin_t = vec![0.0f32; max_pos * rdim];
+        let (mscale, freqs) = if factor > 1.0 {
+            // vLLM defaults beta_fast=32, beta_slow=1 (the draft artifact's values).
+            (0.1f32 * factor.ln() + 1.0,
+             crate::dspark::oracle::yaarn_freqs(rdim, theta, factor,
+                                                cfg.max_position_embeddings, 32, 1))
+        } else {
+            (1.0f32, Vec::new())
+        };
         for p in 0..max_pos {
             let pf = p as f32;
             for i in 0..half {
-                let f = pf * theta.powf(-(2.0 * i as f32) / rdim as f32);
-                let (c, s) = (f.cos(), f.sin());
+                let f = if factor > 1.0 {
+                    pf * freqs[i]
+                } else {
+                    pf * theta.powf(-(2.0 * i as f32) / rdim as f32)
+                };
+                let (mut c, mut s) = (f.cos(), f.sin());
+                if factor > 1.0 { c *= mscale; s *= mscale; }
                 cos_t[p * rdim + i] = c; sin_t[p * rdim + i] = s;
                 cos_t[p * rdim + i + half] = c; sin_t[p * rdim + i + half] = s;
             }
@@ -4576,6 +4850,64 @@ impl GpuModel {
     /// This is emphatically NOT the decode path: dequantizing to bf16 there would stream bf16 bytes
     /// again and throw away the whole point. It exists because prefill reads each weight once for many
     /// tokens, so bandwidth stops being the constraint and cuBLAS's tensor cores win.
+    /// F8 parity lane: W8A8 e4m3 prefill GEMM (gemm_fp8_prefill_e_b). Caller guarantees
+    /// W::Fp8Blk, inn%128==0, outn%128==0, batch>=256. One-time per-tensor repack into
+    /// k32 e4m3 A-frag panels (fp8e_map); per-call X scales (per token x 128-K) + packed
+    /// B panels; the GEMM folds w_s(block 128x128) x x_s(token,128K) every 128-K span.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_fp8_prefill_e(&self, w: &W, x: &B, out: &mut B, inn: usize, outn: usize, batch: usize, trace: bool) {
+        let (data, blk_scale) = match w { W::Fp8Blk { data, blk_scale, .. } => (data, blk_scale), _ => unreachable!() };
+        let dev = &self.dev;
+
+        // (a) lazy one-time repack (the decode kernel keeps the ORIGINAL k16 layout —
+        // this side buffer is read only by gemm_fp8_prefill_e_b). The repack kernel
+        // writes every byte, so the fresh (unzeroed) async alloc is fully initialized.
+        let wptr = *data.device_ptr() as u64;
+        {
+            let mut map = self.fp8e_map.lock().unwrap();
+            if !map.contains_key(&wptr) {
+                let buf = dev.alloc_zeros::<u8>(outn * inn).unwrap();
+                blaunch!(self, "fp8_repack_e_b", (2048, 1, 1), (256, 1, 1), 0,
+                    (wptr, *buf.device_ptr() as u64, outn as i32, inn as i32));
+                if trace { eprintln!("[pf8] repacked {outn}x{inn} -> k32 panels"); }
+                map.insert(wptr, buf);
+            }
+        }
+        let panels = *self.fp8e_map.lock().unwrap()[&wptr].device_ptr() as u64;
+
+        // (b) scratch: Bq panels (tp64 x inn bytes) + Xs scales (tp64 x inn/128 f32).
+        // Precondition (documented above): batch >= 256, where pf8_pad_pub is exactly
+        // div_ceil(64)*64 — the consolidation cannot weaken the bound or shrink `bq_bytes`/
+        // `xs_elems` below what the kernel writes. Below 256 this function is never called.
+        let tp64 = pf8_pad_pub(batch);
+        assert!(out.len() >= tp64 * outn,
+                "pf8 lane OOB: out has {} elems < tp64*outn = {}*{} — caller must size the buffer to the padded token count (see mlp_batch bn)",
+                out.len(), tp64, outn);
+        let bq_bytes = tp64 * inn;
+        let xs_elems = tp64 * (inn / 128);
+        {
+            let mut sc = self.fp8e_scratch.lock().unwrap();
+            if sc.as_ref().map_or(true, |(b, s)| b.len() < bq_bytes || s.len() < xs_elems) {
+                *sc = None; // drop old on the blocking stream (ordered after in-flight use)
+                *sc = Some((dev.alloc_zeros::<u8>(bq_bytes).unwrap(),
+                            dev.alloc_zeros::<f32>(xs_elems).unwrap()));
+            }
+        }
+        let (bq, xs) = self.fp8e_scratch.lock().unwrap().as_ref().map(|(b, s)| (*b.device_ptr() as u64, *s.device_ptr() as u64)).unwrap();
+
+        // (c) fused single-pass quant over the padded token count (pad rows: identity
+        // scale, zero codes — never touch X beyond the real rows). One X read.
+        let kspans = (inn / 128) as i32;
+        let jobs = (tp64 / 8) * (inn / 128) * 32;
+        blaunch!(self, "fp8_quant_pack_b", ((jobs as u32 + 255) / 256, 1, 1), (256, 1, 1), 0,
+            (d(x), bq, xs, batch as i32, inn as i32, kspans));
+
+        // (d) the GEMM: grid = (outn/128) x (tp64/64) rasterized 1-D in-kernel.
+        let blocks = ((outn / 128) * (tp64 / 64)) as u32;
+        blaunch!(self, "gemm_fp8_prefill_e_b", (blocks, 1, 1), (256, 1, 1), 4 * 6144,
+            (panels, bq, xs, d(blk_scale), d(out), outn as i32, tp64 as i32, inn as i32));
+    }
+
     fn gemm_quant_prefill(&self, w: &W, x: &B, out: &mut B, inn: usize, outn: usize, batch: usize) {
         self.gemm_quant_prefill_inner(w, x, out, inn, outn, batch, true)
     }
@@ -4587,6 +4919,86 @@ impl GpuModel {
     }
     /// P4 B2 dispatch + original dequant/cuBLAS path.
     fn gemm_quant_prefill_inner(&self, w: &W, x: &B, out: &mut B, inn: usize, outn: usize, batch: usize, allow_pf4: bool) {
+
+        // F8 parity lane (2026-09-07): W8A8 e4m3 prefill GEMM for the Fp8Blk trunk (the
+        // vLLM-recipe equivalence item). Env-gated while experimental: GB10_FP8_PREFILL=1.
+        // Shapes: M%128==0 (every sharded projection), K%128==0, batch>=PF8_MIN. Falls
+        // through to dequant+cuBLAS otherwise. GB10_PF8_TRACE=1 logs the gate + first
+        // repacks; GB10_PF8_CHECK=1 runs the slow path too and prints per-site rel-L2
+        // (the S3 cross-chain rule: self-consistency proves nothing).
+        static PF8_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static PF8_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static PF8_CHECK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static PF8_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        const PF8_MIN: usize = 256;
+        // Phase-8 (F9): DEFAULT ON. The dequant+cuBLASLt fallback's algo heuristic reads the
+        // operand ADDRESSES, so the same (M,N,K) rounds differently per pool state — on the TP
+        // NODE rank that made warm prefix-reuse prefills diverge from cold (deterministically per
+        // request ordinal). The W8A8 lane is a fixed-order custom kernel: address-invariant and
+        // measured bit-identical to the cuBLAS path's outputs on the head rank (detP==detS
+        // streams), so the flip is a determinism fix, not a numerics change. GB10_FP8_PREFILL=0
+        // restores the cuBLAS arm (diagnostics A/B); =1 remains accepted for symmetry.
+        let pf8_on = allow_pf4
+            && *PF8_ON.get_or_init(|| std::env::var("GB10_FP8_PREFILL").map_or(true, |v| v != "0"))
+            && { static M: std::sync::Once = std::sync::Once::new();
+                 M.call_once(|| eprintln!("[pf8-on] W8A8 prefill GEMM lane ENGAGED (default)")); true }
+            && matches!(w, W::Fp8Blk { .. })
+            && inn % 128 == 0
+            && outn % 128 == 0
+            && batch >= PF8_MIN;
+        if pf8_on {
+            let trace = *PF8_TRACE.get_or_init(|| std::env::var("GB10_PF8_TRACE").is_ok());
+            let check = *PF8_CHECK.get_or_init(|| std::env::var("GB10_PF8_CHECK").is_ok());
+            let c = PF8_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if trace && (c < 5 || c % 200 == 0) {
+                eprintln!("[pf8 #{c}] outn={outn} inn={inn} batch={batch}");
+            }
+            if check && c < 8 {
+                // cross-check: slow reference into a clone, then the fast path into `out`
+                let mut ref_out = out.clone();
+                self.gemm_quant_prefill_slow(w, x, &mut ref_out, inn, outn, batch);
+                self.gemm_fp8_prefill_e(w, x, out, inn, outn, batch, trace);
+                self.dev.synchronize().unwrap();
+            if std::env::var("GB10_PF8_DUMP").is_ok() && PF8_N.load(std::sync::atomic::Ordering::Relaxed) == 1 {
+                // one-shot evidence dump: exact inputs + fast-path output for offline replay
+                if let W::Fp8Blk { data, blk_scale, nb_k, m, k } = w {
+                    let (xh, wh, sh) = (self.dev.dtoh_sync_copy(x).unwrap(),
+                                        self.dev.dtoh_sync_copy(data).unwrap(),
+                                        self.dev.dtoh_sync_copy(blk_scale).unwrap());
+                    let oh = self.dev.dtoh_sync_copy(out).unwrap();
+                    let hdr = format!("{outn} {inn} {batch} {} {} {}\n", *m, *k, *nb_k);
+                    std::fs::write("/tmp/pf8_dump.hdr", hdr).unwrap();
+                    let mut xb = Vec::with_capacity(xh.len() * 2); for v in &xh { xb.extend_from_slice(&v.to_le_bytes()); }
+                    std::fs::write("/tmp/pf8_dump_x.bin", xb).unwrap();
+                    std::fs::write("/tmp/pf8_dump_wt.bin", &wh).unwrap();
+                    let mut sb = Vec::with_capacity(sh.len() * 4); for v in &sh { sb.extend_from_slice(&v.to_le_bytes()); }
+                    std::fs::write("/tmp/pf8_dump_ws.bin", sb).unwrap();
+                    let mut ob = Vec::with_capacity(oh.len() * 2); for v in &oh { ob.extend_from_slice(&v.to_le_bytes()); }
+                    std::fs::write("/tmp/pf8_dump_out.bin", ob).unwrap();
+                    eprintln!("[pf8-dump] wrote x/wt/ws/out for outn={outn} inn={inn} batch={batch}");
+                }
+            }
+
+                let a = self.dev.dtoh_sync_copy(out).unwrap();
+                let b = self.dev.dtoh_sync_copy(&ref_out).unwrap();
+                let mut num = 0f64;
+                let mut den = 0f64;
+                for r in 0..batch {
+                    for q in 0..outn {
+                        let i = r * outn + q;
+                        let av = half::bf16::to_f32(a[i]);
+                        let bv = half::bf16::to_f32(b[i]);
+                        num += ((av - bv) * (av - bv)) as f64;
+                        den += (bv * bv) as f64;
+                    }
+                }
+                eprintln!("[pf8-check #{c}] outn={outn} inn={inn} batch={batch} rel-L2 = {:.3e}",
+                          (num / den).sqrt());
+                return;
+            }
+            self.gemm_fp8_prefill_e(w, x, out, inn, outn, batch, trace);
+            return;
+        }
         // P4 B2 (2026-08-18): W4A4 OMMA prefill GEMM (kernels/gpu_mxfp4.cu). Env-gated
         // (GB10_MXFP4_PREFILL) — ships dark until the B2 gate (prefill >= 1000 tok/s) passes.
         // Constraints mirror the kernel: K % 256 == 0, outn % 128 == 0, batch % 128 == 0
@@ -4950,6 +5362,24 @@ impl GpuModel {
                     (ptr, *data.device_ptr() as u64, d(row_scale), outn as i32, inn as i32));
             }
             W::Fp8Blk { data, blk_scale, nb_k, .. } => {
+                // F8 diagnostic (GB10_TRACE_DEQUANT): who sends a GEMM down the dequant path?
+                // Backtrace on the first calls + every 500th. Answer-only instrumentation.
+                static DQ_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                if std::env::var("GB10_TRACE_DEQUANT").is_ok() {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    let n = DQ_N.fetch_add(1, Relaxed);
+                    if n < 4 || n % 500 == 0 {
+                        let bt = std::backtrace::Backtrace::force_capture();
+                        let frames: Vec<String> = format!("{bt}").lines()
+                            .filter(|l| l.contains("gpu") || l.contains("batch"))
+                            .map(|l| l.trim().to_string()).take(8).collect();
+                        eprintln!("[dq-trace #{n}] outn={outn} inn={inn} batch={batch}\n   {}",
+                                  frames.join("\n   "));
+                    } else if n % 100 == 0 {
+                        // compact cadence probe: is the dequant path still live at this count?
+                        eprintln!("[dq-alive #{n}] batch={batch} outn={outn}");
+                    }
+                }
                 blaunch!(self, "dequant_fp8_blk_tiled_b", (grid,1,1), (256,1,1), 0,
                     (ptr, *data.device_ptr() as u64, d(blk_scale), *nb_k as i32, outn as i32, inn as i32));
             }
@@ -5198,17 +5628,23 @@ impl GpuModel {
                     let ptr = *qweight.device_ptr() as u64;
                     if !st.allow_bf16.read().unwrap().contains(&ptr) {
                         self.launch_gemm_mxfp4(d(out), qweight, scales, gs, d(x), outn, inn, batch, st);
+                        crate::dispatch_assert::record(crate::dispatch_assert::FMT_MXFP4, batch,
+                            crate::dispatch_assert::ARM_MXFP4_NATIVE, MAX_VERIFY, "gemm_act/mxfp4");
                         return;
                     }
                 }
                 self.launch_gemm_fp4(d(out), *qweight.device_ptr() as u64, *scales.device_ptr() as u64,
                                      d(gs), d(x), outn, inn, batch, 0);
+                crate::dispatch_assert::record(crate::dispatch_assert::FMT_NVFP4, batch,
+                    crate::dispatch_assert::ARM_MMA, MAX_VERIFY, "gemm_act/nvfp4");
                 return;
             }
             W::Fp8 { data, row_scale, .. } if batch <= MAX_VERIFY => {
                 blaunch!(self, "gemm_mma_fp8_b", ((outn / 16) as u32,1,1), (256,1,1), 0,
                     (d(out), *data.device_ptr() as u64, d(row_scale),
                      d(x), outn as i32, inn as i32, batch as i32, 0u64));
+                crate::dispatch_assert::record(crate::dispatch_assert::FMT_FP8, batch,
+                    crate::dispatch_assert::ARM_MMA, MAX_VERIFY, "gemm_act/fp8");
                 return;
             }
             W::Fp8Blk { data, blk_scale, .. } if batch <= MAX_VERIFY => {
@@ -5217,9 +5653,33 @@ impl GpuModel {
                 blaunch!(self, "gemm_mma_fp8_blk_b", ((outn / 16) as u32,1,1), (256,1,1), 0,
                     (d(out), *data.device_ptr() as u64, d(blk_scale),
                      d(x), outn as i32, inn as i32, batch as i32, 0u64));
+                crate::dispatch_assert::record(crate::dispatch_assert::FMT_FP8_BLK, batch,
+                    crate::dispatch_assert::ARM_MMA, MAX_VERIFY, "gemm_act/fp8blk");
                 return;
             }
             W::Nvfp4 { .. } | W::Fp8 { .. } | W::Fp8Blk { .. } => {
+                // F8 diagnostic (GB10_TRACE_WIDE): a quantized GEMM reached the PREFILL branch.
+                // Prints shape+caller for the first calls — catches any decode/verify-width leak.
+                static WIDE_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                if std::env::var("GB10_TRACE_WIDE").is_ok() {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    let c = WIDE_N.fetch_add(1, Relaxed);
+                    if c < 5 || c % 200 == 0 {
+                        let bt = std::backtrace::Backtrace::force_capture();
+                        let frames: Vec<String> = format!("{bt}").lines()
+                            .filter(|l| l.contains("gb10_inference")).map(|l| l.trim().to_string())
+                            .take(6).collect();
+                        eprintln!("[wide #{c}] outn={outn} inn={inn} batch={batch}\n   {}",
+                                  frames.join("\n   "));
+                    }
+                }
+                let dfmt = match w {
+                    W::Nvfp4 { .. } => crate::dispatch_assert::FMT_NVFP4,
+                    W::Fp8 { .. } => crate::dispatch_assert::FMT_FP8,
+                    _ => crate::dispatch_assert::FMT_FP8_BLK,
+                };
+                crate::dispatch_assert::record(dfmt, batch,
+                    crate::dispatch_assert::ARM_PREFILL, MAX_VERIFY, "gemm_act/prefill");
                 self.gemm_quant_prefill(w, x, out, inn, outn, batch);
                 return;
             }
@@ -5232,6 +5692,34 @@ impl GpuModel {
             let smem = (batch * 256 * 4) as u32;
             blaunch!(self, "gemm_binv_b", (outn as u32,1,1), (256,1,1), smem,
                 (d(out), d(w), d(x), outn as i32, inn as i32, batch as i32));
+            crate::dispatch_assert::record(crate::dispatch_assert::FMT_BF16, batch,
+                crate::dispatch_assert::ARM_BF16_BINV, MAX_VERIFY, "gemm_act/bf16-binv");
+            return;
+        }
+        // Phase-8 (F9 root cause): wide bf16 GEMMs run the deterministic per-16-column slices of
+        // gemm_binv_b BY DEFAULT. The old cuBLASLt call here fed the MoE ROUTER logits at prefill
+        // widths: cuBLASLt's algo heuristic takes the operand ADDRESSES into account, so the same
+        // (M,N,K) rounded differently depending on which pool buffer the window landed in — and the
+        // router is REPLICATED under TP, computed independently per rank with no all-reduce, so a
+        // near-tie top-k flip on one rank only made the expert-parallel combine sum MIXED experts
+        // (observed: warm prefix-reuse requests diverged from cold AND from each other,
+        // deterministically per request ordinal, while cold requests were bit-identical; layer-0
+        // post-mixer residual identical but post-FFN residual wildly different — the router flip
+        // signature). The sliced path is address-invariant, rank-invariant (same kernel + same
+        // replicated weights + same all-reduced bf16 input), and numerically equal to the decode
+        // contract. GB10_PREFILL_BF16_BINV=0 restores the old cuBLASLt behavior (diagnostics A/B).
+        if std::env::var("GB10_PREFILL_BF16_BINV").map_or(true, |v| v != "0") {
+            static SLICE_MARK: std::sync::Once = std::sync::Once::new();
+            SLICE_MARK.call_once(|| eprintln!("[bf16-slice] deterministic sliced gemm_binv_b ENGAGED for wide bf16 GEMMs (batch>{BINV_BATCH})"));
+            for c0 in (0..batch).step_by(BINV_BATCH) {
+                let cb = BINV_BATCH.min(batch - c0);
+                let smem = (cb * 256 * 4) as u32;
+                blaunch!(self, "gemm_binv_b", (outn as u32,1,1), (256,1,1), smem,
+                    (d(out) + (c0 * outn) as u64 * 2, d(w),
+                     d(x) + (c0 * inn) as u64 * 2, outn as i32, inn as i32, cb as i32));
+            }
+            crate::dispatch_assert::record(crate::dispatch_assert::FMT_BF16, batch,
+                crate::dispatch_assert::ARM_BF16_SLICE, MAX_VERIFY, "gemm_act/bf16-slice");
             return;
         }
         let cfg = GemmConfig::<half::bf16> {
@@ -5596,8 +6084,7 @@ impl GpuModel {
             None => (*self.moe_ids.device_ptr() as u64, *self.moe_wts.device_ptr() as u64),
         };
         if let Some(bias) = &moe.expert_bias {
-            if let W::Bf16(rw) = &moe.router {
-                // hy_v3: the reference computes router logits in FP32 (hidden.float() @ gate.float())
+            if let W::Bf16(rw) = &moe.router {                // hy_v3: the reference computes router logits in FP32 (hidden.float() @ gate.float())
                 // and sigmoid-selects on them. Rounding the logits to bf16 first (the qwen softmax
                 // path's contract) perturbs Hy3's tightly-clustered sigmoid scores by ~1e-3 and
                 // flips near-tie top-8 selections — an O(1) output change per flipped token. Keep
@@ -5641,6 +6128,20 @@ impl GpuModel {
         } else {
             let mut logits = pool.get_bf16(ne * batch);
             self.gemm_act_binv(&moe.router, x, &mut logits, h, ne, batch);
+            if std::env::var("GB10_DUMP_PFHASH").is_ok() {
+                // Phase-8 [rtap]: first wide MoE routing per prefill — token 0's top-k ids/weights
+                // and its logits, hashed — warm-vs-cold router decision probe.
+                static RTAP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                let n = RTAP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 4 {
+                    self.sync_stream();
+                    let lg = self.dev.dtoh_sync_copy(&logits).unwrap_or_default();
+                    let mut f64h = 0u64;
+                    for v in lg.iter().take(ne) { f64h ^= (v.to_bits() as u64).wrapping_mul(0x100000001B3); }
+                    eprintln!("[rtap#{n}] batch={batch} tok0 logits[:8]={:?} xor={:012x}",
+                              &lg.iter().take(8).map(|v| v.to_f32()).collect::<Vec<_>>(), f64h & 0xFFFFFFFFFFFF);
+                }
+            }
             blaunch!(self, "moe_router_topk_b", (batch as u32,1,1), (256,1,1), (ne*4) as u32,
                 (ids_ptr, wts_ptr, d(&logits), ne as i32, k as i32, batch as i32));
             pool.release_bf16(logits, ne * batch);
@@ -6626,7 +7127,8 @@ impl GpuModel {
     /// k8v4 K-row size in bytes: hd/16 blocks × 20 B (16 B int8 codes + 2 B fp16 scale + 2 B pad).
     /// Matches the kernels' KV8_ROW_BYTES. Meaningful only under GB10_KV_K8V4.
     pub fn kv_k_row_bytes(&self, hd: usize) -> usize {
-        assert!(self.kv_k8v4 && hd % 16 == 0, "k8v4 layout needs GB10_KV_K8V4 and hd % 16 == 0");
+        assert!((self.kv_k8v4 || self.kv_k8v8) && hd % 16 == 0,
+                "int8-block layout needs GB10_KV_K8V4/GB10_KV_K8V8 and hd % 16 == 0");
         (hd / 16) * 20
     }
 
@@ -6641,6 +7143,7 @@ impl GpuModel {
     /// The KV cache format this GpuModel uses.
     pub fn kv_mode(&self) -> KVCacheMode {
         if self.kv_tq { KVCacheMode::Tq }
+        else if self.kv_k8v8 { KVCacheMode::K8v8 }
         else if self.kv_k8v4 { KVCacheMode::K8v4 }
         else if self.kv_quant { KVCacheMode::Q4 }
         else { KVCacheMode::Bf16 }
@@ -6651,15 +7154,16 @@ impl GpuModel {
     /// time (K rows 20 B/16, V rows 12 B/16) — size sites must use the per-channel halves.
     pub fn kv_k_elems_per_pos(&self) -> usize {
         if self.kv_tq { self.tq_row_bytes() / 2 }
-        else if self.kv_k8v4 { self.kv_k_row_bytes(self.cfg.head_dim) / 2 }
+        else if self.kv_k8v4 || self.kv_k8v8 { self.kv_k_row_bytes(self.cfg.head_dim) / 2 }
         else if self.kv_quant { self.kvq_row_bytes(self.cfg.head_dim) / 2 }
         else { self.cfg.head_dim }
     }
 
     /// bf16 elements per V-cache position (one KV head). Under k8v4 the V cache is the q4 layout;
-    /// otherwise K and V share one size.
+    /// under k8v8 both channels are the int8-block layout; otherwise K and V share one size.
     pub fn kv_v_elems_per_pos(&self) -> usize {
         if self.kv_tq { self.tq_row_bytes() / 2 }
+        else if self.kv_k8v8 { self.kv_k_row_bytes(self.cfg.head_dim) / 2 }
         else if self.kv_k8v4 || self.kv_quant { self.kvq_row_bytes(self.cfg.head_dim) / 2 }
         else { self.cfg.head_dim }
     }
@@ -6928,6 +7432,17 @@ impl GpuModel {
     /// agree. Per-tensor guards mirror tp_shard_weights: only quantized tensors of divisible shapes
     /// shard, anything else stays replicated with its flag false.
     fn tp_shard_mtp_weights(&mut self, rank: usize, world: usize) {
+        // REGRESSION FIX (2026-09-11): F6 (3cadc14) enabled Fp8Blk sharding of the MTP head.
+        // Under TP the sharded draft path is numerically broken: draft-1 acceptance fell
+        // ~85%->~52% and the chained drafts are ALWAYS rejected (@2: 0% over 500+ steps),
+        // collapsing TP2/TP4 MTP serving (owner-measured 41.5->19.8 tok/s at TP2, 56.2->30.4
+        // at TP4; policy correctly settles at depth 2). Every correctness gate stayed green
+        // because verify rejects the garbage drafts (greedy stays lossless) and step-time
+        // instruments cannot see emission — bisected 918d7de(clean)/9705dc2(clean)/
+        // 3cadc14(broken), and GB10_TP_SHARD_MTP=0 on 74a4611 restores full acceptance.
+        // The MTP head stays REPLICATED (the pre-F6 shipping behavior, 0.444 GB/rank) until
+        // the sharded draft path is fixed AND gated by a TP acceptance probe, not LOSSLESS
+        // alone.
         let quant = |w: &W| matches!(w, W::Nvfp4 { .. } | W::Fp8 { .. });
         // TEMP bisect knob (diagnostics only): enable only the named shard part.
         let only = std::env::var("GB10_DBG_MTP_ONLY").ok();
@@ -7002,10 +7517,15 @@ impl GpuModel {
     }
     /// Whether the MTP block sharding is on (head's --tp-shard-mtp; GB10_TP_SHARD_MTP alias;
     /// TpConfig to the nodes — a one-sided shard is a weight-layout + barrier-sequence mismatch).
+    /// Phase-8 fix: the env term used `is_ok()`, so `GB10_TP_SHARD_MTP=0` read as ON — the head
+    /// sharded its MTP weights while TpConfig told the nodes `false`, the exact one-sided shard
+    /// this comment warns about (observed: boot-time graph-capture tripwire, device epoch 152
+    /// ahead of gpu_ready, 3 failed boots). The config field (tp.rs parses `0` correctly) is now
+    /// authoritative; the env remains a symmetric override that must EXPLICITLY enable.
     fn tp_shard_mtp_on(&self) -> bool {
         self.tp_world > 1
-            && (std::env::var("GB10_TP_SHARD_MTP").is_ok()
-                || crate::tp::tp_config().map(|c| c.shard_mtp).unwrap_or(false))
+            && (crate::tp::tp_config().map(|c| c.shard_mtp).unwrap_or(false)
+                || std::env::var("GB10_TP_SHARD_MTP").map_or(false, |v| v != "0"))
     }
     /// MTP attention head-sharded (drives the MTP KV-cache width — every alloc site must use this).
     fn mtp_attn_sharded(&self) -> bool {
@@ -7236,7 +7756,7 @@ impl GpuModel {
 
     /// MXFP4-native twin of `shard_nvfp4_col` (whole-M col shard + repack re-key).
     fn shard_mxfp4_col(&mut self, w: &W, rank: usize, world: usize) -> W {
-        let m = match w { W::Nvfp4 { m, .. } | W::Fp8 { m, .. } => *m,
+        let m = match w { W::Nvfp4 { m, .. } | W::Fp8 { m, .. } | W::Fp8Blk { m, .. } => *m,
                           _ => panic!("tp col-shard: expected NVFP4 or FP8, got another format") };
         self.shard_mxfp4_col_segs(w, &[(0, m, true)], rank, world)
     }
@@ -7485,6 +8005,7 @@ impl GpuModel {
         match w {
             W::Nvfp4 { .. } => self.shard_nvfp4_col_segs(w, segs, rank, world),
             W::Fp8 { .. }   => self.shard_fp8_col_segs(w, segs, rank, world),
+            W::Fp8Blk { .. } => self.shard_fp8blk_col_segs(w, segs, rank, world),
             _ => panic!("tp col-shard: expected NVFP4 or FP8, got another format"),
         }
     }
@@ -7492,7 +8013,53 @@ impl GpuModel {
         match w {
             W::Nvfp4 { .. } => self.shard_nvfp4_row(w, rank, world),
             W::Fp8 { .. }   => self.shard_fp8_row(w, rank, world),
+            W::Fp8Blk { .. } => self.shard_fp8blk_row(w, rank, world),
             _ => panic!("tp row-shard: expected NVFP4 or FP8, got another format"),
+        }
+    }
+
+    /// In-place (post-load) twin of `shard_raw_fp8_blk` for block-128 FP8 (`W::Fp8Blk`).
+    /// A block-scaled FP8 weight keeps its RAW [M,K] codes and the flat [(M/128)·nb_k] scale grid
+    /// resident (the MMA/e4m3 repacks live in `fp8e_map`, keyed by the data pointer and built
+    /// lazily at the first prefill — so a shard that runs at attach, before any forward, leaves no
+    /// stale entry behind), which is exactly the layout `shard_raw_fp8_blk` was written for. So the
+    /// in-place path DELEGATES to it rather than re-deriving the geometry: one source of truth, and
+    /// the two load paths are byte-identical by construction (the property the shard_raw_tests
+    /// module asserts). Before this, `--dump-rank-weights --world N` on an FP8 trunk (mixers off =>
+    /// in-place path) panicked with "tp col-shard: expected NVFP4 or FP8, got another format".
+    fn shard_fp8blk_col_segs(&self, w: &W, segs: &[(usize, usize, bool)], rank: usize, world: usize) -> W {
+        let (data, sc, m, k, nb_k) = match w {
+            W::Fp8Blk { data, blk_scale, nb_k, m, k } => (data, blk_scale, *m, *k, *nb_k),
+            _ => panic!("tp fp8blk col-shard: expected Fp8Blk, got another format"),
+        };
+        let qh = self.dev.dtoh_sync_copy(data).unwrap();
+        let sh = self.dev.dtoh_sync_copy(sc).unwrap();
+        let (q, s, mo, ko, nb) = shard_raw_fp8_blk(&qh, &sh, m, k, nb_k,
+                                                   &LoadShardOp::ColSegs(segs.to_vec()), rank, world);
+        W::Fp8Blk {
+            data: self.dev.htod_sync_copy(&q).unwrap(),
+            blk_scale: self.dev.htod_sync_copy(&s).unwrap(),
+            nb_k: nb, m: mo, k: ko,
+        }
+    }
+
+    /// Row-parallel twin of `shard_fp8blk_col_segs` (K-split): rank r keeps k-blocks
+    /// [r·nb_k/world, …) of every 128-row scale band. Requires nb_k % world == 0 — asserted in
+    /// `shard_raw_fp8_blk`, not silently replicated, because a wrong k-slice is a silent
+    /// numerical error rather than a crash.
+    fn shard_fp8blk_row(&self, w: &W, rank: usize, world: usize) -> W {
+        let (data, sc, m, k, nb_k) = match w {
+            W::Fp8Blk { data, blk_scale, nb_k, m, k } => (data, blk_scale, *m, *k, *nb_k),
+            _ => panic!("tp fp8blk row-shard: expected Fp8Blk, got another format"),
+        };
+        let qh = self.dev.dtoh_sync_copy(data).unwrap();
+        let sh = self.dev.dtoh_sync_copy(sc).unwrap();
+        let (q, s, mo, ko, nb) = shard_raw_fp8_blk(&qh, &sh, m, k, nb_k,
+                                                   &LoadShardOp::Row, rank, world);
+        W::Fp8Blk {
+            data: self.dev.htod_sync_copy(&q).unwrap(),
+            blk_scale: self.dev.htod_sync_copy(&s).unwrap(),
+            nb_k: nb, m: mo, k: ko,
         }
     }
 
@@ -8116,6 +8683,16 @@ impl GpuModel {
             pool.release(p, outn * batch);
         } else {
             self.gemm_act(w, x, out, inn, outn, batch);
+            // Phase-8 [fh2]: pre- vs post-reduce hash of the FFN's local partial — if pre matches
+            // cold-vs-warm but post differs, the cross-rank reduce is the divergence source.
+            if std::env::var("GB10_LAYER_FULLHASH").is_ok() && batch > 16 {
+                self.sync_stream();
+                let host = self.dev.dtoh_sync_copy(out).unwrap_or_default();
+                let n_real = (outn * batch).min(host.len());
+                let mut xx: u64 = 1469598103934665603;
+                for v in host.iter().take(n_real) { for b in v.to_bits().to_le_bytes() { xx ^= b as u64; xx = xx.wrapping_mul(1099511628211); } }
+                eprintln!("[fh2] pre {outn}x{batch} {:012x}", xx & 0xFFFFFFFFFFFF);
+            }
             if fuse {
                 if let Some(fl) = self.tp_all_reduce_bf16_k1(out, outn * batch) {
                     return Some(match fl {
@@ -8126,6 +8703,14 @@ impl GpuModel {
                 return None;                             // chunked — the full chain ran
             }
             self.tp_all_reduce_bf16(out, outn * batch);
+            if std::env::var("GB10_LAYER_FULLHASH").is_ok() && batch > 16 {
+                self.sync_stream();
+                let host = self.dev.dtoh_sync_copy(out).unwrap_or_default();
+                let n_real = (outn * batch).min(host.len());
+                let mut xx: u64 = 1469598103934665603;
+                for v in host.iter().take(n_real) { for b in v.to_bits().to_le_bytes() { xx ^= b as u64; xx = xx.wrapping_mul(1099511628211); } }
+                eprintln!("[fh2] post {outn}x{batch} {:012x}", xx & 0xFFFFFFFFFFFF);
+            }
         }
         None
     }
@@ -8212,6 +8797,12 @@ impl GpuModel {
         }
     }
 
+    /// Prefill-width output padding for the W8A8 lane (writes tp64 rows — see mlp_batch).
+    /// TRIPWIRE_SPEC §2: ONE definition. The hand-inlined copy in `mlp_batch` and the bare
+    /// `div_ceil(64)*64` in the pf8 sink assert are the same numeric rule written three ways, and
+    /// a numeric rule duplicated across sites is how the next divergence happens.
+    fn pf8_pad(&self, n: usize) -> usize { pf8_pad_pub(n) }
+
     fn mlp_batch(&self, pool: &mut Pool, x: &B, mlp: &GpuMlp, batch: usize, sharded: bool, fuse: bool) -> ReduceOut {
         let h = self.cfg.hidden_size;
         // TP shards the FFN (weights split at attach_tp): gate/up column-parallel (each rank owns
@@ -8222,12 +8813,32 @@ impl GpuModel {
         // false — its weights are replicated), so the divisor is per-call, never a global read.
         let div = if sharded { self.ffn_shard_factor() } else { 1 };
         let im = self.cfg.intermediate_size / div;
-        let mut gate = pool.get_bf16(im*batch);
-        let mut upb = pool.get_bf16(im*batch);
+        // Phase-8 F9 FIX: the W8A8 prefill lane pads tokens to a 64 multiple (tp64) and its GEMM
+        // WRITES pad rows — gate/up must be sized to tp64*im or the kernel writes past the pool
+        // bucket (batch=468: tp64=512, 512*8704 > next_pow2(468*8704) by 512KB — silent
+        // neighbor corruption, deterministic per pool layout: the warm-window stream divergence).
+        // Only prefill widths (batch>=256, the lane's own gate) round up; decode/verify buffers
+        // keep their exact sizes.
+        let bn = self.pf8_pad(batch);
+        let mut gate = pool.get_bf16(im*bn);
+        let mut upb = pool.get_bf16(im*bn);
         self.gemm_act(&mlp.gate, x, &mut gate, h, im, batch);
         self.gemm_act(&mlp.up, x, &mut upb, h, im, batch);
         blaunch!(self, "silu_mul_b", grid(im*batch), (256,1,1), 0, (d(&gate), d(&gate), d(&upb), (im*batch) as i32));
-        let mut out = pool.get_bf16(h*batch);
+        if std::env::var("GB10_LAYER_FULLHASH").is_ok() && batch > 16 {
+            self.sync_stream();
+            let host = self.dev.dtoh_sync_copy(&gate).unwrap_or_default();
+            let n_real = (im * batch).min(host.len());
+            let mut x: u64 = 1469598103934665603;
+            for v in host.iter().take(n_real) { for b in v.to_bits().to_le_bytes() { x ^= b as u64; x = x.wrapping_mul(1099511628211); } }
+            eprintln!("[fh4] L0 gate {im}x{batch} {:012x}", x & 0xFFFFFFFFFFFF);
+        }
+        // Phase-8 F9 FIX #2 (found by the pf8 tripwire in the TP2 quality leg): the DOWN output
+        // is the pf8 lane's GEMM sink too (both the direct gemm_act and tp_reduce_site's K1
+        // partial land in it) — it must carry the same tp64 padding as gate/up or the lane
+        // writes past the bucket exactly like the warm-window bug (batch~410: tp64=448).
+        let obn = self.pf8_pad(batch);
+        let mut out = pool.get_bf16(h*obn);
         // AR landing 2: with `fuse` the row-parallel reduce may stop after K1 and hand the LOCAL
         // partial up for the fused tp_reduce_resnorm_b epilogue (single-barrier only).
         let fused = if sharded {
@@ -8236,7 +8847,7 @@ impl GpuModel {
             self.gemm_act(&mlp.down, &gate, &mut out, im, h, batch);
             None
         };
-        pool.release_bf16(gate, im*batch); pool.release_bf16(upb, im*batch);
+        pool.release_bf16(gate, im*bn); pool.release_bf16(upb, im*bn);
         match fused {
             Some(FusedPartial::F32(p)) => ReduceOut::Fused(FusedReduce { sink: out, partial: Some(p), mode: 1 }),
             Some(FusedPartial::F32Scratch) => ReduceOut::Fused(FusedReduce { sink: out, partial: None, mode: 1 }),
@@ -8434,7 +9045,7 @@ impl GpuModel {
                      pos_dev: &cudarc::driver::CudaSlice<i32>,
                      kc_ptr: u64, vc_ptr: u64, slot_ids_ptr: u64, max_pc: usize, kv_stride: usize, batch: usize,
                      prefill_pos_start: Option<usize>, path_ptr: u64, rope_ptr: u64, col_pos_start_ptr: u64,
-                     sharded: bool, kv_mode: KVCacheMode) -> B {
+                     sharded: bool, kv_mode: KVCacheMode, chain_ok: bool) -> B {
         let cfg = &self.cfg;
         // Head counts must match the CALLER's tensors, not a global flag. The MTP head is replicated
         // under TP, so it hands us full-width q/k/v and a full-width KV cache; deriving the counts from
@@ -8520,6 +9131,36 @@ impl GpuModel {
                 pool.release_bf16(kdq, nkv*npos*hd); pool.release_bf16(vdq, nkv*npos*hd);
                 return attn;
             }
+            KVCacheMode::K8v8 => {
+                // k8v8 prefill: pack-at-write (write_kv_prefill_k8v8 — int8 codes + fp16 block
+                // scales at the 20 B/16 stride on BOTH channels), then dequant the whole prefix
+                // to bf16 scratch for the prefill readers: dequant_kv_k8v4 is channel-agnostic
+                // (the int8-block layout is identical on K and V here), so it runs twice. Same
+                // one-shot scratch semantics as q4/k8v4. The DECODE path reads the cache
+                // directly (gqa_attn_verify_e_k8v8) — this dequant is prefill-only.
+                blaunch!(self, "write_kv_prefill_k8v8", grid(batch*nkv*(hd/16)), (256,1,1), 0,
+                    (kc_ptr, vc_ptr, d(k), d(v), stride as i32, nkv as i32, hd as i32, batch as i32, ps as i32));
+                let npos = ps + batch;
+                let mut kdq = pool.get_bf16(nkv * npos * hd);
+                let mut vdq = pool.get_bf16(nkv * npos * hd);
+                blaunch!(self, "dequant_kv_k8v4", grid(npos*nkv*(hd/16)), (256,1,1), 0,
+                    (d(&kdq), kc_ptr, nkv as i32, stride as i32, hd as i32, npos as i32, 0i32, npos as i32));
+                blaunch!(self, "dequant_kv_k8v4", grid(npos*nkv*(hd/16)), (256,1,1), 0,
+                    (d(&vdq), vc_ptr, nkv as i32, stride as i32, hd as i32, npos as i32, 0i32, npos as i32));
+                let (kqs, vqs) = (d(&kdq), d(&vdq));
+                let mut attn = pool.get_bf16(nh*hd*batch);
+                if batch >= PF_MIN && !prefill_scalar() {
+                    self.attn_prefill_tiled(pool, q, kqs, vqs, npos, nh, nkv, batch, ps, &mut attn);
+                } else {
+                    let qt = (hd / 32).max(1);
+                    let ntile = batch.div_ceil(qt);
+                    blaunch!(self, "gqa_attn_prefill", ((ntile*nh) as u32,1,1), (hd as u32,1,1), 0,
+                        (d(&attn), d(q), kqs, vqs, npos as i32, nh as i32, nkv as i32, hd as i32,
+                         fbits(scale), batch as i32, ps as i32));
+                }
+                pool.release_bf16(kdq, nkv*npos*hd); pool.release_bf16(vdq, nkv*npos*hd);
+                return attn;
+            }
             KVCacheMode::Tq => {
                 // TurboQuant prefill: pack-at-write (write_kv_prefill_tq), then dequant the whole
                 // prefix into a bf16 scratch for the prefill readers (dequant_kv_tq materializes
@@ -8583,6 +9224,10 @@ impl GpuModel {
             blaunch!(self, "write_kv_b_k8v4", grid(batch*nkv*(hd/16)), (256,1,1), 0,
                 (kc_ptr, vc_ptr, d(k), d(v), pos_ptr, stride as i32, nkv as i32, hd as i32, batch as i32, slot_ids_ptr));
         }
+        KVCacheMode::K8v8 => {
+            blaunch!(self, "write_kv_b_k8v8", grid(batch*nkv*(hd/16)), (256,1,1), 0,
+                (kc_ptr, vc_ptr, d(k), d(v), pos_ptr, stride as i32, nkv as i32, hd as i32, batch as i32, slot_ids_ptr));
+        }
         KVCacheMode::Tq => {
             // pack-at-write (one block per (b, kvh) row), then rotate every query head once
             // (the "rotate once, never rotate back" principle of the reference).
@@ -8625,7 +9270,36 @@ impl GpuModel {
         // there is only ONE kernel (gqa_attn_flash is deleted), and the partials are fp32. `ns_grid` is
         // purely a launch bound: pc_b <= max_pc implies ns_b <= ns_grid, so every block a column needs
         // exists, and the surplus ones return immediately.
-        let ns_grid = (max_pc / 256).clamp(1, 32);
+        // F8/C: tensor-core verify attention (the dspark ring_e pattern ported to the trunk
+        // GQA decode/verify). Gated to identity-path, single-slot, chain shapes; everything
+        // else (tree verify, multi-lane batch) stays on the scalar splitk, bit-identical.
+        let ratio_now = nh / nkv.max(1);
+        // F9: the attention kernel choice is a property of the REQUEST, never of the verify
+        // width. `batch * ratio_now <= 48` used to switch a wide verify (b>=9 at QG=6) onto the
+        // splitk lane while a decode stayed on _e — a column-0 cliff. The _e lane now covers up
+        // to MAX_VERIFY columns via a row-group grid dimension (grid.z = ceil(NQ/48)), so the
+        // gate is the contract width.
+        debug_assert_eq!(MAX_VERIFY, 16, "gpu_batch.cu GVE_MAX_VERIFY must match gpu.rs MAX_VERIFY");
+        let use_e = chain_ok && matches!(kv_mode, KVCacheMode::Bf16 | KVCacheMode::K8v8)
+            && (hd == 128 || hd == 256)
+            && batch >= 1 && batch <= MAX_VERIFY
+            && std::env::var("GB10_NO_ATTN_E").is_err();
+        if std::env::var("GB10_ATTN_E_DEBUG").is_ok() {
+            eprintln!("[attn_e] chain_ok={chain_ok} kv={:?} hd={hd} batch={batch} ratio={ratio_now} max_pc={max_pc} use_e={use_e}", kv_mode);
+        }
+        let seg_e: usize = if use_e {
+            // grid = nkv * SEG: cover the SMs (48) with ~2 waves, then keep the per-segment
+            // serial scan bounded (~8K keys) at long ctx. SEG <= 63 (bs_packed field is 6 bits).
+            // F9: SEG comes from kv_stride — a per-request constant, so a decode and a verify of
+            // the same request resolve the SAME SEG (the pre-fix bug: decode passed pos+1 and
+            // verify passed kv_stride, so SEG could differ). The key partition itself comes from
+            // pos[0] + MAX_VERIFY inside the kernel, never from this launch bound.
+            let base = ((192 + nkv - 1) / nkv).max(4);
+            base.max((kv_stride + 8191) / 8192).min(63)
+        } else { 0 };
+        let ns_grid = if use_e { seg_e } else { (max_pc / 256).clamp(1, 32) };
+        // F9: _e row groups (6 warps x 8 real rows per block); 1 for every serving width <= 8.
+        let rg_e = if use_e { (batch * ratio_now).div_ceil(48).max(1) } else { 1 };
         let n_partial = batch * nh * ns_grid;
         let pm = pool.get(n_partial);
         let pl = pool.get(n_partial);
@@ -8674,6 +9348,18 @@ impl GpuModel {
                  logical_ptr, bs_packed, nh_packed, slot_ids_ptr, path_ptr, col_pos_start_ptr));
             }
         }
+        KVCacheMode::K8v8 => {
+            // k8v8 direct-read: the p8b verify kernel (p3 core + in-register block dequant) on
+            // the _e lane. No splitk twin — the non-e fallbacks would need their own int8 readers;
+            // use_e covers decode+verify for batch<=8 (every MTP/graph lane). A non-e dispatch
+            // here is a wiring bug, not a graceful-degradation case (a silent bf16 read of an
+            // int8 buffer is the mojibake-class hazard) — fail loud.
+            assert!(use_e,
+                "k8v8 requires the _e attention lane (batch<=8, gqa<=48, no GB10_NO_ATTN_E)");
+            blaunch!(self, "gqa_attn_verify_e_k8v8", (nkv as u32, seg_e as u32, rg_e as u32), (192,1,1), 0,
+                (d(&pm), d(&pl), d(&pa), d(q), kc_ptr, vc_ptr,
+                 logical_ptr, bs_packed, nh_packed, slot_ids_ptr, col_pos_start_ptr));
+        }
         KVCacheMode::Tq => {
             // TurboQuant split-K: same GQA-packed structure (one block per (kvh, split), the E1
             // win), same per-head bit-identity, reading the pre-rotated qrqs (rotate_q_tq above).
@@ -8690,10 +9376,24 @@ impl GpuModel {
             }
         }
         KVCacheMode::Bf16 => {
+            // F8/C: the tensor-core lane (ring_e pattern; see gqa_attn_verify_e). Runs both
+            // matmuls on mma.sync bf16 with Q row-fragments persistent in registers; partials
+            // land in the splitk layout and the _e reduce merges them (SEG == ns_grid).
+            if use_e {
+                // p3 (round-23): oracle-validated restructure, +18% at 30K-class ctx; A/B knob
+                // until it earns standing-config (diagnostics-class env per §7; promote to CLI
+                // flag with the fp8-KV integration).
+                static ATTN_P3: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                let attn_p3 = *ATTN_P3.get_or_init(|| std::env::var("GB10_ATTN_P3").is_ok());
+                let kname = if attn_p3 { "gqa_attn_verify_e_p3" } else { "gqa_attn_verify_e" };
+                blaunch!(self, kname, (nkv as u32, seg_e as u32, rg_e as u32), (192,1,1), 0,
+                    (d(&pm), d(&pl), d(&pa), d(q), kc_ptr, vc_ptr,
+                     logical_ptr, bs_packed, nh_packed, slot_ids_ptr, col_pos_start_ptr));
+            }
             // GQA-packed bf16 split-K (E1c): same re-read pathology as q4 — the per-head kernel
             // reads each group's KV chunk gqa_ratio times (the bf16 "32K anomaly"). Packed reads it
             // ONCE per (kvh, split); per-head bit-identical. hd in {128,256} && ratio 2..=8.
-            if (hd == 128 || hd == 256) && (2..=8).contains(&gqa_ratio) && !no_gqpack {
+            else if (hd == 128 || hd == 256) && (2..=8).contains(&gqa_ratio) && !no_gqpack {
                 blaunch!(self, "gqa_attn_splitk_gq", ((batch * nkv * ns_grid) as u32,1,1), (hd as u32,1,1), smem,
                     (d(&pm), d(&pl), d(&pa), d(q), kc_ptr, vc_ptr,
                      logical_ptr, bs_packed, nh_packed, slot_ids_ptr, path_ptr, col_pos_start_ptr));
@@ -8704,8 +9404,15 @@ impl GpuModel {
             }
         }
         }
+        if use_e {
+            // _e twin: the partial count is ns_grid (== SEG) by construction — no sk_nsplits
+            // recompute (the splitk reduce would read a different split count than we wrote).
+            blaunch!(self, "gqa_attn_reduce_e", ((batch*nh) as u32,1,1), (hd as u32,1,1), 0,
+                (d(&attn), d(&pm), d(&pl), d(&pa), logical_ptr, ns_grid as i32, batch as i32, nh_packed));
+        } else {
         blaunch!(self, "gqa_attn_reduce", ((batch*nh) as u32,1,1), (hd as u32,1,1), 0,
             (d(&attn), d(&pm), d(&pl), d(&pa), logical_ptr, ns_grid as i32, batch as i32, nh_packed));
+        }
         if let Some(qrqs) = tq_qrqs { pool.release(qrqs, batch * nh * 2 * hd); }
         pool.release(pm, n_partial);
         pool.release(pl, n_partial);
@@ -8716,6 +9423,11 @@ impl GpuModel {
     fn full_attn_batch(&self, pool: &mut Pool, hidden: &B, fa: &GpuFullAttn, pos_dev: &cudarc::driver::CudaSlice<i32>,
                        max_pc: usize, kv_stride: usize, kc_ptr: u64, vc_ptr: u64, cos: &S, sin: &S, slot_ids_ptr: u64, batch: usize,
                        prefill_pos_start: Option<usize>, sharded: bool, kv_mode: KVCacheMode, fuse: bool) -> ReduceOut {
+        if std::env::var("GB10_F9_XHASH").as_deref() == Ok("3") {
+            let prev = F9X_ATTN.with(|c| c.replace(usize::MAX));
+            if prev == usize::MAX { F9X_ATTN.with(|c| c.set(0)); }
+            else { F9X_ATTN.with(|c| c.set(prev + 1)); }
+        }
         let cfg = &self.cfg;
         let (h, hd, rdim) = (cfg.hidden_size, cfg.head_dim, cfg.rotary_dim);
         // TP=2: each box owns half the heads (12Q/2KV). Weights + KV cache are sharded to match, so the
@@ -8737,7 +9449,7 @@ impl GpuModel {
         let old_pipeline = prefill_pos_start.is_some()
             || std::env::var("GB10_NO_QKV_VIEW").is_ok()
             || std::env::var("GB10_NO_FUSED_PERHEAD_ROPE").is_ok()
-            || matches!(kv_mode, KVCacheMode::Tq | KVCacheMode::K8v4);
+            || matches!(kv_mode, KVCacheMode::Tq | KVCacheMode::K8v4 | KVCacheMode::K8v8);
         let mut qg: Option<B> = None;            // packed q(|gate) — old pipeline / split weights
         let mut k: Option<B> = None;             // packed k — old pipeline / split weights
         let mut v: Option<B> = None;             // packed v — old pipeline / split weights
@@ -8746,14 +9458,14 @@ impl GpuModel {
             AttnIn::Fused(w) => {
                 // ONE GEMM for q(|gate), k and v: they all read the same activation, and k/v alone are
                 // M=1024 -- only 84 GB/s against a 234 GB/s machine, because grid=64 barely fills it.
-                let mut fb = pool.get_bf16(mtot * batch);
+                let mut fb = pool.get_bf16(mtot * self.pf8_pad(batch));
                 // E9: the qkv projection is the first consumer GEMM of the TP barrier chain —
                 // weight prefetch runs under the K2 cpu_done wait (plain `gemm_act` elsewhere).
                 self.gemm_act_pdl(w, hidden, &mut fb, h, mtot, batch);
                 if old_pipeline {
-                    let qgb = pool.get_bf16(qg_dim*batch);
-                    let kb = pool.get_bf16(kv_dim*batch);
-                    let vb = pool.get_bf16(kv_dim*batch);
+                    let qgb = pool.get_bf16(qg_dim*self.pf8_pad(batch));
+                    let kb = pool.get_bf16(kv_dim*self.pf8_pad(batch));
+                    let vb = pool.get_bf16(kv_dim*self.pf8_pad(batch));
                     blaunch!(self, "split_qkv_b", grid(mtot*batch), (256,1,1), 0,
                         (d(&qgb), d(&kb), d(&vb), d(&fb), qg_dim as i32, kv_dim as i32, batch as i32));
                     pool.release_bf16(fb, mtot * batch);
@@ -8765,9 +9477,9 @@ impl GpuModel {
             }
             AttnIn::Split { q: qp, k: kp, v: vp } => {
                 // E9: the FIRST (q) GEMM carries the programmatic launch; k/v follow it plainly.
-                let mut qgb = pool.get_bf16(qg_dim*batch);
-                let mut kb = pool.get_bf16(kv_dim*batch);
-                let mut vb = pool.get_bf16(kv_dim*batch);
+                let mut qgb = pool.get_bf16(qg_dim*self.pf8_pad(batch));
+                let mut kb = pool.get_bf16(kv_dim*self.pf8_pad(batch));
+                let mut vb = pool.get_bf16(kv_dim*self.pf8_pad(batch));
                 self.gemm_act_pdl(qp, hidden, &mut qgb, h, qg_dim, batch);
                 self.gemm_act(kp, hidden, &mut kb, h, kv_dim, batch);
                 self.gemm_act(vp, hidden, &mut vb, h, kv_dim, batch);
@@ -8832,7 +9544,22 @@ impl GpuModel {
                     Some(qb) => (qb, nh * hd),
                     None => (fb, mtot),
                 };
-                self.attn_dispatch(pool, q_ref, fb, fb, q_pitch_d, true, pos_dev, kc_ptr, vc_ptr, slot_ids_ptr, max_pc, kv_stride, batch, None, 0u64, 0u64, 0u64, sharded, kv_mode)
+                {
+                    let at = self.attn_dispatch(pool, q_ref, fb, fb, q_pitch_d, true, pos_dev, kc_ptr, vc_ptr, slot_ids_ptr, max_pc, kv_stride, batch, None, 0u64, 0u64, 0u64, sharded, kv_mode, batch == 1);
+                    if std::env::var("GB10_F9_XHASH").as_deref() == Ok("3")
+                       && F9X_ATTN.with(|c| c.get()) == 0 {
+                        let tag = |buf: &B, wdt: usize, nm: &str| {
+                            let host = self.dev.dtoh_sync_copy(buf).unwrap_or_default();
+                            let mut hv: u64 = 0xcbf29ce484222325;
+                            for i in 0..wdt { let b = host.get(i).map(|v| v.to_bits()).unwrap_or(0); hv ^= b as u64; hv = hv.wrapping_mul(0x100000001b3); }
+                            eprintln!("  [f9x-L3-D] {nm} 0x{hv:016x} (b={batch})");
+                        };
+                        tag(q_ref, q_pitch_d * batch, "q");
+                        tag(fb, mtot * batch, "qkv");
+                        tag(&at, nh*hd * batch, "attn");
+                    }
+                    at
+                }
             } else {
                 // AttnIn::Split weights — no fused buffer to view; packed fused rope + dispatch write.
                 let qb = q.as_ref().expect("q buffer");
@@ -8840,7 +9567,22 @@ impl GpuModel {
                 let vb = v.as_ref().expect("v buffer");
                 blaunch!(self, "rmsnorm_rope_b", ((batch*nh) as u32,1,1), (hd as u32,1,1), (hd*4) as u32, (q_ptr, d(&fa.q_norm), d(cos), d(sin), nh as i32, hd as i32, rdim as i32, batch as i32, eps, 0i32, q_pitch as i32));
                 blaunch!(self, "rmsnorm_rope_b", ((batch*nkv) as u32,1,1), (hd as u32,1,1), (hd*4) as u32, (d(kb), d(&fa.k_norm), d(cos), d(sin), nkv as i32, hd as i32, rdim as i32, batch as i32, eps, 0i32, kv_dim as i32));
-                self.attn_dispatch(pool, qb, kb, vb, nh*hd, false, pos_dev, kc_ptr, vc_ptr, slot_ids_ptr, max_pc, kv_stride, batch, prefill_pos_start, 0u64, 0u64, 0u64, sharded, kv_mode)
+                {
+                    let at = self.attn_dispatch(pool, qb, kb, vb, nh*hd, false, pos_dev, kc_ptr, vc_ptr, slot_ids_ptr, max_pc, kv_stride, batch, prefill_pos_start, 0u64, 0u64, 0u64, sharded, kv_mode, batch == 1 && prefill_pos_start.is_none());
+                    if std::env::var("GB10_F9_XHASH").as_deref() == Ok("3")
+                       && F9X_ATTN.with(|c| c.get()) == 0 {
+                        let tag = |buf: &B, wdt: usize, nm: &str| {
+                            let host = self.dev.dtoh_sync_copy(buf).unwrap_or_default();
+                            let mut hv: u64 = 0xcbf29ce484222325;
+                            for i in 0..wdt { let b = host.get(i).map(|v| v.to_bits()).unwrap_or(0); hv ^= b as u64; hv = hv.wrapping_mul(0x100000001b3); }
+                            eprintln!("  [f9x-L3-D] {nm} 0x{hv:016x} (b={batch})");
+                        };
+                        tag(qb, nh*hd*batch, "q");
+                        tag(kb, kv_dim*batch, "k");
+                        tag(&at, nh*hd*batch, "attn");
+                    }
+                    at
+                }
             }
         } else {
             // Old pipeline: packed q/k/v; the rope is fused unless the F4 escape is set.
@@ -8856,7 +9598,22 @@ impl GpuModel {
                 blaunch!(self, "rmsnorm_rope_b", ((batch*nh) as u32,1,1), (hd as u32,1,1), (hd*4) as u32, (q_ptr, d(&fa.q_norm), d(cos), d(sin), nh as i32, hd as i32, rdim as i32, batch as i32, eps, 0i32, q_pitch as i32));
                 blaunch!(self, "rmsnorm_rope_b", ((batch*nkv) as u32,1,1), (hd as u32,1,1), (hd*4) as u32, (d(kb), d(&fa.k_norm), d(cos), d(sin), nkv as i32, hd as i32, rdim as i32, batch as i32, eps, 0i32, kv_dim as i32));
             }
-            self.attn_dispatch(pool, qb, kb, vb, nh*hd, false, pos_dev, kc_ptr, vc_ptr, slot_ids_ptr, max_pc, kv_stride, batch, prefill_pos_start, 0u64, 0u64, 0u64, sharded, kv_mode)
+            {
+                let at = self.attn_dispatch(pool, qb, kb, vb, nh*hd, false, pos_dev, kc_ptr, vc_ptr, slot_ids_ptr, max_pc, kv_stride, batch, prefill_pos_start, 0u64, 0u64, 0u64, sharded, kv_mode, batch == 1 && prefill_pos_start.is_none());
+                if std::env::var("GB10_F9_XHASH").as_deref() == Ok("3")
+                   && F9X_ATTN.with(|c| c.get()) == 0 {
+                    let tag = |buf: &B, wdt: usize, nm: &str| {
+                        let host = self.dev.dtoh_sync_copy(buf).unwrap_or_default();
+                        let mut hv: u64 = 0xcbf29ce484222325;
+                        for i in 0..wdt { let b = host.get(i).map(|v| v.to_bits()).unwrap_or(0); hv ^= b as u64; hv = hv.wrapping_mul(0x100000001b3); }
+                        eprintln!("  [f9x-L3-D] {nm} 0x{hv:016x} (b={batch})", );
+                    };
+                    tag(qb, nh*hd*batch, "q");
+                    tag(kb, kv_dim*batch, "k");
+                    tag(&at, nh*hd*batch, "attn");
+                }
+                at
+            }
         };
         if std::env::var("GB10_CAP_DEBUG").is_ok() {
             // Cheap absmax probes to localize a numeric blow-up (CPU reference deltas). Under F0 the
@@ -8873,7 +9630,7 @@ impl GpuModel {
         if let Some(g) = &gate {
             blaunch!(self, "sigmoid_gate_b", grid(nh*hd*batch), (256,1,1), 0, (d(&attn), d(g), (nh*hd*batch) as i32));
         }
-        let mut out = pool.get_bf16(h*batch);
+        let mut out = pool.get_bf16(h*self.pf8_pad(batch));
         // AR landing 2: with `fuse` the row-parallel o_proj reduce may stop after K1 and hand the
         // LOCAL partial up for the fused mixer epilogue (single-barrier only).
         let fused = if sharded {
@@ -8898,7 +9655,8 @@ impl GpuModel {
     }
 
     fn linear_attn_batch(&self, pool: &mut Pool, hidden: &B, la: &GpuLinearAttn,
-                         conv_ptr: u64, s_ptr: u64, slot_ids_ptr: u64, batch: usize, fuse: bool) -> ReduceOut {
+                         conv_ptr: u64, s_ptr: u64, slot_ids_ptr: u64, batch: usize, fuse: bool,
+                         s_tap: Option<&cudarc::driver::CudaSlice<f32>>) -> ReduceOut {
         let cfg = &self.cfg;
         // TP-local GDN geometry (see eff_lin_v_heads). Every dim below is rank-local when the mixers are
         // sharded, so the conv/state/gate/norm kernels touch only this box's heads.
@@ -9028,10 +9786,24 @@ impl GpuModel {
         let kd_vd = ((kd as u32) << 16) | (vd as u32);
         let stride_pack = ((qkv_stride as u32) << 15) | (ba_stride as u32);
         blaunch!(self, "delta_step_b", ((batch*nh_launch*nchunk) as u32,1,1), (kd as u32,1,1), smem, (d(&core), qkv_ptr, s_ptr, b_ptr, a_ptr, (nh_launch as i32) | ((nk_launch as i32) << 16), kd_vd as i32, d(&la.a_log), d(&la.dt_bias), slot_ids_ptr, visits_ptr, stride_pack as i32));
+        if state_tap_active() {
+            // GDN internals: the conv-output rows (qkv post-conv1d_b, pitched qkv_stride) and core.
+            let cv_src = fused_qkv.as_ref().or(qkv.as_ref());
+            if let Some(cvb) = cv_src {
+                let cv = self.dev.dtoh_sync_copy(cvb).unwrap_or_default();
+                let co = self.dev.dtoh_sync_copy(&core).unwrap_or_default();
+                state_tap_gdn(cv, co);
+                if batch <= 4 {
+                    if let Some(sv) = s_tap {
+                        state_tap_s(self.dev.dtoh_sync_copy(sv).unwrap_or_default());
+                    }
+                }
+            }
+        }
         let normed = pool.get_bf16(value_dim*batch);
         let z_off_z_stride = ((z_stride as u32) << 15) | (z_off as u32);
         blaunch!(self, "rmsnorm_gated_b", ((batch*nh) as u32,1,1), (vd as u32,1,1), (vd*4) as u32, (d(&normed), d(&core), z_ptr, d(&la.norm), vd as i32, nh as i32, batch as i32, fbits(cfg.rms_eps), z_off_z_stride as i32));
-        let mut out = pool.get_bf16(h*batch);
+        let mut out = pool.get_bf16(h*self.pf8_pad(batch));
         // AR landing 2: with `fuse` the row-parallel out_proj reduce may stop after K1 and hand the
         // LOCAL partial up for the fused mixer epilogue (single-barrier only).
         let fused = if self.gdn_shard_factor() > 1 {
@@ -9100,6 +9872,8 @@ impl GpuModel {
         // Cross-chain probe capture: one sink entry per forward call (batch marks prefill vs
         // decode steps). Inert unless GB10_MXFP4_XCHAIN_CAPTURE is set.
         if xchain_active() { xchain_new(batch); }
+        // Phase-8 F9 tap: one record per decode call (probe-only; see StateTapCall).
+        state_tap_call("decode", batch);
         // Sparse mode (GB10_XCHAIN_CTX_LAYERS="1,20,39,58,77"): record only the listed layers'
         // hiddens — the DFlash context-chain recorder needs 5 of 81 layers; the full prefill
         // capture is ~8 GB of host f32 on a 6K prompt (OOM-thrash), sparse is ~0.5 GB.
@@ -9145,7 +9919,8 @@ impl GpuModel {
                 LayerType::LinearAttention => {
                     let conv_ptr = *state.conv_state[li].as_ref().unwrap().device_ptr();
                     let s_ptr = *state.s_state[li].as_ref().unwrap().device_ptr();
-                    self.linear_attn_batch(pool, &normed, layer.la.as_ref().unwrap(), conv_ptr, s_ptr, slot_ids_ptr, batch, reduce_fuse)
+                    self.linear_attn_batch(pool, &normed, layer.la.as_ref().unwrap(), conv_ptr, s_ptr, slot_ids_ptr, batch, reduce_fuse,
+                        state_tap_active().then(|| state.s_state[li].as_ref().unwrap()))
                 }
                 LayerType::FullAttention => {
                     let kc_ptr = *state.k_cache[li].as_ref().unwrap().device_ptr();
@@ -9178,11 +9953,27 @@ impl GpuModel {
             // tapped layers → rank-0 staging scratch. Device-side 2D D2D on the compute stream,
             // no dtoh; the draft loop copies the columns it needs into the ctx feature buffer.
             // (Only the DFLASH loop calls forward_batch with batch <= BLOCK — wider batches skip.)
-            if batch <= crate::dflash::BLOCK {
-                if let Some(tap) = &self.dflash_tap {
-                    if let Some(k) = crate::dflash::TAP_LAYERS.iter().position(|&l| l == li) {
+            if let Some(tap) = &self.dflash_tap {
+                if let Some(k) = tap.tap_index(li) {
+                    // P14: the WIDE (absolute-position) ctx surface is a PREFILL-only target from
+                    // here on — it is filled by the capture site in `prefill_batch_range` and handed
+                    // to the lane by `dflash_prime`. Every other forward (decode here, verify below)
+                    // writes the position-INDEPENDENT ring staging, because a decode/verify forward
+                    // can run inside a captured CUDA graph whose nodes bake absolute addresses: a
+                    // host `wide_pos` read at capture time would freeze the destination column for
+                    // every replay. The wide branch is kept only for a capture wider than the ring.
+                    if batch <= crate::dflash::MAX_BLOCK {
                         crate::dflash::tap_capture(&self.dev, self.stream.stream, tap,
                                                    *residual.device_ptr() as u64, h, batch, k);
+                    } else if let Some(w) = &tap.wide {
+                        let p0 = tap.wide_pos.load(std::sync::atomic::Ordering::Relaxed);
+                        if p0 + batch <= tap.wide_stride {
+                            crate::dflash::tap_capture_to(&self.dev, self.stream.stream,
+                                *w.device_ptr() as u64, tap.nctx * h, p0,
+                                *residual.device_ptr() as u64, h, batch, k);
+                        } else {
+                            crate::dflash::warn_wide_skip(p0, batch, tap.wide_stride);
+                        }
                     }
                 }
             }
@@ -9190,13 +9981,38 @@ impl GpuModel {
             // → the drafter's staging columns [0, n). Same residual pointer, same stream —
             // the D2D is bit-identical to the source by construction (R1 proves it). DEFAULT
             // OFF (df2_capture == None): this branch reads one Option and exits — free.
-            if batch <= crate::dflash2::BLOCK {
+            if batch <= crate::dflash2::block() {
                 if let Some(sink) = &self.df2_capture {
                     if let Some(k) = crate::dflash2::TAP_LAYERS.iter().position(|&l| l == li) {
                         crate::dflash2::capture::capture_cols(&self.dev, self.stream.stream, sink,
                             *residual.device_ptr() as u64, h, batch, k);
                     }
                 }
+            }
+            // WI1 DSpark tap: identical source (hidden_states[l+1]) at the DSpark tap layers
+            // [4,16,28,40,52] → the DSpark round's staging. Independent of the DF2 sink — both
+            // arms can be live at once (the acceptance probe's back-to-back arms).
+            if batch <= crate::dspark::BLOCK {
+                if let Some(sink) = &self.dspark_capture {
+                    if let Some(k) = crate::dspark::TAP_LAYERS.iter().position(|&l| (l as i32 + Self::dspark_tap_shift()) == li as i32) {
+                        crate::dflash2::capture::capture_cols(&self.dev, self.stream.stream, sink,
+                            *residual.device_ptr() as u64, h, batch, k);
+                    }
+                }
+            }
+            // Phase-8 F9 tap: post-layer residual snapshot (probe-only; syncs the stream).
+            if state_tap_active() {
+                state_tap_layer(self.dev.dtoh_sync_copy(&residual).unwrap_or_default());
+            }
+            if std::env::var("GB10_F9_XHASH").as_deref() == Ok("2") && batch <= 8 {
+                let host = self.dev.dtoh_sync_copy(&residual).unwrap_or_default();
+                let mut hs = Vec::with_capacity(batch);
+                for c in 0..batch {
+                    let mut hv: u64 = 0xcbf29ce484222325;
+                    for i in 0..h { let b = host.get(c * h + i).map(|v| v.to_bits()).unwrap_or(0); hv ^= b as u64; hv = hv.wrapping_mul(0x100000001b3); }
+                    hs.push(hv);
+                }
+                F9XHASH.lock().unwrap().push((10u8, F9X_CUR.with(|c| c.get()), li, hs));
             }
         }
         let out = if fuse {
@@ -9367,6 +10183,101 @@ impl GpuModel {
             seeds_key_dev: self.dev.htod_sync_copy(&vec![0u64; max_batch]).unwrap(),
             presence_dev: self.dev.htod_sync_copy(&vec![0.0f32; max_batch]).unwrap(),
             frequency_dev: self.dev.htod_sync_copy(&vec![0.0f32; max_batch]).unwrap(),
+            // W2: schema-mask buffers. The words are initialized to ZERO, which would mean
+            // "nothing allowed" if a flag were set — but the flags start at 0 (unconstrained) and
+            // `mask_any` starts false, so the kernel is never launched from this state.
+            mask_words_dev: self.dev.htod_sync_copy(&vec![0u32; mask_words_for(self.cfg.vocab_size) * max_batch]).unwrap(),
+            mask_flags_dev: self.dev.htod_sync_copy(&vec![0i32; max_batch]).unwrap(),
+            mask_any: false,
+        }
+    }
+
+    /// W2: upload the per-lane DECODE masks in `batch_idx` order and arm/disarm the kernel.
+    /// `flags[k] == 0` marks an unconstrained lane (its words are ignored by the kernel).
+    pub fn upload_decode_masks(&self, bufs: &mut DecodeBuffers,
+                               words: &[u32], flags: &[i32], active: bool) {
+        if !active { bufs.mask_any = false; return; }
+        self.dev.htod_sync_copy_into(words, &mut bufs.mask_words_dev).unwrap();
+        self.dev.htod_sync_copy_into(flags, &mut bufs.mask_flags_dev).unwrap();
+        bufs.mask_any = true;
+        // W2 diagnostic (one-shot): how restrictive is the first armed decode mask?
+        if !MASK_DIAG_ON.load(std::sync::atomic::Ordering::Relaxed) {
+            MASK_DIAG_ON.store(true, std::sync::atomic::Ordering::Relaxed);
+            let allowed: u32 = words.iter().map(|w| w.count_ones()).sum();
+            eprintln!("[schema] decode mask armed: lanes={} words={} allowed_tokens={} flags={:?}",
+                      flags.len(), words.len(), allowed, &flags[..flags.len().min(4)]);
+        }
+    }
+
+    /// W2: arm the per-POSITION verify mask (one slot per verify column, `MAX_VERIFY` max) and
+    /// apply it to whatever verify runs next; `clear_verify_mask` disarms. `masks[j] = None`
+    /// leaves position j unconstrained. Returns false when the scratch could not be allocated.
+    pub fn set_verify_mask(&self, masks: &[Option<std::sync::Arc<Vec<u32>>>]) -> bool {
+        use std::sync::atomic::Ordering;
+        let words = mask_words_for(self.cfg.vocab_size);
+        let n = masks.len().min(MAX_VERIFY);
+        let mut w = vec![0u32; words * MAX_VERIFY];
+        let mut f = vec![0i32; MAX_VERIFY];
+        for j in 0..n {
+            if let Some(m) = &masks[j] {
+                let src: &Vec<u32> = m;
+                let len = src.len().min(words);
+                w[j * words..j * words + len].copy_from_slice(&src[..len]);
+                f[j] = 1;
+            }
+        }
+        unsafe {
+            let words_dst = *self.vmask_words.device_ptr() as cudarc::driver::sys::CUdeviceptr;
+            cudarc::driver::result::memcpy_htod_async(words_dst, &w, self.stream.stream)
+                .expect("htod vmask words");
+            let flags_dst = *self.vmask_flags.device_ptr() as cudarc::driver::sys::CUdeviceptr;
+            cudarc::driver::result::memcpy_htod_async(flags_dst, &f, self.stream.stream)
+                .expect("htod vmask flags");
+        }
+        self.vmask_words_ptr.store(*self.vmask_words.device_ptr(), Ordering::Relaxed);
+        self.vmask_flags_ptr.store(*self.vmask_flags.device_ptr(), Ordering::Relaxed);
+        if !VMASK_DIAG_ON.load(Ordering::Relaxed) {
+            VMASK_DIAG_ON.store(true, Ordering::Relaxed);
+            let allowed: u32 = w.iter().map(|x| x.count_ones()).sum();
+            eprintln!("[schema] verify mask armed: positions={} words={} allowed_tokens_pos0={} flags={:?}",
+                      n, words, w[..words].iter().map(|x| x.count_ones()).sum::<u32>(), &f[..n.min(4)]);
+        }
+        true
+    }
+
+    /// W2: disarm the verify mask (the kernel launch is skipped when the words pointer is 0).
+    pub fn clear_verify_mask(&self) {
+        self.vmask_words_ptr.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.vmask_flags_ptr.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// W2: the armed verify-mask device pointers, or None when no mask is set.
+    #[inline]
+    fn verify_mask_ptrs(&self) -> Option<(u64, u64)> {
+        let w = self.vmask_words_ptr.load(std::sync::atomic::Ordering::Relaxed);
+        let f = self.vmask_flags_ptr.load(std::sync::atomic::Ordering::Relaxed);
+        if w == 0 { None } else { Some((w, f)) }
+    }
+
+    /// W2: launch the vocabulary mask over a [vocab, B] logits column block (bf16).
+    #[inline]
+    fn launch_mask_bf16(&self, logits_ptr: u64, vocab: usize, b: usize) {
+        if let Some((mw, mf)) = self.verify_mask_ptrs() {
+            let nw = mask_words_for(vocab);
+            let gy = ((nw as u32) + 255) / 256;
+            blaunch!(self, "logit_mask_b", (b as u32, gy, 1), (256,1,1), 0,
+                (logits_ptr, mw, mf, vocab as i32, b as i32));
+        }
+    }
+
+    /// W2: same for the fp32 (hy_v3) arm.
+    #[inline]
+    fn launch_mask_f32(&self, logits_ptr: u64, vocab: usize, b: usize) {
+        if let Some((mw, mf)) = self.verify_mask_ptrs() {
+            let nw = mask_words_for(vocab);
+            let gy = ((nw as u32) + 255) / 256;
+            blaunch!(self, "logit_mask_f32_b", (b as u32, gy, 1), (256,1,1), 0,
+                (logits_ptr, mw, mf, vocab as i32, b as i32));
         }
     }
 
@@ -9432,6 +10343,7 @@ impl GpuModel {
     /// inside) -> LM-head logits. Returns the logits buffer UNRELEASED — the select half owns it.
     pub fn forward_decode_logits(&self, pool: &mut Pool, bufs: &mut DecodeBuffers,
                           state: &mut BatchGpuState, kv_stride: usize, max_pc: usize, batch: usize) -> DecodeLogits {
+        if f9_xhash_active() { f9_x_new_call(); F9X_ATTN.with(|c| c.set(usize::MAX)); }
         // Caller must sync NULL stream before calling (after htod copies into bufs, incl. per-lane
         // rep/presence/frequency in bufs). Fully graph-capturable (no host sync).
         let cfg = &self.cfg;
@@ -9448,6 +10360,16 @@ impl GpuModel {
              *bufs.pos_dev.device_ptr() as u64, rdim as i32, batch as i32));
         let out = self.forward_batch_dev(pool, hidden, &bufs.pos_dev, &bufs.cos_dev, &bufs.sin_dev,
                                          max_pc, state, *bufs.slot_ids_dev.device_ptr(), kv_stride, batch);
+        if f9_xhash_active() && batch <= 8 {
+            let host = self.dev.dtoh_sync_copy(&out).unwrap_or_default();
+            let mut hs = Vec::with_capacity(batch);
+            for c in 0..batch {
+                let mut hv: u64 = 0xcbf29ce484222325;
+                for i in 0..h { let b = host.get(c * h + i).map(|v| v.to_bits()).unwrap_or(0); hv ^= b as u64; hv = hv.wrapping_mul(0x100000001b3); }
+                hs.push(hv);
+            }
+            F9XHASH.lock().unwrap().push((0u8, F9X_CUR.with(|c| c.get()), usize::MAX, hs));
+        }
         if cfg.lm_head_fp32 {
             // hy_v3: fp32 logits end-to-end (gemm_binv_f32_b + the f32 penalty/argmax twins).
             let logits = self.logits_batch_f32(pool, &out, batch);
@@ -9486,6 +10408,15 @@ impl GpuModel {
                      *bufs.presence_dev.device_ptr() as u64,
                      *bufs.frequency_dev.device_ptr() as u64,
                      v as i32, batch as i32));
+                // W2: JSON-schema mask — applied to the logits column AFTER the penalties and
+                // BEFORE selection, so every downstream reduction sees the same fixed order it
+                // always did (allowed entries stay byte-identical).
+                if bufs.mask_any {
+                    let gy = ((mask_words_for(v) as u32) + 255) / 256;
+                    blaunch!(self, "logit_mask_f32_b", (batch as u32, gy, 1), (256,1,1), 0,
+                        (d(&logits), *bufs.mask_words_dev.device_ptr() as u64,
+                         *bufs.mask_flags_dev.device_ptr() as u64, v as i32, batch as i32));
+                }
                 if sampling {
                     blaunch!(self, "sample_f32_b", (batch as u32,1,1), (nthr,1,1), smem,
                         (*bufs.token_ids_dev.device_ptr() as u64, d(&logits),
@@ -9507,6 +10438,15 @@ impl GpuModel {
                      *bufs.presence_dev.device_ptr() as u64,
                      *bufs.frequency_dev.device_ptr() as u64,
                      v as i32, batch as i32));
+                // W2: JSON-schema mask — applied to the logits column AFTER the penalties and
+                // BEFORE selection, so every downstream reduction sees the same fixed order it
+                // always did (allowed entries stay byte-identical).
+                if bufs.mask_any {
+                    let gy = ((mask_words_for(v) as u32) + 255) / 256;
+                    blaunch!(self, "logit_mask_b", (batch as u32, gy, 1), (256,1,1), 0,
+                        (d(&logits), *bufs.mask_words_dev.device_ptr() as u64,
+                         *bufs.mask_flags_dev.device_ptr() as u64, v as i32, batch as i32));
+                }
                 if sampling {
                     blaunch!(self, "sample_b", (batch as u32,1,1), (nthr,1,1), smem,
                         (*bufs.token_ids_dev.device_ptr() as u64, d(&logits),
@@ -9884,8 +10824,50 @@ impl GpuModel {
         }
     }
 
-    pub fn new_batch_state(&self, kv_slots: usize, state_slots: usize, max_seq_len: usize) -> BatchGpuState {
-        let cfg = &self.cfg;
+    /// Phase-8 [pfhash] (diagnostics): FNV-1a of the last prefill hidden column + the phys
+    /// slot's GDN conv/s rows, sampled across the layer stack. Warm-vs-cold prefill equality
+    /// probe: if cold and prefix-reuse prefills of the same prompt disagree anywhere, these
+    /// hashes localize whether it is the trunk hidden or the GDN slot state that moved.
+    pub fn pf_hash(&self, state: &BatchGpuState, phys: usize, hw: Option<(&B, usize, usize)>) -> String {
+        self.sync_stream();
+        let fnv = |b: &[half::bf16]| -> u64 {
+            let mut x: u64 = 1469598103934665603;
+            for v in b.iter() { for by in v.to_bits().to_le_bytes() { x ^= by as u64; x = x.wrapping_mul(1099511628211); } }
+            x
+        };
+        let mut s = String::new();
+        if let Some((hw, h, win)) = hw {
+            let host = self.dev.dtoh_sync_copy(hw).unwrap_or_default();
+            let b = win.saturating_sub(1) * h;
+            if b + h <= host.len() { s.push_str(&format!(" hid={:012x}", fnv(&host[b..b + h]))); }
+        }
+        let (kd, vd) = (self.cfg.lin_k_dim, self.cfg.lin_v_dim);
+        let s_ext = self.eff_lin_v_heads() * kd * vd;
+        let conv_ext = self.eff_conv_dim() * self.cfg.conv_kernel;
+        let gdn: Vec<usize> = self.cfg.layer_types.iter().enumerate()
+            .filter(|(_, lt)| matches!(lt, LayerType::LinearAttention)).map(|(i, _)| i).collect();
+        // Phase-8 localization: hash the FIRST 14 GDN layers densely (not sampled) — the first
+        // one whose conv/s hash moves between cold and warm pins the culprit stack region.
+        let mut shown = 0;
+        for &li in gdn.iter().take(14) {
+            if shown >= 14 { break; }
+            shown += 1;
+            let cs = state.conv_state[li].as_ref().and_then(|c| self.dev.dtoh_sync_copy(c).ok());
+            let ss = state.s_state[li].as_ref().and_then(|c| self.dev.dtoh_sync_copy(c).ok());
+            let fnv32 = |b: &[f32]| -> u64 {
+                let mut x: u64 = 1469598103934665603;
+                for v in b.iter() { for by in v.to_bits().to_le_bytes() { x ^= by as u64; x = x.wrapping_mul(1099511628211); } }
+                x
+            };
+            let (mut hc, mut hs) = (0u64, 0u64);
+            if let Some(v) = cs { let b = phys * conv_ext; if b + conv_ext <= v.len() { hc = fnv32(&v[b..b + conv_ext]); } }
+            if let Some(v) = ss { let b = phys * s_ext; if b + s_ext <= v.len() { hs = fnv32(&v[b..b + s_ext]); } }
+            s.push_str(&format!(" l{li}c={:012x} l{li}s={:012x}", hc & 0xFFFFFFFFFFFF, hs & 0xFFFFFFFFFFFF));
+        }
+        s
+    }
+
+    pub fn new_batch_state(&self, kv_slots: usize, state_slots: usize, max_seq_len: usize) -> BatchGpuState {        let cfg = &self.cfg;
         let stride = max_seq_len;
         let mut k_cache = vec![];
         let mut v_cache = vec![];
@@ -9945,6 +10927,7 @@ impl GpuModel {
             graph_epoch: GRAPH_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             vision_embeds: None,
             vision_spans: Vec::new(),
+            state_slots,
         }
     }
 
@@ -10137,6 +11120,22 @@ impl GpuModel {
     pub fn prefill_batch_range(&self, pool: &mut Pool, prompt: &[u32],
                          state: &mut BatchGpuState, slot: usize, kv_stride: usize,
                          pos_start: usize, lo: usize, hi: usize, incoming: Option<B>) -> (u32, B) {
+        // F8 diagnostic (GB10_TRACE_PREFILL): every call's shape + caller. The decode-phase
+        // prefill-class kernels (conv1d_prefill/gdn_chunk/attn_prefill_fa/dequant) needed a
+        // caller attribution — this is the front door of that whole family.
+        static PF_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        if std::env::var("GB10_TRACE_PREFILL").is_ok() {
+            use std::sync::atomic::Ordering::Relaxed;
+            let c = PF_N.fetch_add(1, Relaxed);
+            if c < 6 || c % 200 == 0 {
+                let bt = std::backtrace::Backtrace::force_capture();
+                let frames: Vec<String> = format!("{bt}").lines()
+                    .filter(|l| l.contains("gb10_inference"))
+                    .map(|l| l.trim().to_string()).take(6).collect();
+                eprintln!("[pf-trace #{c}] n={} pos_start={} slot={}\n   {}", prompt.len(), pos_start, slot,
+                          frames.join("\n   "));
+            }
+        }
         let cfg = &self.cfg;
         let h = cfg.hidden_size;
         // TP-local attention heads when the mixers are sharded (matches the sharded qkv/o_proj and the
@@ -10187,7 +11186,7 @@ impl GpuModel {
             // PP-prefill: continue from the lower range's residual stream (bf16, value-exact).
             incoming.expect("prefill_batch_range: lo > 0 requires the incoming hidden")
         };
-        let normed = pool.get_bf16(h * n);
+        let normed = pool.get_bf16_fp("prefill_batch_range:normed", h * self.pf8_pad(n), h * self.pf8_pad(n));
         let ckpt_slot: Option<usize> = None; // prefill never needs the MTP ping-pong checkpoint
         if trace_pf {
             self.sync_stream();
@@ -10218,10 +11217,11 @@ impl GpuModel {
                             + (ss as u64 * lin_nh as u64 * kd as u64 * vd as u64 * 4),
                         None => 0,
                     };
-                    let mut qkv = pool.get_bf16(conv_dim * n);
-                    let mut z = pool.get_bf16(value_dim * n);
-                    let mut b = pool.get_bf16(lin_nh * n);
-                    let mut a = pool.get_bf16(lin_nh * n);
+                    let np = self.pf8_pad(n);
+                    let mut qkv = pool.get_bf16(conv_dim * np);
+                    let mut z = pool.get_bf16(value_dim * np);
+                    let mut b = pool.get_bf16(lin_nh * np);
+                    let mut a = pool.get_bf16(lin_nh * np);
                     // b/a row geometry for gdn_prep_b: the FUSED arm splits to LOCAL-width rows;
                     // the SPLIT arm GEMMs the replicated-full b/a at the FULL head count and
                     // hands the kernel the rank's band via pointer offset + full row stride.
@@ -10230,7 +11230,7 @@ impl GpuModel {
                     match &la.in_proj {
                         GdnIn::Fused(w) => {
                             let mtot = self.eff_gdn_fused_m();
-                            let mut fused = pool.get_bf16(mtot * n);
+                            let mut fused = pool.get_bf16_fp("prefill_batch_range:fused_qkv", mtot * self.pf8_pad(n), mtot * self.pf8_pad(n));
                             self.gemm_act(w, &normed, &mut fused, h, mtot, n);
                             blaunch!(self, "split_gdn_b", grid(mtot*n), (256,1,1), 0,
                                 (d(&qkv), d(&z), d(&b), d(&a), d(&fused),
@@ -10247,8 +11247,8 @@ impl GpuModel {
                             let nh_src = self.cfg.lin_num_v_heads;
                             self.gemm_act(pq, &normed, &mut qkv, h, conv_dim, n);
                             self.gemm_act(pz, &normed, &mut z, h, value_dim, n);
-                            let mut bb = pool.get_bf16(nh_src * n);
-                            let mut ab = pool.get_bf16(nh_src * n);
+                            let mut bb = pool.get_bf16_fp("prefill_batch_range:mixer_bb", nh_src * self.pf8_pad(n), nh_src * self.pf8_pad(n));
+                            let mut ab = pool.get_bf16_fp("prefill_batch_range:mixer_ab", nh_src * self.pf8_pad(n), nh_src * self.pf8_pad(n));
                             self.gemm_act(pb, &normed, &mut bb, h, nh_src, n);
                             self.gemm_act(pa, &normed, &mut ab, h, nh_src, n);
                             b = bb; a = ab;
@@ -10565,7 +11565,7 @@ impl GpuModel {
                     let z_off_z_stride = ((lin_nh as u32 * vd as u32) << 15) | 0;   // packed z: (z_stride<<15)|z_off
                     blaunch!(self, "rmsnorm_gated_b", ((n*lin_nh) as u32,1,1), (vd as u32,1,1), (vd*4) as u32,
                         (d(&gnormed), d(&core), d(&z), d(&la.norm), vd as i32, lin_nh as i32, n as i32, fbits(cfg.rms_eps), z_off_z_stride as i32));
-                    let mut out = pool.get_bf16(h * n);
+                    let mut out = pool.get_bf16_fp("prefill_batch_range:o_proj", h * self.pf8_pad(n), h * self.pf8_pad(n));
                     if self.gdn_shard_factor() > 1 {
                         // AR landing 2: prefill is never fused (chunked, and its FFN epilogue is the
                         // unfused add_residual_b chain — §4) — the fused outcome is impossible.
@@ -10588,13 +11588,14 @@ impl GpuModel {
                     let vc_ptr = *state.v_cache[li].as_ref().unwrap().device_ptr() + v_off;
                     // qwen3_5 fuses a sigmoid output-gate into q_proj ([q|gate]); hy_v3's q_proj is bare.
                     let qmul = if cfg.attn_out_gate() { 2 } else { 1 };
-                    let mut qg = pool.get_bf16(nh*hd*qmul*n);
-                    let mut k = pool.get_bf16(nkv*hd*n);
-                    let mut v = pool.get_bf16(nkv*hd*n);
+                    let np = self.pf8_pad(n);
+                    let mut qg = pool.get_bf16(nh*hd*qmul*np);
+                    let mut k = pool.get_bf16(nkv*hd*np);
+                    let mut v = pool.get_bf16(nkv*hd*np);
                     match &fa.qkv {
                         AttnIn::Fused(w) => {
                             let mtot = if self.attn_shard_factor() > 1 { nh*hd*qmul + 2*nkv*hd } else { AttnIn::fused_m(cfg) };
-                            let mut fused = pool.get_bf16(mtot * n);
+                            let mut fused = pool.get_bf16_fp("prefill_batch_range:fused_qkv_2", mtot * self.pf8_pad(n), mtot * self.pf8_pad(n));
                             self.gemm_act(w, &normed, &mut fused, h, mtot, n);
                             blaunch!(self, "split_qkv_b", grid(mtot*n), (256,1,1), 0,
                                 (d(&qg), d(&k), d(&v), d(&fused),
@@ -10632,7 +11633,7 @@ impl GpuModel {
                     // The INNER loop needs no shared memory at all — it is warp shuffles and registers.
                     let nw = (hd / 32) as u32;                 // warps per block (blockDim = hd)
                     let smem = (nw * hd as u32 + 2 * nw) * 4;
-                    if self.kv_quant || self.kv_tq || self.kv_k8v4 {
+                    if self.kv_quant || self.kv_tq || self.kv_k8v4 || self.kv_k8v8 {
                         // Quantized cache: quantize at write, dequantize for the attention readers
                         // (the TQ dequant materializes decode_k/decode_v, the values the splitk
                         // score path is consistent with). E2 Fix 2: the dequant is INCREMENTAL
@@ -10651,6 +11652,9 @@ impl GpuModel {
                             blaunch!(self, "write_kv_prefill_tq", ((n*nkv) as u32,1,1), (128,1,1),
                                 if self.kv_tq_b3 { TQ_ENCODE_SMEM_BYTES_B3 } else { TQ_ENCODE_SMEM_BYTES },
                                 (kc_ptr, vc_ptr, d(&k), d(&v), d(&self.tq_tables), kv_stride as i32, nkv as i32, n as i32, pos_start as i32));
+                        } else if self.kv_k8v8 {
+                            blaunch!(self, "write_kv_prefill_k8v8", grid(n*nkv*(hd/16)), (256,1,1), 0,
+                                (kc_ptr, vc_ptr, d(&k), d(&v), kv_stride as i32, nkv as i32, hd as i32, n as i32, pos_start as i32));
                         } else if self.kv_k8v4 {
                             blaunch!(self, "write_kv_prefill_k8v4", grid(n*nkv*(hd/16)), (256,1,1), 0,
                                 (kc_ptr, vc_ptr, d(&k), d(&v), kv_stride as i32, nkv as i32, hd as i32, n as i32, pos_start as i32));
@@ -10681,6 +11685,14 @@ impl GpuModel {
                                         (mk + (wm * hd * 2) as u64, mv + (wm * hd * 2) as u64, kc_ptr, vc_ptr,
                                          d(&self.tq_tables), nkv as i32, kv_stride as i32,
                                          len as i32, wm as i32, budget as i32));
+                                } else if self.kv_k8v8 {
+                                    // K AND V at int8+fp16 blocks — channel-agnostic reader, twice.
+                                    blaunch!(self, "dequant_kv_k8v4", grid(len*nkv*(hd/16)), (256,1,1), 0,
+                                        (mk + (wm * hd * 2) as u64, kc_ptr, nkv as i32, kv_stride as i32,
+                                         hd as i32, len as i32, wm as i32, budget as i32));
+                                    blaunch!(self, "dequant_kv_k8v4", grid(len*nkv*(hd/16)), (256,1,1), 0,
+                                        (mv + (wm * hd * 2) as u64, vc_ptr, nkv as i32, kv_stride as i32,
+                                         hd as i32, len as i32, wm as i32, budget as i32));
                                 } else if self.kv_k8v4 {
                                     // K at int8+fp16, V at q4 — the two dequants share one watermark.
                                     blaunch!(self, "dequant_kv_k8v4", grid(len*nkv*(hd/16)), (256,1,1), 0,
@@ -10719,6 +11731,12 @@ impl GpuModel {
                             blaunch!(self, "dequant_kv_tq", ((npos*nkv) as u32,1,1), (128,1,1), TQ_DEQ_SMEM_BYTES,
                                 (d(&kdq), d(&vdq), kc_ptr, vc_ptr, d(&self.tq_tables),
                                  nkv as i32, kv_stride as i32, npos as i32, 0i32, npos as i32));
+                        } else if self.kv_k8v8 {
+                            // K AND V at int8+fp16 blocks — dequant_kv_k8v4 is channel-agnostic.
+                            blaunch!(self, "dequant_kv_k8v4", grid(npos*nkv*(hd/16)), (256,1,1), 0,
+                                (d(&kdq), kc_ptr, nkv as i32, kv_stride as i32, hd as i32, npos as i32, 0i32, npos as i32));
+                            blaunch!(self, "dequant_kv_k8v4", grid(npos*nkv*(hd/16)), (256,1,1), 0,
+                                (d(&vdq), vc_ptr, nkv as i32, kv_stride as i32, hd as i32, npos as i32, 0i32, npos as i32));
                         } else if self.kv_k8v4 {
                             // K at int8+fp16, V at q4 — the same pair the mirror arm launches.
                             blaunch!(self, "dequant_kv_k8v4", grid(npos*nkv*(hd/16)), (256,1,1), 0,
@@ -10756,7 +11774,14 @@ impl GpuModel {
                     if let Some(g) = &gate {
                         blaunch!(self, "sigmoid_gate_b", grid(nh*hd*n), (256,1,1), 0, (d(&attn), d(g), (nh*hd*n) as i32));
                     }
-                    let mut out = pool.get_bf16(h*n);
+                    // FIX #3 (2026-09-11): pad to pf8_pad(n) — the pf8 prefill lane writes
+                    // tp64 = ceil(n/64)*64 rows (gemm_fp8_prefill_e asserts out covers them);
+                    // an unpadded h*n alloc panics whenever the pool's power-of-2 capacity
+                    // lands below tp64*h (observed: prefix-hit tail chunk n=408 -> tp64=448,
+                    // out 2^21 < 448*5120, ladder d0 8.6k_r2 deterministic panic). Mirrors the
+                    // gdn out_proj / batch-mixer pad from 74a4611; the downstream release at
+                    // h*n is capacity-keyed, not length-keyed, so it stays as-is.
+                    let mut out = pool.get_bf16_fp("prefill_batch_range:o_proj_fullattn", h * self.pf8_pad(n), h * self.pf8_pad(n));
                     if self.attn_shard_factor() > 1 {
                         // AR landing 2: prefill is never fused (chunked, and its FFN epilogue is the
                         // unfused add_residual_b chain — §4) — the fused outcome is impossible.
@@ -10796,6 +11821,18 @@ impl GpuModel {
                     acc.push_str(&format!(" MX{s}:{s:.4}/{mx:.4}"));
                 }
                 eprintln!("[csum] L{li} n{n}{acc}");
+            }
+            // Phase-8 [fh]: WHOLE-buffer FNV of the residual at both per-layer points — the
+            // 3-row csum can miss a divergence that starts between the sampled rows.
+            if std::env::var("GB10_LAYER_FULLHASH").is_ok() {
+                let host = self.dev.dtoh_sync_copy(&residual).unwrap_or_default();
+                let n_real = (h * n).min(host.len());
+                let mut x: u64 = 1469598103934665603;
+                for v in host.iter().take(n_real) { for b in v.to_bits().to_le_bytes() { x ^= b as u64; x = x.wrapping_mul(1099511628211); } }
+                let host2 = self.dev.dtoh_sync_copy(&normed).unwrap_or_default();
+                let mut x2: u64 = 1469598103934665603;
+                for v in host2.iter().take(n_real) { for b in v.to_bits().to_le_bytes() { x2 ^= b as u64; x2 = x2.wrapping_mul(1099511628211); } }
+                eprintln!("[fh] L{li} n{n} MX {:012x} nx {:012x}", x & 0xFFFFFFFFFFFF, x2 & 0xFFFFFFFFFFFF);
             }
             let ReduceOut::Full(mlp_out) = self.ffn_batch(pool, &normed, &layer.mlp, n, self.ffn_shard_factor() > 1, false) else {
                 unreachable!("AR landing 2: prefill never fuses the FFN epilogue")
@@ -10846,6 +11883,39 @@ impl GpuModel {
                 }
                 eprintln!("[csum] L{li} n{n}{acc}");
             }
+            if std::env::var("GB10_LAYER_FULLHASH").is_ok() {
+                let host = self.dev.dtoh_sync_copy(&residual).unwrap_or_default();
+                let n_real = (h * n).min(host.len());
+                let mut x: u64 = 1469598103934665603;
+                for v in host.iter().take(n_real) { for b in v.to_bits().to_le_bytes() { x ^= b as u64; x = x.wrapping_mul(1099511628211); } }
+                eprintln!("[fh] L{li} n{n} r {:012x}", x & 0xFFFFFFFFFFFF);
+            }
+            // P14 DFlash v1 PROMPT capture. The post-FFN-add residual IS hidden_states[l+1] — the
+            // same tap source the decode/verify paths capture — written POSITION-ADDRESSED into the
+            // wide ctx feature at the window's absolute column (`wide_pos`, set per window by the
+            // scheduler). This is the ONLY site allowed to use the wide surface: the prefill is
+            // EAGER, so the destination column is a live host value, whereas inside a captured graph
+            // it would be baked at capture time (see the verify site below).
+            //
+            // This site did not exist before the P14 repair. Without it the serving lane's ctx
+            // feature was NEVER written by any forward: `dflash_prime` D2D'd an `alloc_zeros`
+            // surface (`alloc_zeros` does not zero — it is an async alloc) into the lane's feature,
+            // so the drafter conditioned on garbage for every prompt position. The single-process
+            // probe never showed it because it primes token-by-token through the ring staging.
+            if let Some(tap) = &self.dflash_tap {
+                if let Some(w) = &tap.wide {
+                    if let Some(k) = tap.tap_index(li) {
+                        let p0 = tap.wide_pos.load(std::sync::atomic::Ordering::Relaxed);
+                        if p0 + n <= tap.wide_stride {
+                            crate::dflash::tap_capture_to(&self.dev, self.stream.stream,
+                                *w.device_ptr() as u64, tap.nctx * h, p0,
+                                *residual.device_ptr() as u64, h, n, k);
+                        } else {
+                            crate::dflash::warn_wide_skip(p0, n, tap.wide_stride);
+                        }
+                    }
+                }
+            }
             // S5F DFlash2 prompt-prime capture: the post-FFN-add residual IS hidden_states[l+1] —
             // the same tap source the decode/verify path captures. The prefill runs at window
             // width n (up to PREFILL_CHUNK ≫ 8), so the tap lands in the WIDE prime sink, not the
@@ -10854,6 +11924,14 @@ impl GpuModel {
                 if let Some(k) = crate::dflash2::TAP_LAYERS.iter().position(|&l| l == li) {
                     crate::dflash2::capture::capture_cols_into(&self.dev, self.stream.stream,
                         *ps.taps.device_ptr() as u64, crate::dflash2::TAP_CONCAT_DIM,
+                        *residual.device_ptr() as u64, h, n, k);
+                }
+            }
+            // WI1 DSpark prompt-prime twin (same wide buffer shape, dspark taps).
+            if let Some(ps) = &self.dspark_prime {
+                if let Some(k) = crate::dspark::TAP_LAYERS.iter().position(|&l| (l as i32 + Self::dspark_tap_shift()) == li as i32) {
+                    crate::dflash2::capture::capture_cols_into(&self.dev, self.stream.stream,
+                        *ps.taps.device_ptr() as u64, crate::dspark::TAP_CONCAT_DIM,
                         *residual.device_ptr() as u64, h, n, k);
                 }
             }
@@ -11005,7 +12083,29 @@ impl GpuModel {
                           state: &mut BatchGpuState, slot: usize, kv_stride: usize,
                           pos_start: usize, ckpt_slot: Option<usize>,
                           penalty: Option<VerifyPenalty>) -> (Vec<u32>, B) {
-        self.verify_forward_topo(pool, tokens, state, slot, kv_stride, pos_start, ckpt_slot, penalty, None)
+        let _f9x_vcall = if f9_xhash_active() { f9_x_new_call() } else { usize::MAX };
+        let r = self.verify_forward_topo(pool, tokens, state, slot, kv_stride, pos_start, ckpt_slot, penalty, None);
+        if f9_xhash_active() && tokens.len() <= 8 {
+            let h = self.cfg.hidden_size;
+            let n = tokens.len();
+            // SAME STAGE as forward_batch_dev's return: apply the final norm (identical launch
+            // config to the decode path's non-fused arm) before hashing — vout is the PRE-norm
+            // residual by contract (MTP head feed).
+            let normed = pool.get_bf16(h * n);
+            blaunch!(self, "rmsnorm_b", (n as u32,1,1), (1024,1,1), (4096) as u32,
+                (d(&normed), d(&r.1), d(&self.final_norm), h as i32, n as i32, fbits(self.cfg.rms_eps)));
+            self.sync_stream();
+            let host = self.dev.dtoh_sync_copy(&normed).unwrap_or_default();
+            pool.release_bf16(normed, h * n);
+            let mut hs = Vec::with_capacity(n);
+            for c in 0..n {
+                let mut hv: u64 = 0xcbf29ce484222325;
+                for i in 0..h { let b = host.get(c * h + i).map(|v| v.to_bits()).unwrap_or(0); hv ^= b as u64; hv = hv.wrapping_mul(0x100000001b3); }
+                hs.push(hv);
+            }
+            F9XHASH.lock().unwrap().push((1u8, _f9x_vcall, usize::MAX, hs));
+        }
+        r
     }
 
     /// PLAN/25 Phase 0 (coverage capture, dump-only): `verify_forward` that hands back the raw
@@ -11020,6 +12120,14 @@ impl GpuModel {
                           state: &mut BatchGpuState, slot: usize, kv_stride: usize,
                           pos_start: usize, ckpt_slot: Option<usize>) -> (VerifyLogits, B) {
         self.verify_forward_core(pool, tokens, state, slot, kv_stride, pos_start, ckpt_slot, false)
+    }
+
+    /// `verify_forward_keep_logits` with FP32 logits — the Phase-7 F9 TP probe compares
+    /// column-0 logits bitwise, and bf16 would hide a 1-ulp fp32 drift.
+    pub fn verify_forward_keep_logits_f32(&self, pool: &mut Pool, tokens: &[u32],
+                          state: &mut BatchGpuState, slot: usize, kv_stride: usize,
+                          pos_start: usize, ckpt_slot: Option<usize>) -> (VerifyLogits, B) {
+        self.verify_forward_core(pool, tokens, state, slot, kv_stride, pos_start, ckpt_slot, true)
     }
 
     /// `verify_forward` with an optional planted tree topology (fork-then-chain in serving).
@@ -11037,6 +12145,14 @@ impl GpuModel {
         // Trees, the stochastic verify, and GB10_NO_VERIFY_GRAPH keep the eager path. Escape hatch on
         // purpose: a captured-verify bug would be invisible to every gate that only ever runs it —
         // the first-line repro is GB10_NO_VERIFY_GRAPH=1.
+        // W2 (Phase 13): a captured verify graph encodes the kernel sequence from CAPTURE time —
+        // it has no JSON-schema mask launch in it, so replaying it would emit UNCONSTRAINED
+        // tokens while the FSM advanced underneath (observed in the first W2 boot). Whenever a
+        // mask is armed, take the eager path (which launches the mask before argmax/spec_verify).
+        if topo.is_none() && self.verify_mask_ptrs().is_some() {
+            return self.verify_forward_topo_eager(pool, tokens, state, slot, kv_stride, pos_start,
+                                                  ckpt_slot, penalty, topo);
+        }
         if topo.is_none() && std::env::var("GB10_NO_VERIFY_GRAPH").is_err() {
             let n = tokens.len();
             let key = (n, ckpt_slot.unwrap_or(usize::MAX), penalty.is_some(), state.graph_epoch);
@@ -11098,6 +12214,11 @@ impl GpuModel {
                         (d(&lg), p.tokens_ptr, p.counts_ptr, MAX_PEN_TOKENS as i32,
                          p.rep_pen_ptr, p.presence_ptr, p.freq_ptr, vocab as i32, n as i32));
                 }
+                if let Some((mw, mf)) = self.verify_mask_ptrs() {
+                    let gy = ((mask_words_for(vocab) as u32) + 255) / 256;
+                    blaunch!(self, "logit_mask_b", (n as u32, gy, 1), (256,1,1), 0,
+                        (d(&lg), mw, mf, vocab as i32, n as i32));
+                }
                 let block = 1024u32;
                 blaunch!(self, "argmax_b", (n as u32,1,1), (block,1,1), (block*8),
                     (*self.sc_tok.device_ptr() as u64, d(&lg), vocab as i32, n as i32));
@@ -11108,6 +12229,11 @@ impl GpuModel {
                     blaunch!(self, "rep_penalty_f32_b", (n as u32,1,1), (256,1,1), 0,
                         (d(&lg), p.tokens_ptr, p.counts_ptr, MAX_PEN_TOKENS as i32,
                          p.rep_pen_ptr, p.presence_ptr, p.freq_ptr, vocab as i32, n as i32));
+                }
+                if let Some((mw, mf)) = self.verify_mask_ptrs() {
+                    let gy = ((mask_words_for(vocab) as u32) + 255) / 256;
+                    blaunch!(self, "logit_mask_f32_b", (n as u32, gy, 1), (256,1,1), 0,
+                        (d(&lg), mw, mf, vocab as i32, n as i32));
                 }
                 let block = 1024u32;
                 blaunch!(self, "argmax_f32_b", (n as u32,1,1), (block,1,1), (block*8),
@@ -11252,6 +12378,23 @@ impl GpuModel {
         let conv_dim = self.eff_conv_dim(); let ck = cfg.conv_kernel;
         let value_dim = self.eff_value_dim();
         let n = tokens.len();
+        // Per-column GDN checkpoint band. `delta_step_prefill` / `conv1d_prefill` write one
+        // checkpoint per column `t < n-1` at slot `ckpt_slot + t` (`gpu_batch.cu:1299` and `:4120`,
+        // both unguarded), so the widest write lands at `ckpt_slot + n - 2`. There is NO bounds
+        // check in either kernel: an undersized band silently writes OUT OF the conv/s_state
+        // allocation and into whatever the allocator placed next, which is how the P14 DFlash v1
+        // lane produced all-zero argmax (`!` = token 0) while every gate stayed green. Assert the
+        // band here — this is the eager call that every captured verify also makes first, so a
+        // sizing mistake fails loudly instead of corrupting device memory.
+        if let Some(cs) = ckpt_slot {
+            assert!(cs + n <= state.state_slots + 1,
+                    "verify ckpt band overflow: ckpt_slot {cs} + width {n} needs {} GDN state slots, \
+                     state has {} (slots: lane band {cs}, checkpoints {}..={}). The GDN scan writes \
+                     ckpt_slot+t for t < n-1 with no bounds check — size n_ckpt in the scheduler's \
+                     BatchGpuState construction for the WIDEST verify this source can issue \
+                     (MAX_VERIFY for the 16-column block lanes).",
+                    cs + n - 1, state.state_slots, cs, cs + n - 2);
+        }
         // A chain: KV position and RoPE position coincide (both pos_start+j). A tree splits them —
         // siblings share a RoPE position (their tree depth) but occupy distinct KV positions. Kept as
         // two arrays now, populated identically, so the split is proven byte-identical before the tree
@@ -11357,6 +12500,8 @@ impl GpuModel {
         // Cross-chain probe capture: verify forwards are their own per-layer loop (not
         // forward_batch_dev), so they get their own sink entry here.
         if xchain_active() { xchain_new(tokens.len()); }
+        // Phase-8 F9 tap: the verify record (eager only — capture mode has no live residual).
+        if !capture { state_tap_call("verify", n); }
         let cos = pool.get(n * rdim);
         let sin = pool.get(n * rdim);
         blaunch!(self, "gather_rope_b", grid(n*rdim), (256,1,1), 0,
@@ -11493,6 +12638,14 @@ impl GpuModel {
                         (d(&core), d(&convo), s_ptr, b_ptr, a_ptr, stride_pack as i32, (kd as i32) | ((vd as i32) << 16),
                          d(&la.a_log), d(&la.dt_bias), (n as i32 & 0xFFFFFF) | ((self.eff_lin_k_heads() as i32 & 0xFF) << 24),
                          mid_s_ptr, parent_ptr));
+                    if state_tap_active() && !capture {
+                        let cv = self.dev.dtoh_sync_copy(&convo).unwrap_or_default();
+                        let co = self.dev.dtoh_sync_copy(&core).unwrap_or_default();
+                        state_tap_gdn(cv, co);
+                        if n <= 4 {
+                            state_tap_s(self.dev.dtoh_sync_copy(state.s_state[li].as_ref().unwrap()).unwrap_or_default());
+                        }
+                    }
                     let gnormed = pool.get_bf16(value_dim * n);
                     let (z_ptr, z_off, z_stride): (u64, usize, usize) = match &fused_qkv {
                         Some(f) => (d(f), conv_dim, mtot),
@@ -11536,7 +12689,7 @@ impl GpuModel {
                     // under the default); the escapes + TQ/K8v4 keep the packed split.
                     let old_pipeline = std::env::var("GB10_NO_QKV_VIEW").is_ok()
                         || std::env::var("GB10_NO_FUSED_PERHEAD_ROPE").is_ok()
-                        || matches!(self.kv_mode(), KVCacheMode::Tq | KVCacheMode::K8v4);
+                        || matches!(self.kv_mode(), KVCacheMode::Tq | KVCacheMode::K8v4 | KVCacheMode::K8v8);
                     let mut qg: Option<B> = None;
                     let mut k: Option<B> = None;
                     let mut vbuf: Option<B> = None;
@@ -11546,9 +12699,9 @@ impl GpuModel {
                             let mut fb = pool.get_bf16(mtot * n);
                             self.gemm_act(w, &normed, &mut fb, h, mtot, n);
                             if old_pipeline {
-                                let qgb = pool.get_bf16(qg_dim*n);
-                                let kb = pool.get_bf16(kv_dim*n);
-                                let vb = pool.get_bf16(kv_dim*n);
+                                let qgb = pool.get_bf16(qg_dim*self.pf8_pad(n));
+                                let kb = pool.get_bf16(kv_dim*self.pf8_pad(n));
+                                let vb = pool.get_bf16(kv_dim*self.pf8_pad(n));
                                 blaunch!(self, "split_qkv_b", grid(mtot*n), (256,1,1), 0,
                                     (d(&qgb), d(&kb), d(&vb), d(&fb), qg_dim as i32, kv_dim as i32, n as i32));
                                 pool.release_bf16(fb, mtot * n);
@@ -11558,9 +12711,9 @@ impl GpuModel {
                             }
                         }
                         AttnIn::Split { q: qp, k: kp, v: vp } => {
-                            let mut qgb = pool.get_bf16(qg_dim*n);
-                            let mut kb = pool.get_bf16(kv_dim*n);
-                            let mut vb = pool.get_bf16(kv_dim*n);
+                            let mut qgb = pool.get_bf16(qg_dim*self.pf8_pad(n));
+                            let mut kb = pool.get_bf16(kv_dim*self.pf8_pad(n));
+                            let mut vb = pool.get_bf16(kv_dim*self.pf8_pad(n));
                             self.gemm_act(qp, &normed, &mut qgb, h, qg_dim, n);
                             self.gemm_act(kp, &normed, &mut kb, h, kv_dim, n);
                             self.gemm_act(vp, &normed, &mut vb, h, kv_dim, n);
@@ -11612,8 +12765,31 @@ impl GpuModel {
                                 Some(qb) => (qb, nh * hd),
                                 None => (fb, mtot),
                             };
-                            self.attn_dispatch(pool, q_ref, fb, fb, q_pitch_d, true, &self.sc_pos, kc_ptr, vc_ptr,
-                                slot_ids_ptr, kv_stride, kv_stride, n, None, path_ptr, rope_dev_ptr, col_pos_start_ptr, self.attn_shard_factor() > 1, self.kv_mode())
+                            {
+                                let at = self.attn_dispatch(pool, q_ref, fb, fb, q_pitch_d, true, &self.sc_pos, kc_ptr, vc_ptr,
+                                slot_ids_ptr, kv_stride, kv_stride, n, None, path_ptr, rope_dev_ptr, col_pos_start_ptr, self.attn_shard_factor() > 1, self.kv_mode(), topo.is_none());
+                                if std::env::var("GB10_F9_XHASH").as_deref() == Ok("3") && li == 3 && !capture {
+                                    let tag = |buf: &B, wdt: usize, nm: &str| {
+                                        let host = self.dev.dtoh_sync_copy(buf).unwrap_or_default();
+                                        let mut hv: u64 = 0xcbf29ce484222325;
+                                        for i in 0..wdt { let b = host.get(i).map(|v| v.to_bits()).unwrap_or(0); hv ^= b as u64; hv = hv.wrapping_mul(0x100000001b3); }
+                                        eprintln!("  [f9x-L3-V] {nm} 0x{hv:016x} (n={n})");
+                                    };
+                                    // per-column hashes so col 1 can be compared to a decode
+                                    for c in 0..n {
+                                        let tagc = |buf: &B, pitch: usize, nm: &str| {
+                                            let host = self.dev.dtoh_sync_copy(buf).unwrap_or_default();
+                                            let mut hv: u64 = 0xcbf29ce484222325;
+                                            for i in 0..pitch { let b = host.get(c * pitch + i).map(|v| v.to_bits()).unwrap_or(0); hv ^= b as u64; hv = hv.wrapping_mul(0x100000001b3); }
+                                            eprintln!("  [f9x-L3-V] {nm} col{c} 0x{hv:016x}");
+                                        };
+                                        tagc(q_ref, q_pitch_d, "q");
+                                        tagc(fb, mtot, "qkv");
+                                        tagc(&at, nh*hd, "attn");
+                                    }
+                                }
+                                at
+                            }
                         } else {
                             // AttnIn::Split weights — no fused buffer to view; packed fused rope + dispatch write.
                             let qb = q.as_ref().expect("q buffer");
@@ -11622,7 +12798,7 @@ impl GpuModel {
                             blaunch!(self, "rmsnorm_rope_b", ((n*nh) as u32,1,1), (hd as u32,1,1), (hd*4) as u32, (q_ptr, d(&fa.q_norm), d(&cos), d(&sin), nh as i32, hd as i32, rdim as i32, n as i32, eps, 0i32, q_pitch as i32));
                             blaunch!(self, "rmsnorm_rope_b", ((n*nkv) as u32,1,1), (hd as u32,1,1), (hd*4) as u32, (d(kb), d(&fa.k_norm), d(&cos), d(&sin), nkv as i32, hd as i32, rdim as i32, n as i32, eps, 0i32, kv_dim as i32));
                             self.attn_dispatch(pool, qb, kb, vbn, nh*hd, false, &self.sc_pos, kc_ptr, vc_ptr,
-                                slot_ids_ptr, kv_stride, kv_stride, n, None, path_ptr, rope_dev_ptr, col_pos_start_ptr, self.attn_shard_factor() > 1, self.kv_mode())
+                                slot_ids_ptr, kv_stride, kv_stride, n, None, path_ptr, rope_dev_ptr, col_pos_start_ptr, self.attn_shard_factor() > 1, self.kv_mode(), topo.is_none())
                         }
                     } else {
                         // Old pipeline: packed q/k/v; the rope is fused unless the F4 escape is set.
@@ -11638,13 +12814,27 @@ impl GpuModel {
                             blaunch!(self, "rmsnorm_rope_b", ((n*nh) as u32,1,1), (hd as u32,1,1), (hd*4) as u32, (q_ptr, d(&fa.q_norm), d(&cos), d(&sin), nh as i32, hd as i32, rdim as i32, n as i32, eps, 0i32, q_pitch as i32));
                             blaunch!(self, "rmsnorm_rope_b", ((n*nkv) as u32,1,1), (hd as u32,1,1), (hd*4) as u32, (d(kb), d(&fa.k_norm), d(&cos), d(&sin), nkv as i32, hd as i32, rdim as i32, n as i32, eps, 0i32, kv_dim as i32));
                         }
-                        self.attn_dispatch(pool, qb, kb, vbn, nh*hd, false, &self.sc_pos, kc_ptr, vc_ptr,
-                            slot_ids_ptr, kv_stride, kv_stride, n, None, path_ptr, rope_dev_ptr, col_pos_start_ptr, self.attn_shard_factor() > 1, self.kv_mode())
+                        let at = self.attn_dispatch(pool, qb, kb, vbn, nh*hd, false, &self.sc_pos, kc_ptr, vc_ptr,
+                            slot_ids_ptr, kv_stride, kv_stride, n, None, path_ptr, rope_dev_ptr, col_pos_start_ptr, self.attn_shard_factor() > 1, self.kv_mode(), topo.is_none());
+                        if std::env::var("GB10_F9_XHASH").as_deref() == Ok("3") && li == 3 && !capture {
+                            let tag = |buf: &B, wdt: usize, nm: &str| {
+                                let host = self.dev.dtoh_sync_copy(buf).unwrap_or_default();
+                                let mut hv: u64 = 0xcbf29ce484222325;
+                                for i in 0..wdt { let b = host.get(i).map(|v| v.to_bits()).unwrap_or(0); hv ^= b as u64; hv = hv.wrapping_mul(0x100000001b3); }
+                                eprintln!("  [f9x-L3-V] {nm} 0x{hv:016x} (n={n})", );
+                            };
+                            tag(qb, nh*hd*n, "q");
+                            tag(kb, kv_dim*n, "k");
+                            tag(&at, nh*hd*n, "attn");
+                        }
+                        at
                     };
                     if let Some(g) = &gate {
                         blaunch!(self, "sigmoid_gate_b", grid(nh*hd*n), (256,1,1), 0, (d(&attn), d(g), (nh*hd*n) as i32));
                     }
-                    let mut out = pool.get_bf16(h*n);
+                    // FIX #3 (2026-09-11, fused_qkv branch): same pf8 tp64 pad as the write_kv
+                    // o_proj site above — unpadded h*n panics on pool-capacity gaps (n=408 class).
+                    let mut out = pool.get_bf16(h * self.pf8_pad(n));
                     let fused = if self.attn_shard_factor() > 1 {
                         self.tp_reduce_site(pool, &fa.o_proj, &attn, &mut out, nh*hd, h, n, reduce_fuse)
                     } else {
@@ -11672,6 +12862,17 @@ impl GpuModel {
             // F5: the FFN epilogue's flavor-Q kernel is BIT-EXACT to add_residual_b + rmsnorm_b
             // (sum_sq from the ROUNDED residual); the mixer epilogue stays flavor S.
             self.ffn_epilogue(pool, d(&normed), res_ptr, mlp_out, fuse, next_w, h, n, false);
+            if std::env::var("GB10_F9_XHASH").as_deref() == Ok("2") && n <= 8 && !capture {
+                let rv = residual.as_ref().expect("eager residual");
+                let host = self.dev.dtoh_sync_copy(rv).unwrap_or_default();
+                let mut hs = Vec::with_capacity(n);
+                for c in 0..n {
+                    let mut hv: u64 = 0xcbf29ce484222325;
+                    for i in 0..h { let b = host.get(c * h + i).map(|v| v.to_bits()).unwrap_or(0); hv ^= b as u64; hv = hv.wrapping_mul(0x100000001b3); }
+                    hs.push(hv);
+                }
+                F9XHASH.lock().unwrap().push((11u8, F9X_CUR.with(|c| c.get()), li, hs));
+            }
             // GB10_LAYER_CSUM (diagnostic, prefill loop): see the block_forward twin.
             if std::env::var("GB10_LAYER_CSUM").is_ok() {
                 let rv = residual.as_ref().expect("prefill residual");
@@ -11683,10 +12884,29 @@ impl GpuModel {
             // E29-B3 DFlash tap: post-FFN-add residual at the tapped layers → rank-0 staging
             // scratch (the verify is where the draft loop's accepted-span features come from).
             // Capturable: the D2D becomes a memcpy node inside the chain-verify CUDA graph.
-            if n <= crate::dflash::BLOCK {
-                if let Some(tap) = &self.dflash_tap {
-                    if let Some(k) = crate::dflash::TAP_LAYERS.iter().position(|&l| l == li) {
+            //
+            // P14 GRAPH SAFETY: the chain verify runs as a CAPTURED CUDA graph whose nodes bake
+            // absolute addresses, and `wide_pos` is HOST state read at CAPTURE time — writing the
+            // wide (position-addressed) surface here would freeze every replay of that graph at the
+            // first step's column, silently mis-placing every later span. So the verify writes the
+            // POSITION-INDEPENDENT ring staging at columns [0, n) (exactly the discipline the DF2
+            // sink's `capture_cols` follows) and the lane D2Ds the ACCEPTED span to its absolute ctx
+            // column afterwards (`DflashLane::feat`, the S5F3 `sync_staging_from_sink` analogue).
+            // Without that host-side copy the lane consumed ctx columns no forward had written.
+            // The wide branch survives only for a capture wider than the ring — never the verify
+            // (n <= MAX_VERIFY == MAX_BLOCK) but kept for a caller that outgrows it.
+            if let Some(tap) = &self.dflash_tap {
+                if let Some(k) = tap.tap_index(li) {
+                    if n <= crate::dflash::MAX_BLOCK {
                         crate::dflash::tap_capture(&self.dev, self.stream.stream, tap, res_ptr, h, n, k);
+                    } else if let Some(w) = &tap.wide {
+                        let p0 = tap.wide_pos.load(std::sync::atomic::Ordering::Relaxed);
+                        if p0 + n <= tap.wide_stride {
+                            crate::dflash::tap_capture_to(&self.dev, self.stream.stream,
+                                *w.device_ptr() as u64, tap.nctx * h, p0, res_ptr, h, n, k);
+                        } else {
+                            crate::dflash::warn_wide_skip(p0, n, tap.wide_stride);
+                        }
                     }
                 }
             }
@@ -11694,7 +12914,7 @@ impl GpuModel {
             // same stream; capturable identically. DEFAULT OFF = dead branch.
             // PLAN/25 Phase 1: n > BLOCK is the TREE verify (up to MAX_VERIFY nodes) — its
             // per-column taps land in the WIDE sink; the accepted path is gathered out of it.
-            if n > crate::dflash2::BLOCK && n <= MAX_VERIFY {
+            if n > crate::dflash2::block() && n <= MAX_VERIFY {
                 if let Some(sink) = &self.df2_capture_tree {
                     if let Some(k) = crate::dflash2::TAP_LAYERS.iter().position(|&l| l == li) {
                         crate::dflash2::capture::capture_cols(&self.dev, self.stream.stream, sink,
@@ -11702,13 +12922,29 @@ impl GpuModel {
                     }
                 }
             }
-            if n <= crate::dflash2::BLOCK {
+            if n <= crate::dflash2::block() {
                 if let Some(sink) = &self.df2_capture {
                     if let Some(k) = crate::dflash2::TAP_LAYERS.iter().position(|&l| l == li) {
                         crate::dflash2::capture::capture_cols(&self.dev, self.stream.stream, sink,
                             res_ptr, h, n, k);
                     }
                 }
+            }
+            // WI1 DSpark verify taps: the DSpark lane never runs the wide tree verify (v1 is
+            // the width-8 chain only), so only the chain-width arm exists here. The verify pack
+            // is committed + BLOCK drafts = BLOCK+1 = 8 wide — the gate MUST be <= BLOCK+1
+            // (BLOCK=7 alone never fired: every inject pushed stale staging, acceptance 2%).
+            if n <= crate::dspark::BLOCK + 1 {
+                if let Some(sink) = &self.dspark_capture {
+                    if let Some(k) = crate::dspark::TAP_LAYERS.iter().position(|&l| (l as i32 + Self::dspark_tap_shift()) == li as i32) {
+                        crate::dflash2::capture::capture_cols(&self.dev, self.stream.stream, sink,
+                            res_ptr, h, n, k);
+                    }
+                }
+            }
+            // Phase-8 F9 tap: post-layer residual snapshot (eager only; syncs the stream).
+            if state_tap_active() && !capture {
+                state_tap_layer(self.dev.dtoh_sync_copy(residual.as_ref().unwrap()).unwrap_or_default());
             }
         }
         let out = if fuse {
@@ -11818,6 +13054,18 @@ impl GpuModel {
             });
             Some((*tbl.device_ptr() as u64, *scr.device_ptr() as u64))
         } else { None };
+        // W2 (Phase 13): JSON-schema mask over the verify logits [vocab, n] BEFORE
+        // spec_verify_* selects anything, so the p(draft)/residual draws AND the host accept
+        // rule see the masked distribution (allowed entries byte-identical).
+        if let Some((mw, mf)) = self.verify_mask_ptrs() {
+            let gy = ((mask_words_for(vocab) as u32) + 255) / 256;
+            match &logits {
+                VerifyLogits::B16(lg) => blaunch!(self, "logit_mask_b", (n as u32, gy, 1), (256,1,1), 0,
+                    (d(lg), mw, mf, vocab as i32, n as i32)),
+                VerifyLogits::F32(lg) => blaunch!(self, "logit_mask_f32_b", (n as u32, gy, 1), (256,1,1), 0,
+                    (d(lg), mw, mf, vocab as i32, n as i32)),
+            }
+        }
         match logits {
             VerifyLogits::F32(l) => {
                 blaunch!(self, "spec_verify_f32_b", (n as u32,1,1), (256,1,1), smem,
@@ -11936,6 +13184,18 @@ impl GpuModel {
         let smem = ((2 * 64usize + 2 * 256usize) * 4) as u32;
         // S5F3 dump: the top-20 table BEFORE the destructive realq kernel (same as the
         // q=1 arm). Dump-only; t20_out None = free path.
+        // W2 (Phase 13): JSON-schema mask over the verify logits [vocab, n] BEFORE
+        // spec_verify_* selects anything, so the p(draft)/residual draws AND the host accept
+        // rule see the masked distribution (allowed entries byte-identical).
+        if let Some((mw, mf)) = self.verify_mask_ptrs() {
+            let gy = ((mask_words_for(vocab) as u32) + 255) / 256;
+            match &logits {
+                VerifyLogits::B16(lg) => blaunch!(self, "logit_mask_b", (n as u32, gy, 1), (256,1,1), 0,
+                    (d(lg), mw, mf, vocab as i32, n as i32)),
+                VerifyLogits::F32(lg) => blaunch!(self, "logit_mask_f32_b", (n as u32, gy, 1), (256,1,1), 0,
+                    (d(lg), mw, mf, vocab as i32, n as i32)),
+            }
+        }
         let dump_ptrs: Option<(u64, u64)> = if t20_out.is_some() {
             let vocab_cap = self.cfg.vocab_size;
             let tbl = self.sv_t20.get_or_init(|| {
@@ -12199,6 +13459,42 @@ impl GpuModel {
     /// recurrent state, the diff is 0. A nonzero diff localizes the divergence to the GDN recurrence
     /// path (or the projections feeding it) — distinguishing a real kernel bug from cuBLAS N=1-vs-N
     /// rounding. `n` is the verify batch size (1 = single-token append, 2 = two-token append).
+    /// Phase-7: the GDN decode-vs-verify state probe on the SHARDED path. Both ranks run this in
+    /// SPMD lockstep (every forward's all-reduces pair up); each compares its own state slices.
+    pub fn probe_state_tp(&self, pool: &mut Pool, prompt: &[u32], kv_stride: usize, max_n: usize) -> bool {
+        let plen = prompt.len().min(512);
+        let prompt: &[u32] = &prompt[..plen];
+        // Phase-8 A1: the probe MUST run eager. The verify CUDA-graph capture trips the TP
+        // transport tripwire mid-probe (Phase-7 N=4 abort: device epoch != gpu_ready — the capture
+        // records the barrier kernels instead of executing them, which desyncs the SPMD lockstep),
+        // and the probe's job is the numerics of the EAGER path anyway. Setting the env var here
+        // covers both ranks (SPMD: the node runs this same function). Not a §1b feature disable:
+        // graphs return for serving the moment the probe exits the process.
+        std::env::set_var("GB10_NO_VERIFY_GRAPH", "1");
+        // Phase-8 A2: arm the per-layer residual tap (GB10_STATE_TAP=0 disarms, for A/B).
+        if std::env::var("GB10_STATE_TAP").map_or(true, |v| v != "0") {
+            state_tap_arm();
+        }
+        let mut all_ok = true;
+        println!("=== TP GDN state probe (world={} rank={}): verify vs decode, plen={plen} (eager verify) ===",
+                 self.tp_world, self.tp_rank);
+        for n in 1..=max_n {
+            // Phase-8 A2 root cause: this WAS n.max(2) slots, but verify_state_diff's per-slot
+            // extent is len/2 — with >=3 slots the compare read slot-1 data at a 1.5-slot offset
+            // (and zeroed slot-2 tail), reporting a PHANTOM MISMATCH for every N>=3. The probe
+            // uses exactly slots {0=verify, 1=decode}; 2 slots matches run_probe_state (world=1).
+            // The trunk state contract itself was clean at every N.
+            let mut state = self.new_batch_state(2, 2, kv_stride);
+            let d = self.verify_state_diff(pool, &mut state, prompt, kv_stride, n);
+            let ok = d == 0.0;
+            all_ok &= ok;
+            println!("  N={n}: verify_state_diff = {d:.7} {}", if ok { "EXACT" } else { "MISMATCH" });
+        }
+        state_tap_disarm();
+        println!("{}", if all_ok { "PROBE-STATE-TP: PASS" } else { "PROBE-STATE-TP: FAIL" });
+        all_ok
+    }
+
     pub fn verify_state_diff(&self, pool: &mut Pool, state: &mut BatchGpuState, prompt: &[u32],
                              kv_stride: usize, n: usize) -> f32 {
         let h = self.cfg.hidden_size;
@@ -12231,57 +13527,241 @@ impl GpuModel {
         self.zero_slot_state(state, 0, kv_stride);
         let (_s, hh) = self.prefill_batch(pool, prompt, state, 0, kv_stride, 0);
         pool.release_bf16(hh, h * prompt.len());
+        let tap = state_tap_active();
+        if tap { let _ = state_tap_take(); }   // drop the generation-decode records
         let (_p, vout) = self.verify_forward(pool, &inputs, state, 0, kv_stride, plen, None, None);
         pool.release_bf16(vout, h * n);
+        let ver_tap = if tap { state_tap_take() } else { Vec::new() };
+        // Phase-8 bracket: slot-0 state snapshot immediately after the verify returns.
+        let snap_s1 = if tap {
+            state.s_state.iter().map(|b| b.as_ref().map(|s| self.dev.dtoh_sync_copy(s).unwrap()))
+                .collect::<Vec<_>>()
+        } else { Vec::new() };
+        // Phase-8 bracket (in-verify tail): the mid-verify GDN taps hold slot 0 right after each
+        // layer's delta commit; snap_s1 holds slot 0 at verify return. A difference on layer li
+        // means something between layer li's delta and the verify's return corrupted it.
+        if tap && n <= 4 {
+            let vs: Vec<&Vec<Vec<f32>>> = ver_tap.iter().filter(|c| c.tag == "verify").map(|c| &c.s).collect();
+            if let Some(vss) = vs.first() {
+                let mut gi = 0usize;
+                let mut any = false;
+                for (li, s1) in snap_s1.iter().enumerate() {
+                    if !matches!(self.cfg.layer_types.get(li), Some(LayerType::LinearAttention)) { continue; }
+                    let (Some(s1), Some(tap_s)) = (s1, vss.get(gi)) else { gi += 1; continue; };
+                    let per = s1.len() / 2;
+                    let mut w = 0f32;
+                    for j in 0..per { let dd = (s1[j] - tap_s[j]).abs(); if dd > w { w = dd; } }
+                    if w > 0.0 {
+                        eprintln!("    [bracket] N={n} layer {li:>2} (GDN): slot-0 changed during the VERIFY TAIL after its GDN tap, worst={w:.6e}");
+                        any = true;
+                    }
+                    gi += 1;
+                }
+                if !any { eprintln!("    [bracket] N={n}: slot-0 s_state clean through the verify tail (all GDN layers)"); }
+            }
+        }
 
         // Slot 1 was advanced only by the prefill above (the decode loop used lane 0 → slot 0, then
         // we re-zeroed slot 0). Advance slot 1 by n decodes with the same tokens.
         self.dev.htod_sync_copy_into(&[1i32, 0], &mut bufs.slot_ids_dev).unwrap();
         let mut s1pos = plen;
+        // Phase-8 per-step watch: does slot_ids stay [1,0], and which decode step first corrupts
+        // slot-0's GDN state (layer 0)? If slot 0 changes with slot_ids == [1,0], a decode kernel
+        // is writing outside its lane; if slot_ids drifts, the writer is a stray host copy.
+        let watch = tap && n >= 2;
+        let mut prev0 = if watch { self.dev.dtoh_sync_copy(state.s_state[0].as_ref().unwrap()).unwrap() } else { Vec::new() };
         for i in 0..n {
             let t = inputs[i] as i32;
             self.dev.htod_sync_copy_into(&[t, 0], &mut bufs.tokens_dev).unwrap();
             self.dev.htod_sync_copy_into(&[s1pos as i32, 0], &mut bufs.pos_dev).unwrap();
+            if watch {
+                let sids = self.dev.dtoh_sync_copy(&bufs.slot_ids_dev).unwrap();
+                eprintln!("    [step] N={n} i={i} tok={t} pos={s1pos} slot_ids={sids:?}");
+            }
             self.dev.synchronize().unwrap();
             let _nx = self.forward_decode(pool, &mut bufs, state, kv_stride, s1pos + 1, 1);
             s1pos += 1;
+            if watch {
+                let cur = self.dev.dtoh_sync_copy(state.s_state[0].as_ref().unwrap()).unwrap();
+                let per = cur.len() / 2;
+                let (mut w, mut fi) = (0f32, 0usize);
+                for j in 0..per { let dd = (cur[j] - prev0[j]).abs(); if dd > w { w = dd; fi = j; } }
+                if w > 0.0 {
+                    let lin_nh0 = self.eff_lin_v_heads();
+                    let (kdd, vdd) = (self.cfg.lin_k_dim, self.cfg.lin_v_dim);
+                    let head = fi / (kdd * vdd);
+                    let rem = fi - head * kdd * vdd;
+                    eprintln!("    [step] N={n} i={i} done: slot-0 s_state[0] delta this step = {w:.6e} at head={head} row={} col={} old={} new={} slot1_now={}",
+                        rem / vdd, rem - (rem / vdd) * vdd, prev0[fi], cur[fi], cur[per + fi]);
+                } else {
+                    eprintln!("    [step] N={n} i={i} done: slot-0 s_state[0] delta this step = 0.000000e0");
+                }
+                prev0 = cur;
+            }
         }
         drop(bufs);
+        let dec_tap = if tap { state_tap_take() } else { Vec::new() };
+        // Phase-8 bracket: second snapshot after the decode leg. If slot 0 changed between the
+        // two snapshots, the DECODE leg is the corruptor (writes outside slot 1). If slot 0 is
+        // stable but already differs from the mid-forward taps, the VERIFY corrupted its own
+        // commit after its last GDN-layer tap (the FA/logits tail).
+        if tap {
+            let mut rep = false;
+            for (li, s1) in snap_s1.iter().enumerate() {
+                let Some(s1) = s1 else { continue };
+                let s2 = self.dev.dtoh_sync_copy(state.s_state[li].as_ref().unwrap()).unwrap();
+                let per = s2.len() / 2;
+                let mut w = 0f32;
+                for j in 0..per { let dd = (s1[j] - s2[j]).abs(); if dd > w { w = dd; } }
+                if w > 0.0 {
+                    let ty = if matches!(self.cfg.layer_types.get(li), Some(LayerType::LinearAttention)) { "GDN" } else { "FA" };
+                    eprintln!("    [bracket] N={n} layer {li:>2} ({ty}): SLOT-0 s_state changed during the decode leg, worst={w:.6e}");
+                    rep = true;
+                }
+            }
+            if !rep { eprintln!("    [bracket] N={n}: slot-0 s_state STABLE across the decode leg (all layers)"); }
+        }
 
         // Compare slot 0 (verify path) vs slot 1 (decode path): s_state, conv_state, AND k/v cache.
         // All three must be ~0 for verify_forward to be a bit-identical stand-in for decode (the
         // lossless-MTP contract); s_state alone is insufficient.
-        let lin_nh = self.cfg.lin_num_v_heads; let kd = self.cfg.lin_k_dim; let vd = self.cfg.lin_v_dim;
-        let per_slot = lin_nh * kd * vd;
-        let conv_dim = self.cfg.key_dim()*2 + self.cfg.value_dim(); let ck = self.cfg.conv_kernel;
-        let per_slot_conv = conv_dim * ck;
-        let nkv = self.cfg.num_kv_heads;
-        // Packed modes: per-slot extents are the per-channel packed sizes (k8v4 K/V diverge);
-        // bf16: both are nkv*kv_stride*hd (the old value).
-        let per_slot_k = nkv * kv_stride * self.kv_k_elems_per_pos();
-        let per_slot_v = nkv * kv_stride * self.kv_v_elems_per_pos();
+        // TP: the state buffers are allocated at FULL head shape (the head-proof red zone), so the
+        // per-slot extent is each buffer's own half-length, not the global-config product.
+        let per_slot = state.s_state.iter().flatten().next().map(|b| b.len() / 2).unwrap_or(0);
+        let per_slot_conv = state.conv_state.iter().flatten().next().map(|b| b.len() / 2).unwrap_or(0);
+        let _ = self.cfg.num_kv_heads;
+        let _ = kv_stride;
         let mut worst_s = 0.0f32; let mut worst_conv = 0.0f32; let mut worst_kv = 0.0f32;
+        let mut per_layer: Vec<(usize, f32, f32, f32)> = Vec::new();
         for (li, lt) in self.cfg.layer_types.iter().enumerate() {
+            let (mut wl_s, mut wl_c, mut wl_k) = (0.0f32, 0.0f32, 0.0f32);
             match lt {
                 LayerType::LinearAttention => {
                     let s = self.dev.dtoh_sync_copy(state.s_state[li].as_ref().unwrap()).unwrap();
                     let c = self.dev.dtoh_sync_copy(state.conv_state[li].as_ref().unwrap()).unwrap();
-                    for j in 0..per_slot { let dd=(s[per_slot+j]-s[j]).abs(); if dd>worst_s{worst_s=dd;} }
-                    for j in 0..per_slot_conv { let dd=(c[per_slot_conv+j]-c[j]).abs(); if dd>worst_conv{worst_conv=dd;} }
+                    for j in 0..per_slot { let dd=(s[per_slot+j]-s[j]).abs(); if dd>worst_s{worst_s=dd;} if dd>wl_s {wl_s=dd;} }
+                    for j in 0..per_slot_conv { let dd=(c[per_slot_conv+j]-c[j]).abs(); if dd>worst_conv{worst_conv=dd;} if dd>wl_c {wl_c=dd;} }
                 }
                 LayerType::FullAttention => {
-                    let k = self.dev.dtoh_sync_copy(state.k_cache[li].as_ref().unwrap()).unwrap();
-                    let v = self.dev.dtoh_sync_copy(state.v_cache[li].as_ref().unwrap()).unwrap();
+                    let kb = state.k_cache[li].as_ref().unwrap();
+                    let vb = state.v_cache[li].as_ref().unwrap();
+                    let per_slot_k = kb.len() / 2;
+                    let per_slot_v = vb.len() / 2;
+                    let k = self.dev.dtoh_sync_copy(kb).unwrap();
+                    let v = self.dev.dtoh_sync_copy(vb).unwrap();
                     for j in 0..per_slot_k {
-                        let dk=(half::bf16::to_f32(k[per_slot_k+j])-half::bf16::to_f32(k[j])).abs(); if dk>worst_kv{worst_kv=dk;}
+                        let dk=(half::bf16::to_f32(k[per_slot_k+j])-half::bf16::to_f32(k[j])).abs(); if dk>worst_kv{worst_kv=dk;} if dk>wl_k {wl_k=dk;}
                     }
                     for j in 0..per_slot_v {
-                        let dv=(half::bf16::to_f32(v[per_slot_v+j])-half::bf16::to_f32(v[j])).abs(); if dv>worst_kv{worst_kv=dv;}
+                        let dv=(half::bf16::to_f32(v[per_slot_v+j])-half::bf16::to_f32(v[j])).abs(); if dv>worst_kv{worst_kv=dv;} if dv>wl_k {wl_k=dv;}
                     }
                 }
             }
+            per_layer.push((li, wl_s, wl_c, wl_k));
         }
         eprintln!("    [probe] N={}  s_state={}, conv_state={}, kv_cache={}", n, worst_s, worst_conv, worst_kv);
+        if tap {
+            for (li, ws, wc, wk) in &per_layer {
+                if *ws > 0.0 || *wc > 0.0 || *wk > 0.0 {
+                    let ty = if matches!(self.cfg.layer_types.get(*li), Some(LayerType::LinearAttention)) { "GDN" } else { "FA" };
+                    eprintln!("    [state-diff] N={n} layer {li:>2} ({ty}): s={ws:.4} conv={wc:.4} kv={wk:.4}");
+                }
+            }
+            // Per-layer residual compare: verify column t vs decode step t (the FIRST divergent
+            // layer+column localizes the F9 residual).
+            let vc: Vec<Vec<half::bf16>> = ver_tap.iter().find(|c| c.tag == "verify")
+                .map(|c| c.layers.clone()).unwrap_or_default();
+            let vg = ver_tap.iter().find(|c| c.tag == "verify").map(|c| c.gdn.clone()).unwrap_or_default();
+            let vs_s = ver_tap.iter().find(|c| c.tag == "verify").map(|c| c.s.clone()).unwrap_or_default();
+            let dc: Vec<&Vec<Vec<half::bf16>>> = dec_tap.iter().map(|c| &c.layers).collect();
+            let dg: Vec<&Vec<(Vec<half::bf16>, Vec<half::bf16>)>> = dec_tap.iter().map(|c| &c.gdn).collect();
+            let ds_s: Vec<&Vec<Vec<f32>>> = dec_tap.iter().map(|c| &c.s).collect();
+            eprintln!("    [tap] N={n}: verify record layers={} gdn={}; decode calls={} (layers0={} gdn0={})",
+                vc.len(), vg.len(), dc.len(), dc.first().map(|l| l.len()).unwrap_or(0), dg.first().map(|g| g.len()).unwrap_or(0));
+            if !vc.is_empty() && dc.len() == n {
+                for (li, vl) in vc.iter().enumerate() {
+                    let (mut wl, mut wt, mut wi) = (0f32, 0usize, 0usize);
+                    let mut first: Option<(usize, usize, f32, f32)> = None;
+                    for t in 0..n {
+                        let dl = &dc[t][li];
+                        for i in 0..h {
+                            let a = half::bf16::to_f32(vl[t * h + i]);
+                            let b = half::bf16::to_f32(dl[i]);
+                            let dd = (a - b).abs();
+                            if dd > wl { wl = dd; wt = t; wi = i; }
+                            if dd > 0.0 && first.is_none() { first = Some((t, i, a, b)); }
+                        }
+                    }
+                    if wl > 0.0 {
+                        let ty = if matches!(self.cfg.layer_types.get(li), Some(LayerType::LinearAttention)) { "GDN" } else { "FA" };
+                        eprintln!("    [resid-diff] N={n} layer {li:>2} ({ty}): worst={wl:.6e} at col={wt} elem={wi}{}",
+                            first.map(|(t, i, a, b)| format!(" first=col{t} elem{i} verify={a:.6e} decode={b:.6e}"))
+                                 .unwrap_or_default());
+                    }
+                }
+                // Post-delta S compare (n<=4): verify's slot-0 committed state vs decode step t's
+                // slot-1 committed state, per GDN layer, with (head,row,col) localization.
+                let lin_nh = self.eff_lin_v_heads();
+                let (kdd, vdd) = (self.cfg.lin_k_dim, self.cfg.lin_v_dim);
+                let ext = lin_nh * kdd * vdd;
+                for (gi, vss) in vs_s.iter().enumerate() {
+                    for t in 0..n {
+                        let dss = match ds_s.get(t).and_then(|s| s.get(gi)) {
+                            Some(x) => x, None => continue,
+                        };
+                        if vss.len() < 2 * ext || dss.len() < 2 * ext { continue; }
+                        let (mut w, mut fi) = (0f32, 0usize);
+                        for i in 0..ext {
+                            let a = vss[i];
+                            let b = dss[ext + i];
+                            let dd = (a - b).abs();
+                            if dd > w { w = dd; fi = i; }
+                        }
+                        if w > 0.0 {
+                            let head = fi / (kdd * vdd);
+                            let rem = fi - head * kdd * vdd;
+                            let row = rem / vdd;
+                            let col = rem - row * vdd;
+                            eprintln!("    [s-diff] N={n} gdn#{gi:>2} after-col={t}: worst={w:.6e} at head={head} row={row} col={col} (verify={} decode={})",
+                                vss[fi], dss[ext + fi]);
+                        }
+                    }
+                }
+                let conv_dim = self.eff_conv_dim();
+                let lin_nh = self.eff_lin_v_heads();
+                let vd = self.cfg.lin_v_dim;
+                for (gi, (vconvo, vcore)) in vg.iter().enumerate() {
+                    // Decode call t holds column t's row 0 (width-1 forwards): its conv rows are the
+                    // first conv_dim entries of the (possibly mtot-pitched) tap buffer.
+                    for t in 0..n {
+                        let (dconvo, dcore) = match dg.get(t).and_then(|g| g.get(gi)) {
+                            Some(x) => x, None => continue,
+                        };
+                        let (mut wc, mut wcc) = (0f32, 0f32);
+                        let mut fc: Option<(usize, f32, f32)> = None;
+                        for c in 0..conv_dim.min(dconvo.len()) {
+                            let a = half::bf16::to_f32(vconvo[t * conv_dim + c]);
+                            let b = half::bf16::to_f32(dconvo[c]);
+                            let dd = (a - b).abs();
+                            if dd > wc { wc = dd; }
+                            if dd > 0.0 && fc.is_none() { fc = Some((c, a, b)); }
+                        }
+                        for i in 0..(lin_nh * vd).min(dcore.len()) {
+                            let a = half::bf16::to_f32(vcore[t * lin_nh * vd + i]);
+                            let b = half::bf16::to_f32(dcore[i]);
+                            let dd = (a - b).abs();
+                            if dd > wcc { wcc = dd; }
+                        }
+                        if wc > 0.0 || wcc > 0.0 {
+                            eprintln!("    [gdn-diff] N={n} gdn#{gi:>2} col={t}: convo={wc:.6e}{} core={wcc:.6e}",
+                                fc.map(|(c, a, b)| format!(" (first ch{c} verify={a:.6e} decode={b:.6e})")).unwrap_or_default());
+                        }
+                    }
+                }
+            } else if !vc.is_empty() {
+                eprintln!("    [resid-diff] N={n}: tap pairing skipped (verify layers={}, decode calls={})", vc.len(), dc.len());
+            }
+        }
         worst_s
     }
 
@@ -12670,6 +14150,13 @@ impl GpuModel {
     /// lives in a dedicated slot). KV cache is NOT copied: verify overwrites stale KV positions, so
     /// no KV rollback is needed.
     pub fn copy_gdn_slot(&self, state: &BatchGpuState, src: usize, dst: usize) {
+        // Slot bounds: this is a raw pointer/offset copy into the slot band, so an out-of-range slot
+        // silently reads/writes a neighbouring allocation. The block lanes roll back to
+        // `mtp_snapshot_slot + nacc`, whose upper bound is set by the verify WIDTH (P14: block 16 ⇒
+        // nacc ≤ 14 ⇒ slot ≤ 15), so the band must be sized for the widest source too.
+        assert!(src < state.state_slots && dst < state.state_slots,
+                "copy_gdn_slot out of range: src {src} dst {dst}, state has {} GDN state slots",
+                state.state_slots);
         // Route through the COMPUTE stream (async) so the snapshot/restore is stream-ordered with
         // the verify/reverify GDN writes (all on self.stream) — no cross-stream race with the
         // device's default stream.
@@ -14680,6 +16167,99 @@ impl GpuModel {
         (n, mism)
     }
 
+    /// P11 (BATCHED_MTP P1): the PACK gate — same byte oracle as `bench_lanes`, at the production
+    /// pack widths p = 2..=5. The 2-lane gate cannot see take=3/4/5 (AGENTS §3's self-consistency
+    /// blind spot: a path can be internally consistent and still wrong for the shape that ships).
+    /// Per-lane depth uses the PRODUCTION allocator (MAX_VERIFY/p − 1, capped by the policy depth
+    /// cap), and every lane's per-column logits must stay bit-equal to running that lane alone.
+    /// Returns (columns, bit_mismatches).
+    pub fn bench_lanes_pack(&self, pool: &mut Pool, state: &mut BatchGpuState,
+                            prompts: &[&[u32]], kv_stride: usize, depth_cap: usize) -> (usize, usize) {
+        let vocab = self.cfg.vocab_size;
+        let h = self.cfg.hidden_size;
+        let ck = self.cfg.conv_kernel;
+        let p = prompts.len();
+        assert!((2..=5).contains(&p), "pack gate covers the production take range 2..=5 (got {p})");
+        let depth = ((MAX_VERIFY / p).saturating_sub(1)).clamp(1, depth_cap.max(1));
+        assert!(p * depth <= MAX_VERIFY, "forest pack p={p} d={depth} exceeds MAX_VERIFY {MAX_VERIFY}");
+
+        // Prefill lane i -> slot i; snapshot each GDN state to scratch slot p + i.
+        let plen_l: Vec<usize> = prompts.iter().map(|s| s.len()).collect();
+        let mut comms = Vec::with_capacity(p);
+        for (i, pr) in prompts.iter().enumerate() {
+            self.zero_slot_state(state, i, kv_stride);
+            let (c, hb) = self.prefill_batch(pool, pr, state, i, kv_stride, 0);
+            pool.release_bf16(hb, h * plen_l[i]);
+            comms.push(c);
+        }
+        for i in 0..p { self.copy_gdn_slot(state, i, p + i); }
+
+        // Distinct synthetic drafts per lane (the oracle only needs them equal across runs).
+        let toks: Vec<Vec<u32>> = (0..p).map(|lane| {
+            let drafts = (0..depth - 1)
+                .map(|i| (((lane + 1) * (i * 131 + 7) + 23) % (vocab - 1) + 1) as u32)
+                .collect::<Vec<_>>();
+            std::iter::once(comms[lane]).chain(drafts.iter().copied()).collect()
+        }).collect();
+
+        // FOREST topo: p chains of `depth` columns each — exactly the production mtp_forest_step
+        // layout (lane-local positions, per-column slot routing, per-lane prefix boundary).
+        let n = p * depth;
+        let mut tokens: Vec<u32> = Vec::with_capacity(n);
+        let mut parent = vec![-1i32; n];
+        let mut slotv = vec![0i32; n];
+        let mut rope = vec![0i32; n];
+        let mut kv_pos = vec![0i32; n];
+        let mut cps = vec![0i32; n];
+        let mut path = vec![0u8; n * MAX_VERIFY];
+        let mut winsrc = vec![0i32; n * ck];
+        for lane in 0..p {
+            let base = lane * depth;
+            tokens.extend_from_slice(&toks[lane]);
+            let plen = plen_l[lane];
+            for r in 0..depth {
+                let c = base + r;
+                parent[c] = if r == 0 { -1 } else { (c - 1) as i32 };
+                slotv[c] = lane as i32;
+                rope[c] = (plen + r) as i32;
+                kv_pos[c] = (plen + r) as i32;
+                cps[c] = plen as i32;
+                for dd in 0..=r { path[c * MAX_VERIFY + dd] = dd as u8; }
+                for j in 0..ck {
+                    let wd = r as i32 - (ck as i32 - 1) + j as i32;
+                    winsrc[c * ck + j] = if wd < 0 { wd } else { base as i32 + wd };
+                }
+            }
+        }
+        let topo = TreeTopo { rope, kv_pos, parent, path, winsrc, slot: Some(slotv), col_pos_start: Some(cps) };
+        let pos_start_max = *plen_l.iter().max().unwrap();
+
+        // Packed forest verify with every lane restored from its snapshot.
+        for i in 0..p { self.copy_gdn_slot(state, p + i, i); }
+        let (pl, pr) = self.verify_forward_core_topo(pool, &tokens, state, 0, kv_stride, pos_start_max, None, Some(&topo), false, false);
+        let pl = pl.into_b16();
+        self.sync_stream();
+        let packed: Vec<half::bf16> = self.dev.dtoh_sync_copy(&pl).unwrap();
+        pool.release_bf16(pl, vocab * n); pool.release_bf16(pr, h * n);
+
+        // Each lane ALONE, from its own restored committed state and pos_start.
+        let mut mism = 0usize;
+        for lane in 0..p {
+            self.copy_gdn_slot(state, p + lane, lane);
+            let (al, ar) = self.verify_forward_core(pool, &toks[lane], state, lane, kv_stride, plen_l[lane], None, false);
+            let al = al.into_b16();
+            self.sync_stream();
+            let alone: Vec<half::bf16> = self.dev.dtoh_sync_copy(&al).unwrap();
+            pool.release_bf16(al, vocab * depth); pool.release_bf16(ar, h * depth);
+            for r in 0..depth {
+                let pp = &packed[(lane * depth + r) * vocab..(lane * depth + r + 1) * vocab];
+                let aa = &alone[r * vocab..(r + 1) * vocab];
+                if pp.iter().map(|x| x.to_bits()).ne(aa.iter().map(|x| x.to_bits())) { mism += 1; }
+            }
+        }
+        (n, mism)
+    }
+
     /// Step-3a end-to-end gate: verify + accept-walk + KV compaction on a planted fork whose SECOND
     /// branch carries the target's own greedy continuation (so it is fully accepted) and whose FIRST
     /// branch is a decoy (rejected at depth 1). Checks: (a) the accepted path is the decoy's sibling
@@ -15133,6 +16713,9 @@ impl GpuModel {
                 pool.release_bf16(m, h);
                 cur_tok = self.argmax_hidden(pool, &cur_hidden) as i32;
                 drafts.push(cur_tok as u32);
+            if std::env::var("GB10_MTP_GARBAGE_DRAFT").is_ok() {
+                for d in drafts.iter_mut() { *d = (*d).wrapping_add(1); }
+            }
                 total_drafts += 1;
             }
 
@@ -15143,14 +16726,21 @@ impl GpuModel {
             // BOTH accept/reject cases (the old reverify's hidden was identical), so it is reused.
             let mut verify_input = vec![committed_tok];
             verify_input.extend(drafts.iter().copied());
+            let mut f9_div_count: Option<usize> = None;
             let (preds, vout) = self.verify_forward(pool, &verify_input, state, 0, kv_stride, main_pos, Some(2), None);
+            let (vhs, vcall): (Vec<u64>, usize) = if f9_xhash_active() {
+                match F9XHASH.lock().unwrap().last().filter(|(l, _, _, _)| *l == 1u8) {
+                    Some((_, c, _, hs)) => (hs.clone(), *c),
+                    None => (Vec::new(), usize::MAX),
+                }
+            } else { (Vec::new(), usize::MAX) };
 
             // ---- Accept longest prefix (committed_tok already emitted, don't re-emit). ----
             let mut nacc = 0usize;
             while nacc < drafts.len() && preds[nacc] == drafts[nacc] { nacc += 1; }
-            if std::env::var("GB10_ACCEPT_DEBUG").is_ok() && n_steps <= 4 {
-                eprintln!("  [accept-dbg] step {n_steps} committed={committed_tok} drafts={drafts:?} preds[0..3]={:?} nacc={nacc}",
-                          &preds[..preds.len().min(3)]);
+            if std::env::var("GB10_ACCEPT_DEBUG").is_ok() && (n_steps <= 4 || nacc < drafts.len()) {
+                eprintln!("  [accept-dbg] step {n_steps} emitted_so_far={} committed={committed_tok} drafts={drafts:?} preds[0..3]={:?} nacc={nacc}",
+                          mtp_tokens.len(), &preds[..preds.len().min(3)]);
             }
             let bonus = preds[nacc];
             let emitted_count_before = mtp_tokens.len();
@@ -15187,12 +16777,54 @@ impl GpuModel {
             // ---- Lockstep greedy check on slot 1: decode one token per emitted MTP token. ----
             // Timed separately: this IS the sequential baseline, and it is not part of the MTP step.
             let seq_t0 = std::time::Instant::now();
-            for &_emt in &mtp_tokens[emitted_count_before..] {
+            for (li, &_emt) in mtp_tokens[emitted_count_before..].iter().enumerate() {
+                if std::env::var("GB10_ACCEPT_DEBUG").is_ok() && li == 0 && n_steps > 0 {
+                    // (debug aid) nothing yet — mismatch checked after the decode below
+                }
                 let tok = *seq_tokens.last().unwrap() as i32;
                 self.dev.htod_sync_copy_into(&vec![tok, 0], &mut bufs2.tokens_dev).unwrap();
                 self.dev.htod_sync_copy_into(&vec![spos as i32, 0], &mut bufs2.pos_dev).unwrap();
                 self.dev.synchronize().unwrap();
                 let next = self.forward_decode(pool, &mut bufs2, state, kv_stride, spos + 1, 1);
+                if f9_xhash_active() && !vhs.is_empty() {
+                    let dcall_now = F9X_CUR.with(|c| c.get());
+                    let dh = F9XHASH.lock().unwrap().last().filter(|(l, c, _, _)| *l == 0u8 && *c == dcall_now).map(|(_, _, _, hs)| hs[0]);
+                    let p_abs = mtp_tokens.len() + li;
+                    match (vhs.get(li), dh) {
+                        (Some(v), Some(d)) if v != &d => {
+                            eprintln!("  [f9x] HIDDEN DIVERGE at abs pos {p_abs} (step {n_steps} col {li}): verify 0x{v:016x} decode 0x{d:016x}");
+                            *f9_div_count.get_or_insert_with(|| 0usize) += 1;
+                            if f9_div_count.unwrap() == 1
+                               && std::env::var("GB10_F9_XHASH").as_deref() == Ok("2") {
+                                let ring = F9XHASH.lock().unwrap();
+                                let dcall_now = F9X_CUR.with(|c| c.get());
+                                // call-id-tagged windows (robust to finals interleaving).
+                                {
+                                    let dec: Vec<(usize, &Vec<u64>)> = ring.iter()
+                                        .filter(|(l, c, _, _)| *l == 10u8 && *c == dcall_now).map(|(_, _, li2, hs)| (*li2, hs)).collect();
+                                    let ver: Vec<(usize, &Vec<u64>)> = ring.iter()
+                                        .filter(|(l, c, _, _)| *l == 11u8 && *c == vcall).map(|(_, _, li2, hs)| (*li2, hs)).collect();
+                                    eprintln!("  [f9x-L] windows: dec={} ver={} layers (dcall {dcall_now} vcall {vcall})", dec.len(), ver.len());
+                                    let dm: std::collections::BTreeMap<usize, &Vec<u64>> = dec.into_iter().collect();
+                                    let mut printed = 0;
+                                    for (lix, vh) in &ver {
+                                        if let Some(dh) = dm.get(lix) {
+                                            let dv = vh.get(li).copied().unwrap_or(0) != dh[0];
+                                            let c0v = vh.first().copied().unwrap_or(0) != dh[0];
+                                            if (dv || c0v) && printed < 6 {
+                                                let cls = if lix % 4 == 3 {"FA "} else {"GDN"};
+                                                eprintln!("  [f9x-L] layer divergence L{lix} ({cls}): col{li} {} col0 {}",
+                                                    if dv {"DIFF"} else {"same"}, if c0v {"DIFF"} else {"same"});
+                                                printed += 1;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
                 seq_tokens.push(next[0]);
                 spos += 1;
             }
@@ -15439,7 +17071,7 @@ impl GpuModel {
     ///   3. accepted span [start, start+nacc] taps (from the verify's staging scratch) append to
     ///      the ctx feature; advance start += nacc + 1.
     pub fn tp_generate_dflash(&self, prompt: &[u32], max_new: usize, max_seq_len: usize) -> Vec<u32> {
-        use crate::dflash::{DflashDrafter, DflashKv, NCTX_LAYERS, BLOCK};
+        use crate::dflash::{DflashDrafter, DflashKv};
         let v = self.cfg.vocab_size;
         let h = self.cfg.hidden_size;
         let eos = self.cfg.eos_token_id;
@@ -15448,32 +17080,34 @@ impl GpuModel {
         let mut pool = Pool::new(self.dev.clone());
         // 2 + BLOCK state slots: 0 = the lane; 2..=2+BLOCK-2 = the 8-column verify's per-column
         // GDN checkpoints (an N-column verify with a checkpoint at slot 2 touches 2..=2+N-2).
-        let mut state = self.new_batch_state(1, 2 + BLOCK, max_seq_len);
+        let mut state = self.new_batch_state(1, 2 + crate::dflash::MAX_BLOCK, max_seq_len);
         let mut bufs = self.new_decode_buffers(1);
 
         // ---- rank 0: drafter + persistent KV + its pool + the ctx feature buffer ----
-        let dflash_dir = std::env::var("GB10_DFLASH_DIR").unwrap_or_default();
+        let dflash_dir = crate::draft_dir_env().unwrap_or_default();
         let mut drafter: Option<DflashDrafter> = None;
         let mut dkv: Option<DflashKv> = None;
         let mut dpool: Option<Pool> = None;
-        let mut feature: Option<cudarc::driver::CudaSlice<half::bf16>> = None; // [5h, max_seq_len]
-        let mut mask = 120023u32; // dflash_config.mask_token_id
+        let mut feature: Option<cudarc::driver::CudaSlice<half::bf16>> = None; // [nctx*h, max_seq_len]
+        let mut mask = 0u32;   // from the artifact's dflash_config.mask_token_id (never guessed)
+        let mut dblock = 0usize; // the artifact's block_size (draft width AND verify width)
         if is_head {
             // No default path (owner rule 2026-08-23): the DFlash (Hy3) drafter dir MUST be
-            // supplied via GB10_DFLASH_DIR — a missing var stops the load loudly.
+            // supplied via the drafter-dir env knob — a missing var stops the load loudly.
             if dflash_dir.is_empty() {
-                panic!("FATAL: GB10_DFLASH_DIR is REQUIRED for the DFlash (Hy3) drafter — no default path exists");
+                panic!("FATAL: no drafter dir — set --draft-dir / GB10_DRAFT_DIR for the DFlash (Hy3) drafter; there is no default path");
             }
             let dir = &dflash_dir;
-            let draf = DflashDrafter::load_from_dir(std::path::Path::new(dir), max_seq_len + BLOCK)
+            let draf = DflashDrafter::load_from_dir(std::path::Path::new(dir), max_seq_len + crate::dflash::MAX_BLOCK)
                 .expect("dflash drafter load");
             mask = draf.mask_token_id;
-            let dk = DflashKv::new(&draf, max_seq_len + BLOCK);
+            dblock = draf.block;
+            let dk = DflashKv::new(&draf, max_seq_len + dblock);
             let dp = Pool::new(draf.dev.clone());
-            let feat = self.dev.alloc_zeros::<half::bf16>(NCTX_LAYERS * h * max_seq_len).unwrap();
-            eprintln!("[dflash] rank 0: drafter {} layers h={} mask={} rope_theta={} | feature \
+            let feat = self.dev.alloc_zeros::<half::bf16>(draf.nctx * h * max_seq_len).unwrap();
+            eprintln!("[dflash] rank 0: drafter {} layers h={} mask={} rope_theta={} block={} | feature \
                        [{} x {}, {}] | kv stride {}", draf.layers.len(), draf.h, mask, draf.rope_theta,
-                      NCTX_LAYERS, h, max_seq_len, max_seq_len + BLOCK);
+                      dblock, draf.nctx, h, max_seq_len, max_seq_len + dblock);
             drafter = Some(draf); dkv = Some(dk); dpool = Some(dp); feature = Some(feat);
         }
 
@@ -15511,13 +17145,14 @@ impl GpuModel {
         if let Some(feat) = &feature {
             if let Ok(p) = std::env::var("GB10_DFLASH_TAPDUMP") {
                 let fh: Vec<half::bf16> = self.dev.dtoh_sync_copy(feat).unwrap();
-                let mut out = Vec::with_capacity(12 + 4 * plen * NCTX_LAYERS * h);
+                let nctx = drafter.as_ref().map(|d| d.nctx).unwrap_or(0);
+                let mut out = Vec::with_capacity(12 + 4 * plen * nctx * h);
                 out.extend_from_slice(b"DFCT");
                 out.extend_from_slice(&1u32.to_le_bytes());
                 out.extend_from_slice(&(plen as u32).to_le_bytes());
                 out.extend_from_slice(&1u32.to_le_bytes());
                 for pos in 0..plen {
-                    for li in 0..NCTX_LAYERS {
+                    for li in 0..nctx {
                         for i in 0..h {
                             let x = fh[(li * h + i) * max_seq_len + pos];
                             out.extend_from_slice(&x.to_f32().to_le_bytes());
@@ -15525,16 +17160,17 @@ impl GpuModel {
                     }
                 }
                 std::fs::write(&p, &out).unwrap();
-                eprintln!("[dflash] tapdump {} (plen {} x {} x {})", p, plen, NCTX_LAYERS, h);
+                eprintln!("[dflash] tapdump {} (plen {} x {} x {})", p, plen, nctx, h);
                 // ALSO dump the staging scratch (last prefill forward's taps, [BLOCK, 5h] rows):
                 // the feature only shows what survived the copy; the scratch shows what the taps wrote.
                 let sp = format!("{}.scratch", p);
                 let tap = self.dflash_tap.as_ref().unwrap();
                 let sh: Vec<half::bf16> = self.dev.dtoh_sync_copy(&tap.scratch).unwrap();
-                let mut sb = Vec::with_capacity(4 + 4 * NCTX_LAYERS * h * crate::dflash::BLOCK);
+                let nctx = drafter.as_ref().map(|d| d.nctx).unwrap_or(0);
+                let mut sb = Vec::with_capacity(4 + 4 * nctx * h * crate::dflash::MAX_BLOCK);
                 for x in &sh { sb.extend_from_slice(&x.to_f32().to_le_bytes()); }
                 std::fs::write(&sp, &sb).unwrap();
-                eprintln!("[dflash] scratch dump {} ({} rows x {} cols)", sp, crate::dflash::BLOCK, NCTX_LAYERS * h);
+                eprintln!("[dflash] scratch dump {} ({} rows x {} cols)", sp, crate::dflash::MAX_BLOCK, nctx * h);
             }
         }
 
@@ -15545,7 +17181,7 @@ impl GpuModel {
         let mut committed = last;                    // t_start: the block's first token
         let mut start = plen;                        // block's first position == ctx length
         let mut block = vec![committed];
-        block.extend(std::iter::repeat(mask).take(BLOCK - 1));
+        block.extend(std::iter::repeat(mask).take(dblock - 1));
         let (mut drafts_total, mut accepted_total, mut n_steps) = (0usize, 0usize, 0usize);
         let t0 = std::time::Instant::now();
         let mut step_no = 0u64;
@@ -15553,7 +17189,7 @@ impl GpuModel {
             step_no += 1;
             n_steps += 1;
             // ---- 1. draft (rank 0 only): block forward over the [5h, start] ctx feature ----
-            let mut drafts = vec![0u32; BLOCK - 1];
+            let mut drafts = vec![0u32; dblock - 1];
             if is_head {
                 // The tap D2D copies are queued on the ENGINE stream; the drafter runs on its own
                 // stream — drain the engine stream so the feature is complete before the drafter
@@ -15563,7 +17199,8 @@ impl GpuModel {
                 let dk = dkv.as_mut().unwrap();
                 let dp = dpool.as_mut().unwrap();
                 let feat = feature.as_ref().unwrap();
-                let ctx_view = feat.slice(..NCTX_LAYERS * h * start);
+                let nctx = draf.nctx;
+                let ctx_view = feat.slice(..nctx * h * start);
                 let logits = draf.forward(dp, dk, &ctx_view, start, &block, start,
                                           Some(self.embed.bf16()), self.dflash_lm_head.as_ref())
                     .expect("dflash block forward");
@@ -15574,7 +17211,7 @@ impl GpuModel {
                     let mut f = std::io::BufWriter::new(std::fs::File::create("/tmp/b3_draft_dbg.txt").unwrap());
                     use std::io::Write;
                     writeln!(f, "top1 all 8: {}", top1.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(",")).unwrap();
-                    for b in 0..BLOCK {
+                    for b in 0..dblock {
                         let col = &logits[b * draf.vocab..(b + 1) * draf.vocab];
                         let mut best = 0usize;
                         for (t, &x) in col.iter().enumerate() { if x > col[best] { best = t; } }
@@ -15590,10 +17227,10 @@ impl GpuModel {
             // wire frame are the gen tag, leaving exactly BLOCK-1 usable u32s). The exchange is a
             // SWAP: each side receives the PEER's payload — the head sent its real drafts and the
             // node sent zeros, so the node adopts the received drafts and the head keeps its own.
-            let recv = crate::net::exchange_u32s(&drafts, BLOCK + 1).expect("dflash draft exchange");
+            let recv = crate::net::exchange_u32s(&drafts, dblock + 1).expect("dflash draft exchange");
             if !is_head { drafts = recv; }
             // ---- 3. verify [committed, drafts...] at positions [start, start+8) ----
-            let mut vinput = Vec::with_capacity(BLOCK);
+            let mut vinput = Vec::with_capacity(dblock);
             vinput.push(committed);
             vinput.extend_from_slice(&drafts);
             let (preds, vout) = self.verify_forward(&mut pool, &vinput, &mut state, 0, max_seq_len,
@@ -15605,12 +17242,12 @@ impl GpuModel {
             while nacc < drafts.len() && preds[nacc] == drafts[nacc] { nacc += 1; }
             let bonus = preds[nacc];
             // GDN rollback to the last accepted column (full accept needs none).
-            if nacc + 1 != BLOCK { self.copy_gdn_slot(&state, 2 + nacc, 0); }
+            if nacc + 1 != dblock { self.copy_gdn_slot(&state, 2 + nacc, 0); }
             let emitted_before = out_tokens.len();
             for &d in drafts.iter().take(nacc) { out_tokens.push(d); }
             if out_tokens.len() < max_new { out_tokens.push(bonus); }
             accepted_total += nacc;
-            drafts_total += BLOCK - 1;
+            drafts_total += dblock - 1;
             eprintln!("[dflash] step {step_no}: start={start} block0={committed} drafts={} \
                        nacc={nacc} bonus={bonus}", drafts.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(","));
             // ---- 5. rank 0: accepted span taps (staging cols 0..=nacc) -> feature ----
@@ -15626,7 +17263,7 @@ impl GpuModel {
             for &t in &out_tokens[emitted_before..] { if t == eos { hit_eos = true; break; } }
             if hit_eos {
                 if let Some(pos) = out_tokens.iter().position(|&t| t == eos) { out_tokens.truncate(pos + 1); }
-                pool.release_bf16(vout, h * BLOCK);
+                pool.release_bf16(vout, h * dblock);
                 break;
             }
             // ---- 7. lockstep agreement guard (TP invariant 10): same (step, count, hash) on both
@@ -15637,8 +17274,8 @@ impl GpuModel {
             // B8/G1: the verify WIDTH joins the extended token (k_verify = BLOCK here). agree_ext
             // folds it into bits [27..31), so fold the local hash the same way before comparing —
             // raw-vs-folded mismatches by exactly (BLOCK<<27) otherwise.
-            let hsh_ext = (hsh ^ ((BLOCK as u32 & 0xF) << 27)) as u32;
-            match crate::net::agree_ext(step_no, cnt, BLOCK as u8, hsh) {
+            let hsh_ext = (hsh ^ ((dblock as u32 & 0xF) << 27)) as u32;
+            match crate::net::agree_ext(step_no, cnt, dblock as u8, hsh) {
                 Some((pc, ph)) if pc == cnt && ph == hsh_ext => {}
                 Some((pc, ph)) => {
                     crate::net::abort_link();
@@ -15650,7 +17287,7 @@ impl GpuModel {
                     panic!("[dflash] TP agree: link aborted or peer timeout at step {step_no} — divergence would be silent");
                 }
             }
-            pool.release_bf16(vout, h * BLOCK);
+            pool.release_bf16(vout, h * dblock);
         }
         if is_head {
             let dt = t0.elapsed().as_secs_f64().max(1e-6);
@@ -15663,11 +17300,296 @@ impl GpuModel {
         out_tokens
     }
 
-    /// E29-B3: D2D (compute stream) copy of the first `ncols` columns of the DFlash tap staging
-    /// scratch — this forward's taps, layer-major [5*h, ncols] — into the ctx feature buffer at
-    /// column `fpos`. Rank 0 only (the sink exists only there). No dtoh in the loop.
-    fn dflash_tap_to_feature(&self, feat: &cudarc::driver::CudaSlice<half::bf16>, fpos: usize, ncols: usize) {
-        let nctx = crate::dflash::NCTX_LAYERS;
+    /// P14 — DFlash v1 greedy generation, single process (the lane's reference loop; the batch
+    /// scheduler runs the same primitives on its own state/pool). Semantics are the z-lab
+    /// `dflash_generate` greedy path: a block `[committed, mask x (block-1)]` is drafted from the
+    /// target's hidden states, the trunk verifies `[committed, drafts...]`, the longest agreeing
+    /// prefix is accepted and the target's own argmax is the bonus — so the emitted chain IS plain
+    /// greedy by construction (every emitted token is a trunk argmax).
+    ///
+    /// `dump_prefix` (optional) writes `<prefix>.dfct` + `<prefix>.tokens.json` — the real-tap
+    /// oracle input for ~/recipe_launch/p14/ref/run_ref.py (AGENTS §3: a wrong-but-self-consistent
+    /// drafter passes every in-mode gate, so the drafts must be diffed against the reference on
+    /// REAL activations).
+    pub fn dflash_generate_local(&self, dir: &str, prompt: &[u32], max_new: usize,
+                                 max_seq_len: usize, dump_prefix: Option<&str>) -> Vec<u32> {
+        use crate::dflash::{DflashDrafter, DflashKv};
+        let h = self.cfg.hidden_size;
+        let v = self.cfg.vocab_size;
+        let eos = self.cfg.eos_token_id;
+        let plen = prompt.len();
+        assert!(plen + max_new + crate::dflash::MAX_BLOCK <= max_seq_len, "prompt+gen > max_seq_len");
+        let mut pool = Pool::new(self.dev.clone());
+        let mut state = self.new_batch_state(1, 2 + crate::dflash::MAX_BLOCK, max_seq_len);
+        let mut bufs = self.new_decode_buffers(1);
+
+        let mut draf = DflashDrafter::load_from_dir(std::path::Path::new(dir), max_seq_len + 16)
+            .expect("dflash drafter load (drafter dir)");
+        let nctx = draf.nctx;
+        let block = draf.block;
+        let mask = draf.mask_token_id;
+        let mut dkv = DflashKv::new(&draf, max_seq_len + crate::dflash::MAX_BLOCK);
+        let mut dpool = Pool::new(draf.dev.clone());
+        let feat = self.dev.alloc_zeros::<half::bf16>(nctx * h * max_seq_len).unwrap();
+        eprintln!("[dflash] local lane: {} layers h={} block={} mask={} nctx={} rope_theta={}",
+                  draf.layers.len(), draf.h, block, mask, nctx, draf.rope_theta);
+
+        // ---- prefill, token by token: the taps of every prompt position land in the ctx feature
+        // (a token-by-token prefill is the price of a per-position feature; the serving lane arms
+        // the WIDE sink and fills the feature in one chunked prefill instead). ----
+        let mut last = 0u32;
+        for (t, &tok) in prompt.iter().enumerate() {
+            let hidden = self.embed_batch(&[tok]);
+            let out = self.forward_batch(&mut pool, hidden, &[t], &mut state, max_seq_len, 1);
+            if t == plen - 1 {
+                let logits = self.logits_batch_f32(&mut pool, &out, 1);
+                blaunch!(self, "argmax_f32_b", (1u32,1,1), (1024,1,1), (1024*8),
+                    (*bufs.token_ids_dev.device_ptr() as u64, d(&logits), v as i32, 1i32));
+                self.sync_stream();
+                last = self.dev.dtoh_sync_copy(&bufs.token_ids_dev).unwrap()[0] as u32;
+                pool.release(logits, v);
+            }
+            self.dflash_tap_to_feature(&feat, t, 1);
+            pool.release_bf16(out, h);
+        }
+        let mut out_tokens: Vec<u32> = Vec::with_capacity(max_new + 1);
+        if last == eos { return out_tokens; }
+        out_tokens.push(last);
+        let mut start = plen;              // next block's first position == appended ctx columns
+        let mut committed = last;
+        let (mut pend_row0, mut pend_ncols) = (0usize, plen);   // the ctx span to append next
+        let (mut drafts_total, mut accepted_total, mut n_steps) = (0usize, 0usize, 0usize);
+        let mut block_toks = vec![committed];
+        block_toks.extend(std::iter::repeat(mask).take(block - 1));
+        let t0 = std::time::Instant::now();
+        while out_tokens.len() < max_new {
+            n_steps += 1;
+            // ---- 1. draft: append the pending ctx span (engine stream → sync first), block
+            // forward, then the TARGET's head over the block rows 1.. = the draft tokens ----
+            self.sync_stream();
+            let drafts = self.dflash_draft(&mut draf, &mut dkv, &mut dpool, &feat, nctx, h,
+                                                 pend_row0, pend_ncols, pend_row0, &block_toks);
+            if n_steps == 1 {
+                // Oracle: this step's exact drafter input (feature + block ids + the target's
+                // embedding rows) and the object the torch reference must reproduce (the final
+                // normalized hidden, i.e. everything before the LM head).
+                if let Some(pfx) = dump_prefix {
+                    eprintln!("[dflash-dbg] dump hidden begin");
+                    self.dflash_dump_hidden(&draf, block, pfx);
+                    eprintln!("[dflash-dbg] dump hidden done; embed begin");
+                    self.dflash_dump_embed(&[block_toks[0], mask], pfx);
+                    eprintln!("[dflash-dbg] dump embed done");
+                }
+            }
+            drafts_total += block - 1;
+            // ---- 2. verify [committed, drafts...] at positions [start, start+block) ----
+            let mut vinput = Vec::with_capacity(block);
+            vinput.push(committed);
+            vinput.extend_from_slice(&drafts);
+            let (preds, vout) = self.verify_forward(&mut pool, &vinput, &mut state, 0, max_seq_len,
+                                                     start, Some(2), None);
+            // ---- 3. accept the longest agreeing prefix; the bonus is the trunk's own argmax ----
+            let mut nacc = 0usize;
+            while nacc < drafts.len() && preds[nacc] == drafts[nacc] { nacc += 1; }
+            let bonus = preds[nacc];
+            if nacc + 1 != block { self.copy_gdn_slot(&state, 2 + nacc, 0); }
+            let before = out_tokens.len();
+            for &d in drafts.iter().take(nacc) { out_tokens.push(d); }
+            if out_tokens.len() < max_new { out_tokens.push(bonus); }
+            accepted_total += nacc;
+            eprintln!("[dflash] step {n_steps}: start={start} nacc={nacc} bonus={bonus} drafts={} \
+                       preds={} commit={committed}",
+                      drafts.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(","),
+                      preds[..drafts.len().min(preds.len())].iter().map(|t| t.to_string())
+                          .collect::<Vec<_>>().join(","));
+            // ---- 4. the verify's own tap capture wrote the span's features at their absolute
+            // positions; the next step appends [start, start+nacc+1) ----
+            self.dflash_tap_to_feature(&feat, start, nacc + 1);
+            pend_row0 = start;
+            pend_ncols = nacc + 1;
+            start += nacc + 1;
+            committed = bonus;
+            block_toks[0] = committed;
+            let mut hit_eos = false;
+            for &t in &out_tokens[before..] { if t == eos { hit_eos = true; break; } }
+            pool.release_bf16(vout, h * block);
+            if hit_eos {
+                if let Some(pos) = out_tokens.iter().position(|&t| t == eos) { out_tokens.truncate(pos + 1); }
+                break;
+            }
+        }
+        let dt = t0.elapsed().as_secs_f64().max(1e-6);
+        let acc = if drafts_total > 0 { accepted_total as f64 / drafts_total as f64 } else { 0.0 };
+        eprintln!("[dflash] LOCAL: {n_steps} steps, {} tokens ({:.2}/step), {:.2} ms/step, \
+                   {:.1} tok/s, acceptance {:.1}% ({accepted_total}/{drafts_total})",
+                  out_tokens.len(), out_tokens.len() as f64 / n_steps.max(1) as f64,
+                  dt * 1000.0 / n_steps.max(1) as f64, out_tokens.len() as f64 / dt, acc * 100.0);
+        if let Some(pfx) = dump_prefix {
+            self.dflash_dump_ctx(&feat, nctx, h, plen, &out_tokens, pfx);
+        }
+        out_tokens
+    }
+
+    /// One v1 draft: append ctx columns `[row0, row0+ncols)` (sourced from the feature columns
+    /// `[src_col0, src_col0+ncols)`), run the block forward, then run the TARGET's LM head over the
+    /// drafter's final hidden and argmax each column. Returns the block's rows 1.. (the drafts).
+    #[allow(clippy::too_many_arguments)]
+    pub fn dflash_draft(&self, draf: &mut crate::dflash::DflashDrafter, dkv: &mut crate::dflash::DflashKv,
+                          dpool: &mut Pool, feat: &cudarc::driver::CudaSlice<half::bf16>,
+                          nctx: usize, _h: usize, row0: usize, ncols: usize, src_col0: usize,
+                          block_toks: &[u32]) -> Vec<u32> {
+        let blk = block_toks.len();
+        let v = self.cfg.vocab_size;
+        let pos_start = row0 + ncols;
+        let src = feat.slice(src_col0 * nctx * _h..(src_col0 + ncols) * nctx * _h);
+        // The TARGET's embedding may be NVFP4-packed (the 35B's is), so the noise block must come
+        // from the engine's own embedding path — `W::bf16()` on a packed table is a loud panic by
+        // design (the legacy single-stream contract), not a path we may take here.
+        let noise = self.embed_batch(block_toks);
+        draf.forward_step(dpool, dkv, &src, ncols, row0, block_toks, pos_start,
+                          None::<&cudarc::driver::CudaSlice<half::bf16>>, Some(&noise))
+            .expect("dflash forward_step");
+        drop(noise);
+        let logits = self.logits_batch(dpool, &draf.last_hidden, blk);   // [v, blk] bf16
+        let ids = self.dev.alloc_zeros::<i32>(blk).unwrap();
+        // `argmax_b` indexes the BATCH by `blockIdx.x` (kernels/gpu_batch.cu:3261) — one block per
+        // column. A grid of (1,1,1) writes only column 0 and leaves the rest at their buffer
+        // contents, which presented as "every draft is token 0".
+        blaunch!(self, "argmax_b", (blk as u32,1,1), (1024,1,1), (1024*8),
+            (*ids.device_ptr() as u64, d(&logits), v as i32, blk as i32));
+        self.sync_stream();
+        let host = self.dev.dtoh_sync_copy(&ids).unwrap();
+        dpool.release_bf16(logits, v * blk);
+        host[1..].iter().map(|&t| t as u32).collect()
+    }
+
+    /// P14: absolute position of the next wide tap capture (see `DflashTapSink`).
+    pub fn set_dflash_wide_pos(&self, p: usize) {
+        if let Some(t) = &self.dflash_tap { if t.wide.is_some() { t.set_wide_pos(p); } }
+    }
+
+    /// P14: arm the wide ctx capture surface for the v1 lane (geometry from the artifact's config,
+    /// never assumed: the sink reads `nctx` from the same file).
+    pub fn arm_dflash_wide(&mut self, dir: &str, stride: usize) -> anyhow::Result<()> {
+        let cfg = crate::dflash::DflashCfg::load(std::path::Path::new(dir))?;
+        let h = self.cfg.hidden_size;
+        let buf = self.dev.alloc_zeros::<half::bf16>(cfg.nctx() * h * stride)?;
+        if self.dflash_tap.is_none() {
+            // The artifact can be installed AFTER the model load (the serving path resolves
+            // --spec-source at schedule time), so create the sink here when the load did not.
+            self.dflash_tap = Some(crate::dflash::DflashTapSink::new(
+                &self.dev, h, cfg.tap_layers.clone()));
+        }
+        match self.dflash_tap.as_mut() {
+            Some(t) => { t.arm_wide(buf, stride); eprintln!(
+                "[dflash] wide ctx surface armed: {} taps x h {} x {} positions", t.nctx, h, stride); }
+            None => anyhow::bail!("v1 tap sink could not be created"),
+        }
+        Ok(())
+    }
+
+    /// P14: D2D the wide ctx feature columns `[src_col, src_col+ncols)` into the lane's consumed
+    /// feature at `[dst_col, dst_col+ncols)` (both `[nctx*h, stride]` bf16).
+    pub fn dflash_feat_copy_at(&self, dst: &cudarc::driver::CudaSlice<half::bf16>,
+                               dst_col: usize, src_col: usize, ncols: usize) {
+        let t = self.dflash_tap.as_ref().expect("dflash wide sink");
+        let h = self.cfg.hidden_size;
+        let bytes = ncols * t.nctx * h * 2;
+        unsafe {
+            let r = cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+                *dst.device_ptr() as u64 + (dst_col * t.nctx * h * 2) as u64,
+                t.wide_ptr() + (src_col * t.nctx * h * 2) as u64,
+                bytes, self.stream.stream);
+            assert!(r == cudarc::driver::sys::CUresult::CUDA_SUCCESS, "dflash feat copy: {r:?}");
+        }
+    }
+
+    /// P14 oracle support: gather `ids`' embedding rows from the TARGET's embedding table (bf16)
+    /// and write them as JSON `{"ids": [...], "rows": [[f32 x h] ...]}`. The 35B drafter artifact
+    /// carries NO embedding of its own — the reference conditions on the target's — so the torch
+    /// oracle needs exactly the rows the engine's block gathered (≤ block unique ids, ~64 KB).
+    pub fn dflash_dump_embed(&self, ids: &[u32], prefix: &str) {
+        let h = self.cfg.hidden_size;
+        let n = ids.len();
+        // The TARGET's embedding may be NVFP4-packed (`W::bf16()` panics there by design): gather
+        // through the ENGINE's own embedding path, which is exactly the bytes the drafter conditions
+        // on. `rows` is [h, n] col-major.
+        let rows = self.embed_batch(ids);
+        let host: Vec<half::bf16> = self.dev.dtoh_sync_copy(&rows).unwrap();
+        let mut j = String::from("{\"ids\": [");
+        j.push_str(&ids.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(","));
+        j.push_str("], \"rows\": [");
+        for i in 0..n {
+            if i > 0 { j.push(','); }
+            j.push('[');
+            j.push_str(&host[i * h..(i + 1) * h].iter()
+                .map(|x| format!("{:.9e}", x.to_f32())).collect::<Vec<_>>().join(","));
+            j.push(']');
+        }
+        j.push_str("]}");
+        std::fs::write(format!("{prefix}.embed.json"), j).unwrap();
+        eprintln!("[dflash] embed rows for {:?} -> {prefix}.embed.json", ids);
+    }
+
+    /// P14 oracle support: write the drafter's final normalized hidden ([h, block] f32, the exact
+    /// input to the LM head) — the object the torch reference must reproduce bit-for-bit-ish.
+    pub fn dflash_dump_hidden(&self, draf: &crate::dflash::DflashDrafter, block: usize, prefix: &str) {
+        let h = draf.h;
+        let v: Vec<half::bf16> = self.dev.dtoh_sync_copy(&draf.last_hidden).unwrap();
+        let mut out = Vec::with_capacity(16 + 4 * h * block);
+        out.extend_from_slice(b"DFHL");
+        out.extend_from_slice(&1u32.to_le_bytes());
+        out.extend_from_slice(&(block as u32).to_le_bytes());
+        out.extend_from_slice(&(h as u32).to_le_bytes());
+        for x in &v[..h * block] { out.extend_from_slice(&x.to_f32().to_le_bytes()); }
+        std::fs::write(format!("{prefix}.hidden.bin"), &out).unwrap();
+        eprintln!("[dflash] drafter hidden [{} x {}] -> {prefix}.hidden.bin", h, block);
+    }
+
+    /// Write the ctx feature as a DFCT file (position-major, layer-major) — the oracle input for
+    /// ~/recipe_launch/p14/ref/run_ref.py — plus the emitted chain as tokens.json.
+    fn dflash_dump_ctx(&self, feat: &cudarc::driver::CudaSlice<half::bf16>, nctx: usize, h: usize,
+                       plen: usize, chain: &[u32], prefix: &str) {
+        let fh: Vec<half::bf16> = self.dev.dtoh_sync_copy(feat).unwrap();
+        // The oracle compares ONE step (the reference's `dflash_generate` first block): ctx = the
+        // whole prompt, block = [first emitted token, mask x (block-1)]. Longer chains would feed
+        // REAL tokens into the block, which the lane never does (its block is always mask-filled),
+        // so the dump keeps exactly the one generated token the block needs.
+        let cols = plen;
+        let chain = &chain[..chain.len().min(1)];
+        let mut out = Vec::with_capacity(16 + 4 * cols * nctx * h);
+        out.extend_from_slice(b"DFCT");
+        out.extend_from_slice(&1u32.to_le_bytes());
+        out.extend_from_slice(&(cols as u32).to_le_bytes());
+        out.extend_from_slice(&1u32.to_le_bytes());
+        for pos in 0..cols {
+            for li in 0..nctx {
+                for i in 0..h {
+                    let x = fh[(li * h + i) + pos * nctx * h];
+                    out.extend_from_slice(&x.to_f32().to_le_bytes());
+                }
+            }
+        }
+        std::fs::write(format!("{prefix}.dfct"), &out).unwrap();
+        let mut toks = Vec::with_capacity(plen + chain.len());
+        toks.extend_from_slice(&chain.to_vec());
+        let j = format!("{{\"plen\": {}, \"tokens\": [{}]}}", plen,
+                        toks.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(","));
+        std::fs::write(format!("{prefix}.tokens.json"), j).unwrap();
+        eprintln!("[dflash] dump: {prefix}.dfct ({cols} cols x {nctx} x {h}) + {prefix}.tokens.json");
+    }
+
+    /// E29-B3 / P14: D2D (compute stream) copy of the first `ncols` columns of the DFlash tap
+    /// staging scratch — this forward's taps, layer-major [nctx*h, ncols] — into the ctx feature
+    /// buffer at column `fpos`. Rank 0 only (the sink exists only there). No dtoh in the loop.
+    ///
+    /// The v1 SERVING lane calls this once per step with `ncols = nacc+1` to place the span the
+    /// verify just confirmed at its absolute ctx column: the verify's own capture writes the
+    /// POSITION-INDEPENDENT ring staging (a captured graph cannot bake a host-computed column), so
+    /// this copy is the only thing that fills the lane's ctx for positions ≥ plen. The single-process
+    /// probe reaches the same buffer through the same call at the same place.
+    pub fn dflash_tap_to_feature(&self, feat: &cudarc::driver::CudaSlice<half::bf16>, fpos: usize, ncols: usize) {
+        let nctx = self.dflash_tap.as_ref().map(|t| t.nctx).unwrap_or(0);
         let h = self.cfg.hidden_size;
         let tap = self.dflash_tap.as_ref().expect("dflash tap sink");
         let src = *tap.scratch.device_ptr() as u64;
@@ -17085,6 +19007,103 @@ impl GpuModel {
     }
 
 
+    /// DISPATCH_ASSERT (`PLAN/DISPATCH_ASSERT_SPEC.md` §3.3) — the two-legged dispatch probe.
+    ///
+    /// Leg A (the contract): for every N = 1..=MAX_VERIFY on real quantized weights the arm taken
+    /// must be the fixed-shape MMA arm. Two independent signals, because "no error" is not a pass
+    /// (AGENTS §3): the assert posture panics on any record that violates the invariant, AND this
+    /// leg requires the counter to *move* — if a width records nothing, the probe is blind and the
+    /// PASS is vacuous.
+    /// Leg B (the negative control, the part that makes Leg A mean something): ONE call at
+    /// `batch = MAX_VERIFY + 1` must observe the PREFILL arm. If it does not, the instrument
+    /// cannot see the cliff it exists to guard (spec §4 P0) and the probe FAILS.
+    pub fn probe_dispatch(&self) -> bool {
+        use crate::dispatch_assert as da;
+        let h = self.cfg.hidden_size;
+        let l0 = &self.layers[0];
+        let (mlp_ref, im) = match &l0.mlp {
+            Ffn::Dense(m) => (m, self.cfg.intermediate_size),
+            Ffn::Moe(moe) => (&moe.shared, self.cfg.shared_expert_intermediate_size),
+        };
+        let mut cases: Vec<(&str, &W, usize, usize)> = vec![
+            ("mlp.gate", &mlp_ref.gate, h, im),
+            ("mlp.down", &mlp_ref.down, im, h),
+        ];
+        if let Some(la) = &l0.la {
+            cases.push(("gdn.out_proj", &la.out_proj, self.cfg.value_dim(), h));
+        }
+        if let Some(fa) = self.layers.iter().find(|ly| ly.fa.is_some()).and_then(|ly| ly.fa.as_ref()) {
+            let nh = self.cfg.num_heads.max(1);
+            let hd = self.cfg.head_dim.max(1);
+            cases.push(("attn.o_proj", &fa.o_proj, nh * hd, h));
+        }
+        if let Some(lh) = &self.lm_head {
+            let rows = if self.lm_head_sharded { self.cfg.vocab_size / self.shard_factor() } else { self.cfg.vocab_size };
+            cases.push(("lm_head", lh, h, rows));
+        }
+
+        da::set_posture(da::POSTURE_ASSERT);
+        println!("=== dispatch assert: a <=MAX_VERIFY verify must never take the prefill dequant arm ===");
+        println!("  posture={} MAX_VERIFY={}", da::posture_name(), MAX_VERIFY);
+        let mut all_ok = true;
+        for (name, w, inn, outn) in cases {
+            let fmt = match w {
+                W::Nvfp4 { .. } => da::FMT_NVFP4,
+                W::Fp8 { .. } => da::FMT_FP8,
+                W::Fp8Blk { .. } => da::FMT_FP8_BLK,
+                W::Bf16(_) => da::FMT_BF16,
+                _ => da::FMT_NVFP4,
+            };
+            let nref = MAX_VERIFY + 1;
+            let x_host: Vec<half::bf16> = (0..inn * nref)
+                .map(|_| half::bf16::from_f32(rand::random::<f32>() * 2.0 - 1.0)).collect();
+            let x = self.dev.htod_sync_copy(&x_host).unwrap();
+            self.dev.synchronize().unwrap();
+
+            // ---- Leg A: the contract, N = 1..=MAX_VERIFY
+            let mut mma_moves = 0u64;
+            let mut prefill_in_a = 0u64;
+            for n in 1..=MAX_VERIFY {
+                let mut out = unsafe { self.dev.alloc::<half::bf16>(outn * n) }.unwrap();
+                let m0 = da::count_of(fmt, da::ARM_MMA);
+                let p0 = da::count_of(fmt, da::ARM_PREFILL);
+                self.gemm_act(w, &x, &mut out, inn, outn, n);
+                self.sync_stream();
+                let dm = da::count_of(fmt, da::ARM_MMA) - m0;
+                let dp = da::count_of(fmt, da::ARM_PREFILL) - p0;
+                mma_moves += dm;
+                prefill_in_a += dp;
+                drop(out);
+            }
+            let vacuous = mma_moves != MAX_VERIFY as u64;
+            let leg_a_ok = !vacuous && prefill_in_a == 0;
+
+            // ---- Leg B: the negative control (one call past the bound)
+            let p0 = da::count_of(fmt, da::ARM_PREFILL);
+            let mut r = unsafe { self.dev.alloc::<half::bf16>(outn * nref) }.unwrap();
+            self.gemm_act(w, &x, &mut r, inn, outn, nref);
+            self.sync_stream();
+            let leg_b_prefill = da::count_of(fmt, da::ARM_PREFILL) - p0;
+            let leg_b_ok = leg_b_prefill > 0;
+            drop(r);
+
+            all_ok &= leg_a_ok && leg_b_ok;
+            println!("  {:<14} fmt={:<6} LegA(N=1..{}) mma_moves={} prefill={} {}   LegB(N={}) prefill_seen={} {}",
+                     name, da::FMT_NAMES[fmt as usize], MAX_VERIFY, mma_moves, prefill_in_a,
+                     if leg_a_ok { "PASS" } else if vacuous { "FAIL(vacuous: arm not observed)" }
+                        else { "FAIL(prefill at <=MAX_VERIFY)" },
+                     nref, leg_b_prefill,
+                     if leg_b_ok { "PASS" } else { "FAIL(blind: instrument cannot see the cliff)" });
+        }
+        println!("{}", da::stats_line());
+        if all_ok {
+            println!("DISPATCH_ASSERT OK (leg A contract + leg B negative control both observed)");
+        } else {
+            println!("DISPATCH_ASSERT FAILED ({} violations recorded)", da::violations());
+        }
+        all_ok
+    }
+
     pub fn probe_binv(&self) -> bool {
         let h = self.cfg.hidden_size;
         let l0 = &self.layers[0];
@@ -17109,8 +19128,22 @@ impl GpuModel {
             }
             cases.push(("gdn.out_proj", &la.out_proj, self.cfg.value_dim(), h));
         }
-        if let Some(fa) = &l0.fa {
+        let fa_ref = self.layers.iter().find(|ly| ly.fa.is_some()).and_then(|ly| ly.fa.as_ref());
+        if let Some(fa) = fa_ref {
             if let AttnIn::Fused(w) = &fa.qkv { cases.push(("attn.qkv FUSED", w, h, AttnIn::fused_m(&self.cfg))); }
+            // Phase-8: o_proj was never probed (and Split qkv neither) — the depth-2 losslessness
+            // break implicates a verify col>=1; cover every FA projection.
+            let nh = self.cfg.num_heads.max(1);
+            let hd = self.cfg.head_dim.max(1);
+            match &fa.qkv {
+                AttnIn::Split { q, k, v } => {
+                    cases.push(("attn.q (split)", q, h, nh * hd));
+                    cases.push(("attn.k (split)", k, h, (self.cfg.num_kv_heads.max(1)) * hd));
+                    cases.push(("attn.v (split)", v, h, (self.cfg.num_kv_heads.max(1)) * hd));
+                }
+                _ => {}
+            }
+            cases.push(("attn.o_proj", &fa.o_proj, nh * hd, h));
         }
         // A TP vocab-sharded head has v/2 rows — probe the shard's true shape, not cfg.vocab_size.
         if let Some(lh) = &self.lm_head {
@@ -17129,26 +19162,41 @@ impl GpuModel {
             let x = self.dev.htod_sync_copy(&x_host).unwrap();
             self.dev.synchronize().unwrap();
 
+            // Phase-8 (Part A): ALL-column invariance — each column c of an N-wide call must
+            // match an N=1 call on the SAME x column (col-0-only checked every earlier run; the
+            // depth-2 losslessness break at token 442 implicates verify cols >= 1).
+            let mut refs: Vec<Vec<half::bf16>> = Vec::with_capacity(nref);
+            for c in 0..nref {
+                let xc = self.dev.htod_sync_copy(&x_host[c * inn..(c + 1) * inn]).unwrap();
+                let mut o1 = unsafe { self.dev.alloc::<half::bf16>(outn) }.unwrap();
+                self.gemm_act(w, &xc, &mut o1, inn, outn, 1);
+                self.sync_stream();
+                refs.push(self.dev.dtoh_sync_copy(&o1).unwrap());
+                drop(o1);
+            }
             let mut col0: Option<Vec<half::bf16>> = None;
             let mut worst = 0u16;
             let mut first_bad_n = 0usize;
+            let mut first_bad_col = 0usize;
             for n in 1..=MAX_VERIFY {
                 let mut out = unsafe { self.dev.alloc::<half::bf16>(outn * n) }.unwrap();
                 self.gemm_act(w, &x, &mut out, inn, outn, n);
                 self.sync_stream();
                 let got: Vec<half::bf16> = self.dev.dtoh_sync_copy(&out).unwrap();
-                match &col0 {
-                    None => col0 = Some(got[..outn].to_vec()),
-                    Some(c0) => for i in 0..outn {
-                        // BITWISE. Not "close": a 1-ulp drift in column 0 re-argmaxes a token
+                if n == 1 { col0 = Some(got[..outn].to_vec()); }
+                for c in 0..n {
+                    for i in 0..outn {
+                        // BITWISE. Not "close": a 1-ulp drift in ANY column re-argmaxes a token
                         // somewhere in a long generation, and MTP silently stops being lossless.
-                        let d = c0[i].to_bits() ^ got[i].to_bits();
+                        let d = refs[c][i].to_bits() ^ got[c * outn + i].to_bits();
                         if d != 0 && d > worst { worst = d; }
-                        if d != 0 && first_bad_n == 0 { first_bad_n = n; }
-                    },
+                        if d != 0 && first_bad_n == 0 { first_bad_n = n; first_bad_col = c; }
+                    }
                 }
             }
-            println!("  [diag] {name}: first divergent N = {first_bad_n} (worst xor 0x{worst:04x})");
+            if first_bad_n > 0 {
+                println!("  [diag] {name}: first divergent N = {first_bad_n} col = {first_bad_col} (worst xor 0x{worst:04x})");
+            }
             // Independent reference: batch > MAX_VERIFY takes the prefill path (dequant + cuBLAS).
             let mut r = unsafe { self.dev.alloc::<half::bf16>(outn * nref) }.unwrap();
             self.gemm_act(w, &x, &mut r, inn, outn, nref);
@@ -17171,6 +19219,114 @@ impl GpuModel {
         }
         println!("{}", if all_ok { "PASS — greedy MTP is lossless at every depth up to 16." }
                        else { "FAIL — batch-invariance is broken; greedy MTP is NOT lossless." });
+        all_ok
+    }
+
+    /// Phase-7 F9 gate — TP-mode batch-invariance probe. BOTH ranks run this in SPMD lockstep
+    /// (the sharded forward's all-reduces pair up); each prints its own verdict.
+    ///
+    /// At ONE position (the end of `prompt`) it sweeps the verify width N=1..MAX_VERIFY through
+    /// the REAL verify path and asserts column 0 is BIT-IDENTICAL to the N=1 forward:
+    ///   * the column-0 hidden state (bf16 bits) — the LM-head input;
+    ///   * the full column-0 FP32 logits (bitwise, every vocab row);
+    ///   * the greedy argmax.
+    /// N=1 is the engine's decode-shaped forward, and `--bench-mtp` separately gates N=1 against
+    /// a sequential decode, so (this sweep) + (bench-mtp) = "col 0 of an N-wide verify == decode".
+    ///
+    /// The single-process `--probe-binv` cannot see this class: it probes GEMM entry points only,
+    /// at world=1. F9 lived in the attention key partition of the sharded `_e` lane
+    /// (kernels/gpu_batch.cu gve_*_impl), which no GEMM probe touches.
+    pub fn probe_binv_tp(&self, prompt: &[u32], kv_stride: usize, max_n: usize) -> bool {
+        let h = self.cfg.hidden_size;
+        let v = self.cfg.vocab_size;
+        // Gate hygiene (boundary-targeted): the pre-fix defect only bit when the batch-max
+        // partition crossed a seg_size boundary, so a single arbitrary position can MISS it. Pick
+        // the prompt length so (plen+1) sits 2 keys below a boundary of the _e lane's partition
+        // (seg = the host's SEG formula, same inputs the dispatch uses): every width N >= 3 then
+        // straddles it at this position, deterministically. A short prompt keeps 16 resets cheap.
+        let nkv_eff = if self.attn_shard_factor() > 1 { self.eff_num_kv_heads() } else { self.cfg.num_kv_heads };
+        let base = ((192 + nkv_eff.max(1) - 1) / nkv_eff.max(1)).max(4);
+        let seg = base.max((kv_stride + 8191) / 8192).min(63);
+        let l0 = prompt.len().min(2048);
+        let mut plen = l0.max(64);
+        if seg >= 3 {
+            let want = (seg - 2) % seg;
+            while (plen + 1) % seg != want { plen += 1; }
+        }
+        let mut ptoks: Vec<u32> = prompt[..l0].to_vec();
+        while ptoks.len() < plen { ptoks.push(*ptoks.last().unwrap()); }
+        let prompt: &[u32] = &ptoks[..];
+        let plen = prompt.len();
+        println!("  [binv-tp] probe position plen={plen} seg={seg} (plen+1) % seg = {}", (plen + 1) % seg);
+        let mut pool = Pool::new(self.dev.clone());
+        println!("=== TP batch-invariance probe (world={} rank={}): col 0 of an N-wide verify vs N=1 ===",
+                 self.tp_world, self.tp_rank);
+        let mut reference: Option<(Vec<half::bf16>, Vec<f32>, u32)> = None;
+        let mut all_ok = true;
+        for n in 1..=max_n {
+            let mut state = self.new_batch_state(n.max(2), n.max(2), kv_stride);
+            self.zero_slot_state(&mut state, 0, kv_stride);
+            let (a0, hout) = self.prefill_batch(&mut pool, prompt, &mut state, 0, kv_stride, 0);
+            pool.release_bf16(hout, h * plen);
+            // Column 0 is the decode-shaped column; the extra columns are deterministic filler
+            // (causality means they cannot affect column 0 — that is exactly what is asserted).
+            let toks: Vec<u32> = (0..n)
+                .map(|i| if i == 0 { a0 } else { (a0 + 1 + i as u32) % (v as u32) })
+                .collect();
+            let (lg, vout) = self.verify_forward_keep_logits_f32(&mut pool, &toks, &mut state,
+                                                                 0, kv_stride, plen, None);
+            self.sync_stream();
+            // The engine's fp32-logits path requires cfg.lm_head_fp32; this model keeps the head
+            // bf16, so the probe compares bf16 logits bitwise — exactly what the argmax consumes.
+            let (lrow, vcol, tok) = match &lg {
+                VerifyLogits::F32(l) => {
+                    let host: Vec<f32> = self.dev.dtoh_sync_copy(l).unwrap();
+                    let row = host[..v].to_vec();
+                    let (mut bi, mut bv) = (0usize, f32::NEG_INFINITY);
+                    for (i, &x) in row.iter().enumerate() {
+                        if x > bv { bv = x; bi = i; }
+                    }
+                    let vh: Vec<half::bf16> = self.dev.dtoh_sync_copy(&vout).unwrap();
+                    (row, vh[..h].to_vec(), bi as u32)
+                }
+                VerifyLogits::B16(l) => {
+                    let host: Vec<half::bf16> = self.dev.dtoh_sync_copy(l).unwrap();
+                    let row: Vec<f32> = host[..v].iter().map(|x| x.to_f32()).collect();
+                    let (mut bi, mut bv) = (0usize, f32::NEG_INFINITY);
+                    for (i, &x) in row.iter().enumerate() {
+                        if x > bv { bv = x; bi = i; }
+                    }
+                    let vh: Vec<half::bf16> = self.dev.dtoh_sync_copy(&vout).unwrap();
+                    (row, vh[..h].to_vec(), bi as u32)
+                }
+            };
+            match lg {
+                VerifyLogits::F32(l) => pool.release(l, v * n),
+                VerifyLogits::B16(l) => pool.release_bf16(l, v * n),
+            }
+            pool.release_bf16(vout, h * n);
+            match &reference {
+                None => {
+                    println!("  N=1 reference: tok={tok}");
+                    reference = Some((vcol, lrow, tok));
+                }
+                Some((rv, rl, rt)) => {
+                    let hdiff = rv.iter().zip(vcol.iter())
+                        .filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+                    let ldiff = rl.iter().zip(lrow.iter())
+                        .filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+                    let ok = hdiff == 0 && ldiff == 0 && tok == *rt;
+                    all_ok &= ok;
+                    println!("  N={n:<2} tok={tok} {} (hidden diffs {hdiff}/{h}, logits diffs {ldiff}/{v})",
+                             if ok { "BIT-IDENTICAL" } else { "DIVERGED" });
+                }
+            }
+        }
+        println!("{}", if all_ok {
+            "PROBE-BINV-TP: PASS — col 0 bit-identical at every verify width 1..=N."
+        } else {
+            "PROBE-BINV-TP: FAIL — column 0 depends on the verify width."
+        });
         all_ok
     }
 
@@ -17729,6 +19885,16 @@ pub struct BatchGpuState {
     /// text hidden 5120). Set per serving request by the scheduler before prefill; cleared after.
     pub vision_embeds: Option<B>,
     pub vision_spans: Vec<crate::vision_encoder::ImageSpan>,
+    /// GDN/conv state-slot count this state was ALLOCATED with (the `state_slots` argument of
+    /// `new_batch_state`). Recorded so the verify can ASSERT that its per-column checkpoint band
+    /// `[ckpt_slot, ckpt_slot + n - 1]` fits: `delta_step_prefill` writes a checkpoint per column
+    /// `t < n-1` at slot `ckpt_slot + t` with no bounds check, so an undersized band is a silent
+    /// out-of-bounds device write into whatever allocation follows (P14: the 16-column DFlash v1
+    /// verify ran on a band sized for mtp-depth 8 → 8 OOB slots per GDN layer → garbage logits,
+    /// all-zero argmax, and `!!!!` output while every gate stayed green). Keep this field in sync
+    /// with the allocation; the assert is the only thing standing between a sizing bug and silent
+    /// heap corruption.
+    pub state_slots: usize,
 }
 
 /// LM-head logits handed from `forward_decode_logits` to `forward_decode_select`. The two arms
@@ -17764,6 +19930,14 @@ pub struct DecodeBuffers {
     pub pen_ring_dev: cudarc::driver::CudaSlice<i32>,
     pub pen_ring_state_dev: cudarc::driver::CudaSlice<i32>,
     pub seeds_key_dev: cudarc::driver::CudaSlice<u64>,
+    /// W2 (Phase 13) JSON-schema masks for the DECODE path: per-lane vocabulary bitsets
+    /// (`mask_words_dev` = [max_batch][mask_words_for(vocab)] u32 little-endian, bit t = token t
+    /// allowed) plus the per-lane enable flags (`mask_flags_dev` = [max_batch] i32, 0 =
+    /// unconstrained). `mask_any` is the host-side gate: false on every non-schema step, so the
+    /// mask kernel is not launched at all on the normal path (bit-identical behaviour).
+    pub mask_words_dev: cudarc::driver::CudaSlice<u32>,
+    pub mask_flags_dev: cudarc::driver::CudaSlice<i32>,
+    pub mask_any: bool,
 }
 
 pub const MAX_PEN_TOKENS: usize = 64;
@@ -18027,9 +20201,98 @@ pub struct Pool {
     cached_bytes: usize,
     cap_bytes: usize,
     /// E13 tripwire: set around cuStreamBeginCapture/EndCapture (capture_verify_graph). An alloc in
-    /// this window is a capture-illegal NULL-stream op — the debug_asserts in get/get_bf16 make a
-    /// bucket the eager warmup failed to cover LOUD in debug builds instead of an opaque rc=134.
+    /// this window is a capture-illegal NULL-stream op — `tripwire_fire` (always-on, see
+    /// PLAN/TRIPWIRE_SPEC.md §3.3) makes a bucket the eager warmup failed to cover LOUD in EVERY
+    /// build, not just debug ones. Until 2026-09-13 this was a `debug_assert!`, i.e. DEAD in every
+    /// deployed (release) binary — the spec's "wrong thing #1".
     capturing: std::cell::Cell<bool>,
+}
+
+// ---------------------------------------------------------------------------------------------
+// The permanent OOB / alloc tripwire (PLAN/TRIPWIRE_SPEC.md).
+//
+// The class it exists for: a kernel that writes a PADDED footprint (the pf8 lane writes
+// `tp64 = ceil(n/64)*64` rows) into a buffer the caller sized for the UNPADDED `n`. The write
+// lands inside the pool's power-of-two bucket slack, so there is no fault, no assert, and the
+// bytes are later handed to somebody else — the client sees a silently truncated stream while
+// the head log holds nothing at all. Three production incidents (74a4611, ccaa234, af362ca).
+//
+// Three postures (spec §3.3):
+//   off     — the shipped default. Counters still move; nothing is printed.
+//   observe — production diagnosis: one rate-limited line per violation + a counter.
+//   assert  — probes/tests: panic with site + numbers + remedy.
+// The assert posture is DOWNGRADED to observe when the process is a TP rank (main.rs): an
+// asymmetric abort is worse than the bug (the FIX #4 report: a one-sided GB10_FP8_PREFILL=0
+// killed the node and tripped the TP watchdog).
+// ---------------------------------------------------------------------------------------------
+
+/// Tripwire posture. `Off` still COUNTS (the check is a branch, not a print).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Tripwire { Off = 0, Observe = 1, Assert = 2 }
+
+static TRIPWIRE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static TW_FIRES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CENSUS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn tripwire_set(t: Tripwire) { TRIPWIRE.store(t as u8, std::sync::atomic::Ordering::Relaxed); }
+pub fn tripwire_get() -> Tripwire {
+    match TRIPWIRE.load(std::sync::atomic::Ordering::Relaxed) {
+        2 => Tripwire::Assert, 1 => Tripwire::Observe, _ => Tripwire::Off,
+    }
+}
+/// How many violations the tripwire has observed this process. The selftest REQUIRES this to move;
+/// a check that has never fired is unverified (spec §3.5.2, the negative-control discipline).
+pub fn tripwire_fires() -> u64 { TW_FIRES.load(std::sync::atomic::Ordering::Relaxed) }
+
+pub fn census_set(on: bool) { CENSUS.store(on, std::sync::atomic::Ordering::Relaxed); }
+pub fn census_on() -> bool { CENSUS.load(std::sync::atomic::Ordering::Relaxed) }
+
+/// Report one observed violation: count it, print it (rate-limited), and panic at the assert tier.
+/// Host-only and allocation-scoped — never per launch, never on the decode path.
+pub fn tripwire_fire(what: &str, detail: &str) {
+    let n = TW_FIRES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let t = tripwire_get();
+    if t != Tripwire::Off || n <= 5 || n % 200 == 0 {
+        eprintln!("[tripwire #{n}] {what} — {detail}");
+    }
+    if t == Tripwire::Assert {
+        panic!("tripwire (assert posture): {what} — {detail}");
+    }
+}
+
+/// One census record (spec §3.2). Opt-in, one line per prefill-path allocation; NEVER enabled for
+/// a timing run (it prints per allocation).
+fn census_line(dtype: &str, site: &'static str, req: usize, footprint: usize, cap: usize) {
+    if !census_on() { return; }
+    let pad = footprint.saturating_sub(req);
+    eprintln!("[pool-census] dtype={dtype} site={site} req={req} footprint={footprint} \
+               pad={pad} bucket={cap} slack={} elems{}",
+              cap.saturating_sub(footprint), if pad > 0 { " — PADDED" } else { "" });
+}
+
+/// The pf8 prefill lane pads its token count to a 64 multiple. ONE definition (spec §2: the
+/// hand-inlined copy at the batch-mixer site was a second, divergent copy of a numeric rule the
+/// three OOB incidents were all about).
+pub fn pf8_pad_pub(n: usize) -> usize { if n >= 256 { n.div_ceil(64) * 64 } else { n } }
+
+/// Scheduler gate 4 (PLAN/SCHEDULER_2LANE_WORKDOC.md §5): record one prefill window's width and
+/// the (n, tp64, bucket, pad-danger) tuple the pf8 lane presents for it. The gate is a SUBSET
+/// claim over the multiset of `n` values the two schedulers present for the same prompt mix, so
+/// the line is `n` + everything derived from `n` — a diff of two such streams is the artifact.
+///
+/// `row` is a representative sink row width, used only to make the pool-luck arithmetic visible:
+/// the incident fires when `tp64 * row` overflows `bucket_up(n * row)` (REGRESSION_REPORT §5.1:
+/// n ∈ (384, 409.6] for row = 5120).
+pub fn pf_census_window(w0: usize, w1: usize, row: usize) {
+    if !census_on() { return; }
+    let n = w1 - w0;
+    let tp64 = pf8_pad_pub(n);
+    let b_unpadded = bucket_up(n * row);
+    let b_padded = bucket_up(tp64 * row);
+    let danger = tp64 * row > b_unpadded;
+    eprintln!("[pool-census] pfwin w0={w0} w1={w1} n={n} tp64={tp64} \
+               bucket_n={b_unpadded} bucket_tp64={b_padded} danger={}",
+              if danger { "UNPADDED-WOULD-OOB" } else { "ok" });
 }
 
 /// Past this many bytes of CACHED (idle) buffers, released buffers are freed rather than hoarded.
@@ -18043,6 +20306,25 @@ const POOL_CAP_BYTES: usize = 3 << 30;
 /// length, and every prefill activation is sized by the PROMPT LENGTH — so each distinct prompt length
 /// got its own permanent bucket and nothing was ever reused. Costs <2x slack, buys bounded growth.
 fn bucket_up(n: usize) -> usize { n.max(256).next_power_of_two() }
+
+/// The GB10 opt-in cap on dynamic shared memory per block: 99 KiB = 101,376 B (the 100 KiB/SM
+/// carve-out with 1 KiB of reserved smem). TRIPWIRE_SPEC §3.4 — this number was cited in prose at
+/// two load sites and ASSERTED nowhere; `cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)` is an
+/// upper bound, not a check, so a budget past the cap fails the call and one BELOW the kernel's
+/// real need overflows into illegal shared memory (the documented 81,312 → illegal-smem burn).
+pub const SMEM_OPTIN_CAP: i32 = 99 * 1024;
+
+/// Log and check one raw-PTX dynamic-smem budget (TRIPWIRE_SPEC §3.4): the boot log must record
+/// the budget (so a re-derived number can be compared), and the cap must be a checked constant.
+fn smem_budget(tag: &str, bytes: i32) {
+    eprintln!("[{tag}] dynamic smem budget {bytes} B / cap {SMEM_OPTIN_CAP} B ({} KiB)",
+              bytes / 1024);
+    if bytes > SMEM_OPTIN_CAP {
+        tripwire_fire("dynamic smem budget exceeds the GB10 opt-in cap",
+            &format!("{tag}: {bytes} B > {SMEM_OPTIN_CAP} B — cuFuncSetAttribute would fail; \
+                      re-derive the section sizes (prefer an expression to a literal)"));
+    }
+}
 
 /// P4 B3: one-time raw-module load of gpu_batch.ptx, fetch gdn_chunk_prefill_b, and opt in
 /// to ~86KB dynamic smem (cuFuncSetAttribute). None disables the chunked path gracefully.
@@ -18070,6 +20352,7 @@ fn gdn_chunk_load_raw_fn() -> Option<cudarc::driver::sys::CUfunction> {
     // Exact budget at the actual dims (kd=128, VC=64): ~86KB — under the ~99KB GB10 opt-in cap.
     // (Do NOT size for kd=256 worst case: 148KB > cap and the attribute call fails.)
     let bytes: i32 = (128 * 64 + 32*132*2 + 32*64*2 + 32*32*2 + 32 + 33) as i32 * 4;
+    smem_budget("b3", bytes);
     let r = unsafe {
         sys::cuFuncSetAttribute(f, sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, bytes)
     };
@@ -18098,6 +20381,7 @@ fn gdn_chunk_tc_load_raw_fn() -> Option<cudarc::driver::sys::CUfunction> {
     // (32*32 + 32*64*2 + 32 + 33)*4 = 83,204 B (the probe's runtime figure — a hardcoded
     // 81,312 was 1.9KB short and overflowed Sb into illegal smem)
     let bytes: i32 = 83204;
+    smem_budget("gtc", bytes);
     let r = unsafe {
         sys::cuFuncSetAttribute(f, sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, bytes)
     };
@@ -18130,6 +20414,7 @@ fn gdn_split_load_raw_fns() -> Option<(cudarc::driver::sys::CUfunction, cudarc::
         let r = unsafe { sys::cuModuleGetFunction(&mut f, module, cname.as_ptr()) };
         if r != sys::CUresult::CUDA_SUCCESS { eprintln!("[gsc] get {name} failed ({r:?})"); return None; }
         let bytes: i32 = if i == 0 { h_smem } else { wuo_smem };
+        smem_budget(if i == 0 { "gsc:states" } else { "gsc:wuo" }, bytes);
         let r = unsafe {
             sys::cuFuncSetAttribute(f, sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, bytes)
         };
@@ -18177,6 +20462,7 @@ fn fa_tc_raw_fn() -> Option<cudarc::driver::sys::CUfunction> {
         let r = unsafe { sys::cuModuleGetFunction(&mut f, module, cname.as_ptr()) };
         if r != sys::CUresult::CUDA_SUCCESS { eprintln!("[fa] get attn_prefill_fa_b failed ({r:?})"); return None; }
         // 4 x 32 keys x 256 dims x 2 B = 65536 (hd=256; the attribute covers the max we request)
+        smem_budget("fa", 65536);
         let r = unsafe {
             sys::cuFuncSetAttribute(f, sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 65536)
         };
@@ -18220,8 +20506,12 @@ impl Pool {
             return buf;
         }
         // E13 tripwire: a MISS here during graph capture is a capture-illegal NULL-stream alloc —
-        // the eager warmup failed to cover this bucket (see capture_verify_graph).
-        debug_assert!(!self.capturing.get(), "pool f32 alloc of {b} elems during CUDA-graph capture");
+        // the eager warmup failed to cover this bucket (see capture_verify_graph). ALWAYS-ON
+        // (TRIPWIRE_SPEC §3.3): a `debug_assert!` here was dead code in every deployed binary.
+        if self.capturing.get() {
+            tripwire_fire("pool f32 alloc during CUDA-graph capture",
+                &format!("bucket={b} elems — the eager warmup did not cover this bucket"));
+        }
         // cudarc's alloc_zeros is cuMemAllocAsync — it does NOT zero. Zero fresh allocations explicitly
         // so any pool buffer handed out is deterministic (a stale read would otherwise pick up GPU
         // garbage that varies run-to-run). Reused buffers are NOT re-zeroed: every kernel that reads a
@@ -18229,6 +20519,29 @@ impl Pool {
         let mut buf = self.alloc_f32(b);
         self.dev.memset_zeros(&mut buf).unwrap();
         self.dev.synchronize().unwrap(); // ensure zeroing is visible to the compute stream
+        buf
+    }
+
+    /// TRIPWIRE_SPEC §3.2/§3.3 — a pool hand-out that DECLARES the owning kernel's write footprint.
+    ///
+    /// `req` is what the pool must hand out (the SAME contract as the two-argument form, so a
+    /// converted site allocates exactly what it did before); `footprint` is what the owning kernel
+    /// will actually WRITE. The check is `capacity >= footprint`, and it is DELIBERATELY detection,
+    /// not prevention: the spec's own claim is that a tripwire "does not fix the bug class, it
+    /// shortens the time-to-detection" — silently allocating the padded size here would make the
+    /// check vacuous for the very caller it exists to catch. Host-known numbers only: no sync, no
+    /// readback (rule 16/17 reject a device-side check on this path by design).
+    ///
+    /// NEVER use on the decode path: the decode pool sites keep the two-argument form.
+    pub fn get_fp(&mut self, site: &'static str, req: usize, footprint: usize) -> S {
+        let buf = self.get(req);
+        census_line("f32", site, req, footprint, buf.len());
+        if footprint > buf.len() {
+            tripwire_fire("declared write footprint exceeds the handed-out capacity",
+                &format!("site={site} req={req} footprint={footprint} cap={} \
+                          — UNDER-SIZED CALLER (the pf8 pad class); size the request to the \
+                          padded width (pf8_pad(n))", buf.len()));
+        }
         buf
     }
 
@@ -18278,7 +20591,20 @@ impl Pool {
     /// address — which surfaces as a baffling `CUDA_ERROR_INVALID_VALUE` on some later, innocent memcpy.
     /// (I did exactly this and it blew up on the first run.) Eviction happens in `trim`, which syncs.
     pub fn release(&mut self, s: S, _n: usize) {
+        // TRIPWIRE_SPEC §2 asked for a "s.len() power-of-two >= 256" sanity check here. That
+        // premise is WRONG, and this session measured it: the check fired 27,253 times on ONE
+        // 512-token leg. Non-power-of-two capacities are normal and documented — `embed_batch`
+        // allocates the prefill residual at exactly `h*n`, and the decode/verify path releases
+        // `h*batch` views (len 20,480 = 5120*4 on the 27B). `bucket_down` exists precisely to file
+        // those under the largest bucket that FITS, and lengths < 256 are deliberately DROPPED.
+        // A length check cannot see the hazard the spec was reaching for (a release of a buffer that
+        // is still in flight — a use-after-free class); the pool's own accounting invariant can, and
+        // `trim` checks it. What IS worth recording is how much slack the pool is asked to round.
         let b = bucket_down(s.len());   // TRUE capacity — see bucket_down
+        if b != s.len() && census_on() {
+            eprintln!("[pool-census] release-rounddown f32 true_cap={} bucket={} slack={} elems",
+                      s.len(), b, s.len() - b);
+        }
         if b == 0 { return; }
         self.cached_bytes += s.len() * 4;
         self.free.push((s, b));
@@ -18293,16 +20619,39 @@ impl Pool {
             return buf;
         }
         // E13 tripwire: a MISS here during graph capture is a capture-illegal NULL-stream alloc —
-        // the eager warmup failed to cover this bucket (see capture_verify_graph).
-        debug_assert!(!self.capturing.get(), "pool bf16 alloc of {b} elems during CUDA-graph capture");
+        // the eager warmup failed to cover this bucket (see capture_verify_graph). ALWAYS-ON
+        // (TRIPWIRE_SPEC §3.3): a `debug_assert!` here was dead code in every deployed binary.
+        if self.capturing.get() {
+            tripwire_fire("pool bf16 alloc during CUDA-graph capture",
+                &format!("bucket={b} elems — the eager warmup did not cover this bucket"));
+        }
         let mut buf = self.alloc_bf16(b);
         self.dev.memset_zeros(&mut buf).unwrap();
         self.dev.synchronize().unwrap();
         buf
     }
 
+    /// bf16 twin of [`Pool::get_fp`] — the census/footprint form for the PREFILL path.
+    pub fn get_bf16_fp(&mut self, site: &'static str, req: usize, footprint: usize) -> B {
+        let buf = self.get_bf16(req);
+        census_line("bf16", site, req, footprint, buf.len());
+        if footprint > buf.len() {
+            tripwire_fire("declared write footprint exceeds the handed-out capacity",
+                &format!("site={site} req={req} footprint={footprint} cap={} \
+                          — UNDER-SIZED CALLER (the pf8 pad class); size the request to the \
+                          padded width (pf8_pad(n))", buf.len()));
+        }
+        buf
+    }
+
     pub fn release_bf16(&mut self, s: B, _n: usize) {
+        // See `release` — the spec's power-of-two premise is wrong (27,253 legitimate non-pow2
+        // releases in one 512-token leg); the pool rounds down and files by TRUE capacity.
         let b = bucket_down(s.len());   // TRUE capacity — see bucket_down
+        if b != s.len() && census_on() {
+            eprintln!("[pool-census] release-rounddown bf16 true_cap={} bucket={} slack={} elems",
+                      s.len(), b, s.len() - b);
+        }
         if b == 0 { return; }
         self.cached_bytes += s.len() * 2;
         self.free_bf16.push((s, b));
@@ -18319,6 +20668,18 @@ impl Pool {
     /// retained its own set of prefill activations (90–600 MB each on 9B) and a tool-eval suite with
     /// hundreds of prompt lengths exhausted the GPU.
     pub fn trim(&mut self) {
+        // Pool invariant (TRIPWIRE_SPEC §2): `cached_bytes` must equal the bytes actually idle in
+        // the two freelists. Nothing checked this before; a mis-sized release or a dropped bucket
+        // would make the pool's own cap accounting lie forever. One pass over a short list, once
+        // per request — never on the decode step.
+        let tally = self.free.iter().map(|x| x.0.len() * 4).sum::<usize>()
+                  + self.free_bf16.iter().map(|x| x.0.len() * 2).sum::<usize>();
+        if tally != self.cached_bytes {
+            tripwire_fire("pool accounting drift (cached_bytes != freelist)",
+                &format!("cached_bytes={} freelist={} (f32 {} bufs, bf16 {} bufs)",
+                         self.cached_bytes, tally, self.free.len(), self.free_bf16.len()));
+            self.cached_bytes = tally;   // self-heal so the cap keeps working
+        }
         if self.cached_bytes <= self.cap_bytes { return; }
         let before = self.cached_bytes;
         self.dev.synchronize().unwrap();      // no queued kernel may still reference what we free
@@ -18341,6 +20702,111 @@ impl Pool {
                   before as f64 / 1e9, self.cached_bytes as f64 / 1e9);
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// TRIPWIRE_SPEC §3.5.2 — the SELFTEST (the negative control).
+//
+// "A tripwire that has never fired in a test is unverified." This mode runs FOUR legs against the
+// real Pool on the real device and exits 0 only if every leg holds:
+//
+//   A  the historical incident reproduced: req = 468*8704, footprint = 512*8704 (ccaa234 FIX #3's
+//      arithmetic, the shape that produced `pf8 lane OOB: out has 4194304 elems < tp64*outn =
+//      384*12288`) — the footprint check MUST fire.
+//   B  the mechanism that made it SILENT, demonstrated on device: a 0xAA fill of the whole bucket,
+//      then a 0x00 write of the FOOTPRINT (which is larger than the request but inside the bucket),
+//      then a readback proving [req, footprint) was overwritten while [footprint, cap) was not.
+//      Nothing faults; that is exactly why three production incidents shipped.
+//   C  zero false positives: a correctly padded site (req == footprint == pf8_pad(n)*width) must
+//      NOT fire.
+//   D  the capture-window check is LIVE in a release build (it used to be a `debug_assert!`, i.e.
+//      compiled out of every deployed binary — spec "wrong thing #1").
+// ---------------------------------------------------------------------------------------------
+
+/// Run the tripwire selftest. Returns the process exit code (0 = all legs hold).
+pub fn tripwire_selftest() -> i32 {
+    use cudarc::driver::sys;
+    let dev = CudaDevice::new(0).expect("selftest: CUDA device 0");
+    let stream = fork_blocking_stream(&dev);
+    let mut pool = Pool::new(dev.clone());
+    let tier = tripwire_get();
+    eprintln!("[tripwire-selftest] release_build={} tier={:?} fires_at_entry={}",
+              !cfg!(debug_assertions), tier, tripwire_fires());
+    let mut ok = true;
+
+    // ---- Leg A: the historical incident, through the real check path -------------------------
+    // At the assert tier the check PANICS by design; catch it and require the panic.
+    let (req_a, fp_a) = (468usize * 8704, 512usize * 8704);
+    let f0 = tripwire_fires();
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = pool.get_bf16_fp("selftest.incident_ccaa234", req_a, fp_a);
+    })).is_err();
+    let f1 = tripwire_fires();
+    let leg_a = f1 == f0 + 1 && (tier != Tripwire::Assert || panicked);
+    eprintln!("[tripwire-selftest] A incident(req={req_a} footprint={fp_a} pool_bucket={}) \
+               fired={} panicked={} -> {}",
+              bucket_up(req_a), f1 - f0, panicked, if leg_a { "PASS" } else { "FAIL" });
+    ok &= leg_a;
+
+    // ---- Leg B: the SILENT case (pool luck), demonstrated live on device ----------------------
+    // The dangerous case (leg A) is the one where the bucket does NOT cover the footprint — there
+    // the write is genuinely out of bounds, so this leg deliberately does NOT perform it (it would
+    // corrupt the async allocator's heap; that is what the three production incidents did).
+    // What is demonstrated here is the OTHER half of the class, the one that made the bug silent:
+    // a write past the REQUEST but inside the BUCKET is invisible to every check the engine has.
+    let req_b: usize = 1_000_000;               // bucket_up => 1,048,576
+    let fp_b: usize = 1_040_000;                // > req_b, <= bucket => no fire, no fault
+    let cap_b = bucket_up(req_b);
+    let buf_b = pool.get_bf16_fp("selftest.slack", req_b, req_b);
+    let dptr_b = *buf_b.device_ptr();
+    unsafe {
+        sys::cuMemsetD8Async(dptr_b as sys::CUdeviceptr, 0xAA, cap_b * 2, stream.stream);
+        sys::cuMemsetD8Async(dptr_b as sys::CUdeviceptr, 0x00, fp_b * 2, stream.stream);
+    }
+    let mut inside: u16 = 0xFFFF;   // index fp_b-1: inside the declared footprint, PAST the request
+    let mut past: u16 = 0xFFFF;     // index cap_b-1: past the footprint, inside the bucket
+    unsafe {
+        sys::cuMemcpyDtoHAsync_v2(&mut inside as *mut u16 as *mut std::ffi::c_void,
+            (dptr_b + ((fp_b - 1) * 2) as u64) as sys::CUdeviceptr, 2, stream.stream);
+        sys::cuMemcpyDtoHAsync_v2(&mut past as *mut u16 as *mut std::ffi::c_void,
+            (dptr_b + ((cap_b - 1) * 2) as u64) as sys::CUdeviceptr, 2, stream.stream);
+    }
+    dev.synchronize().expect("selftest sync");
+    let f_b = tripwire_fires();
+    let leg_b = inside == 0x0000 && past == 0xAAAA && cap_b > req_b && fp_b <= cap_b
+                && f_b == f1;   // leg A's fire is the last one; THIS allocation must stay SILENT
+    eprintln!("[tripwire-selftest] B silent-slack req={req_b} bucket={cap_b} footprint={fp_b} \
+               [fp-1]={inside:#06x} (expect 0x0000 — written PAST the request, no check fired) \
+               [cap-1]={past:#06x} (expect 0xaaaa — untouched) extra_fires={} -> {}",
+              f_b - f1, if leg_b { "PASS" } else { "FAIL" });
+    ok &= leg_b;
+
+    // ---- Leg C: zero false positives on a correctly padded site ------------------------------
+    let (h, n) = (5120usize, 468usize);
+    let f2 = tripwire_fires();
+    let _ = pool.get_bf16_fp("selftest.clean_padded", h * n, h * pf8_pad_pub(n));
+    let leg_c = tripwire_fires() == f2;
+    eprintln!("[tripwire-selftest] C clean padded site (n={n} tp64={}) fired={} -> {}",
+              pf8_pad_pub(n), tripwire_fires() - f2, if leg_c { "PASS" } else { "FAIL" });
+    ok &= leg_c;
+
+    // ---- Leg D: the capture-window check is live in THIS build --------------------------------
+    let f3 = tripwire_fires();
+    pool.capturing.set(true);
+    let d_panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = pool.get_bf16(1 << 26 | 1);     // a bucket the selftest has certainly not cached
+    })).is_err();
+    pool.capturing.set(false);
+    let leg_d = tripwire_fires() == f3 + 1 && (tier != Tripwire::Assert || d_panicked);
+    eprintln!("[tripwire-selftest] D capture-window check live fired={} panicked={} \
+               (release build: this was a DEAD debug_assert!) -> {}",
+              tripwire_fires() - f3, d_panicked, if leg_d { "PASS" } else { "FAIL" });
+    ok &= leg_d;
+
+    eprintln!("[tripwire-selftest] {} legs=4 fires_total={} tier={:?}",
+              if ok { "PASS" } else { "FAIL" }, tripwire_fires(), tier);
+    if ok { 0 } else { 1 }
+}
+
 
 // -----------------------------------------------------------------------------------------------
 // DSV4 routed-expert MoE (Phase 2 lane 2B, DEEPSEEK_V4_PORT.md §12.A.6 + §B.9).
@@ -19058,6 +21524,9 @@ mod shard_factor_tests {
             vocab_size: vocab,
             rms_eps: 1e-6,
             rope_theta: 1e7,
+            // Pre-existing breakage (not Phase-2): 7e188f9 added Config::rope_yarn_factor and
+            // did not update this test initializer, so `cargo test --lib` stopped compiling.
+            rope_yarn_factor: 1.0,
             rotary_dim: 64,
             max_position_embeddings: 262144,
             eos_token_id: 0,
@@ -19267,6 +21736,103 @@ mod shard_raw_tests {
                 assert_eq!(sg, rg, "world {world} rank {rank}: gs mismatch");
             }
         }
+    }
+
+    /// Block-128 FP8 (`W::Fp8Blk`) shard geometry. Both load paths share this function: the
+    /// load-time path calls it directly, and the in-place path (`shard_fp8blk_col_segs` /
+    /// `shard_fp8blk_row`, used when mixer sharding is off, e.g. `--dump-rank-weights --world N`)
+    /// now delegates to it — before 2026-09-09 that path panicked on Fp8Blk.
+    /// The property tested is a full ROUND TRIP: placing every rank's shard back at its source
+    /// offset must reproduce the original codes AND the original scale grid exactly. The scale
+    /// buffer starts as NaN so an unfilled element fails the comparison instead of passing empty.
+    #[test]
+    fn fp8blk_shard_roundtrip_reassembles_the_original() {
+        let m = 2048usize;         // 16 bands of 128
+        let k = 1024usize;         // nb_k = 8 -> row-shard valid up to world 8
+        let nb_k = k / 128;
+        let bands = m / 128;
+        let qw = rng(m * k, 11);
+        let sc: Vec<f32> = (0..bands * nb_k).map(|i| i as f32 * 0.25).collect();
+        // Segment takes must stay 128-aligned at every world in the ladder: 1024/world is a
+        // multiple of 128 for world <= 8. (A finer segment would legitimately panic — the
+        // real Qwen qkv/GDN segments are head-multiples of 128 or more, so they pass.)
+        let segs = vec![(0usize, 1024, true), (1024usize, 1024, true)];
+
+        for world in [1usize, 2, 4, 8] {
+            for op in [LoadShardOp::Col, LoadShardOp::ColSegs(segs.clone()), LoadShardOp::Row] {
+                let mut rec_q = vec![0u8; m * k];
+                let mut rec_s = vec![f32::NAN; bands * nb_k];
+                let mut rows_total = 0usize;
+                for rank in 0..world {
+                    let (q, s, mo, ko, nb) = shard_raw_fp8_blk(&qw, &sc, m, k, nb_k, &op, rank, world);
+                    let row_split = matches!(op, LoadShardOp::Row);
+                    assert_eq!(ko, if row_split { k / world } else { k }, "op {op:?} world {world} rank {rank}: local k");
+                    assert_eq!(nb, if row_split { nb_k / world } else { nb_k }, "op {op:?} world {world} rank {rank}: local nb_k");
+                    assert_eq!(q.len(), mo * ko, "op {op:?} world {world} rank {rank}: code bytes");
+                    assert_eq!(s.len(), (mo / 128) * nb, "op {op:?} world {world} rank {rank}: scale count");
+                    if row_split {
+                        assert_eq!(mo, m, "row shard keeps M");
+                        for r in 0..m {
+                            rec_q[r * k + rank * ko..r * k + (rank + 1) * ko]
+                                .copy_from_slice(&q[r * ko..r * ko + ko]);
+                        }
+                        for b in 0..bands {
+                            rec_s[b * nb_k + rank * nb..b * nb_k + (rank + 1) * nb]
+                                .copy_from_slice(&s[b * nb..b * nb + nb]);
+                        }
+                    } else {
+                        // Row ranges for this rank, derived test-side from the op (independent of
+                        // the function under test), so a placement bug cannot cancel out.
+                        let rows: Vec<(usize, usize)> = match &op {
+                            LoadShardOp::Col => vec![(rank * (m / world), m / world)],
+                            LoadShardOp::ColSegs(segs) => segs.iter().map(|&(off, cnt, split)| {
+                                let take = if split { cnt / world } else { cnt };
+                                (off + if split { rank * take } else { 0 }, take)
+                            }).collect(),
+                            _ => unreachable!(),
+                        };
+                        let (mut qoff, mut soff) = (0usize, 0usize);
+                        for (r0, take) in rows {
+                            rec_q[r0 * k..(r0 + take) * k].copy_from_slice(&q[qoff..qoff + take * k]);
+                            qoff += take * k;
+                            rec_s[(r0 / 128) * nb_k..((r0 + take) / 128) * nb_k]
+                                .copy_from_slice(&s[soff..soff + (take / 128) * nb]);
+                            soff += (take / 128) * nb;
+                        }
+                        assert_eq!(qoff, q.len(), "op {op:?} world {world} rank {rank}: codes not fully consumed");
+                        assert_eq!(soff, s.len(), "op {op:?} world {world} rank {rank}: scales not fully consumed");
+                        rows_total += mo;
+                    }
+                }
+                assert_eq!(rec_q, qw, "op {op:?} world {world}: reconstructed codes differ");
+                assert_eq!(rec_s, sc, "op {op:?} world {world}: reconstructed scales differ");
+                if !matches!(op, LoadShardOp::Row) {
+                    assert_eq!(rows_total, m, "op {op:?} world {world}: ranks do not tile M");
+                }
+            }
+        }
+    }
+
+    /// A 128-row-misaligned ColSegs take must PANIC, not silently produce a scale band that
+    /// straddles two segments (a silent numerical error is the failure mode this guards).
+    #[test]
+    #[should_panic(expected = "not 128-aligned")]
+    fn fp8blk_col_seg_must_be_128_aligned() {
+        let (m, k, nb_k) = (512usize, 1024usize, 8usize);
+        let qw = rng(m * k, 3);
+        let sc = vec![0f32; (m / 128) * nb_k];
+        let _ = shard_raw_fp8_blk(&qw, &sc, m, k, nb_k,
+                                  &LoadShardOp::ColSegs(vec![(0usize, 64, false)]), 0, 2);
+    }
+
+    /// A row split whose nb_k does not divide the world must PANIC (world 16 vs nb_k 8).
+    #[test]
+    #[should_panic(expected = "won't split across world")]
+    fn fp8blk_row_shard_requires_divisible_nb_k() {
+        let (m, k, nb_k) = (512usize, 1024usize, 8usize);
+        let qw = rng(m * k, 3);
+        let sc = vec![0f32; (m / 128) * nb_k];
+        let _ = shard_raw_fp8_blk(&qw, &sc, m, k, nb_k, &LoadShardOp::Row, 0, 16);
     }
 }
 

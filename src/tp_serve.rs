@@ -37,6 +37,10 @@ pub struct WireRequest {
     /// S8F routing domain (S6F adjudication): rides the wire so a future TP-DF2 lane split is
     /// SPMD-identical; a pure function of the prompt, default `General`.
     pub domain: crate::batch::Domain,
+    #[serde(default)]
+    pub min_new: usize,
+    #[serde(default)]
+    pub ignore_eos: bool,
 }
 
 /// One scheduler-visible event within a step. Ordering inside a step: all Admits (in admit order),
@@ -96,6 +100,8 @@ impl From<&BatchRequest> for WireRequest {
             seed: r.seed,
             ckpt_at: r.ckpt_at,
             domain: r.domain,
+            min_new: r.min_new,
+            ignore_eos: r.ignore_eos,
         }
     }
 }
@@ -118,9 +124,14 @@ impl WireRequest {
             seed: self.seed,
             ckpt_at: self.ckpt_at,
             domain: self.domain,
+            min_new: self.min_new,
+            ignore_eos: self.ignore_eos,
             received_at: std::time::Instant::now(),
             image_embeds: None,
             image_spans: Vec::new(),
+            // W2: the schema FSM lives on the HEAD (that is where the sampler runs); the node's
+            // mirror lane is unconstrained by construction.
+            schema: None,
         }
     }
 }

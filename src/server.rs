@@ -14,7 +14,7 @@ use uuid::Uuid;
 use chrono;
 
 use crate::batch::{BatchRequest, TokEvent};
-use crate::tokenizer::{QwenTokenizer, ChatMessage, ToolCall};
+use crate::tokenizer::{QwenTokenizer, ChatMessage, ToolCall, ThinkingMode};
 use crate::{Usage, Timings, make_timings};
 
 #[derive(Clone)]
@@ -31,6 +31,10 @@ pub struct AppState {
     /// which is the only value guaranteed to be valid for that family. A request's
     /// `reasoning_effort` field overrides per request.
     pub reasoning_effort: Option<String>,
+    /// W1 (Phase 13): the server-wide `--thinking auto|on|off` policy (default Auto = pass nothing,
+    /// the model's own chat template decides). A request's `chat_template_kwargs.enable_thinking`
+    /// overrides it per call.
+    pub thinking: ThinkingMode,
     /// `--output-prompts [cap]`: log every chat-completion request in human-readable form
     /// (effective params, one line per turn, rendered-prompt excerpt up to `cap` chars).
     /// 0 = off (default).
@@ -51,6 +55,11 @@ pub struct AppState {
     pub vision_gpu: Option<std::sync::Arc<std::sync::Mutex<crate::vision_gpu::GpuVisualTower>>>,
     /// Force the CPU vision tower (--vision-cpu), as a diagnostic/escape hatch.
     pub vision_cpu: bool,
+    /// Every token id that terminates an assistant turn for this model, resolved once at boot
+    /// from the model's own config files (QwenTokenizer::stop_token_ids). Phase-2 A3 uses it to
+    /// label a generation's terminal token as a stop token — a fact the Phase-1 ledger could
+    /// not recover from the transcripts (harness never reads finish_reason/terminal ids).
+    pub stop_ids: Vec<u32>,
     /// OTel generation-telemetry emitter (--otel-endpoint). `None` = OFF (the default): every
     /// telemetry hook site in the SSE path compiles to one `if let Some` branch — zero cost.
     /// Some = the lock-free-ring sink; the SSE chunk hooks below forward the SAME chunk bytes
@@ -255,6 +264,12 @@ struct ChatCompletionRequest {
     /// Stop sequences: accept either a string or a list of strings (OpenAI spec).
     #[serde(default, deserialize_with = "deserialize_stop")]
     stop: Vec<String>,
+    /// vLLM-compat: suppress EOS until this many tokens (llama-benchy --exact-tg).
+    #[serde(default)]
+    min_tokens: Option<usize>,
+    /// vLLM-compat: never stop on EOS (--exact-tg).
+    #[serde(default)]
+    ignore_eos: Option<bool>,
     /// OpenAI tool definitions. Passed straight to the model's chat template, which renders them into
     /// a `# Tools` system block. This field simply did not exist, so serde discarded it and the model
     /// was never told the tools were there -- it answered in prose and every agent harness broke.
@@ -283,6 +298,20 @@ struct ChatCompletionRequest {
     /// key (see crate::otel::SessionRegistry). Absent/other keys are ignored.
     #[serde(default)]
     metadata: Option<serde_json::Value>,
+    /// OpenAI `response_format`. Until Phase 13 this field did not exist on the request struct, so
+    /// serde DISCARDED it and every `{"type":"json_schema", ...}` request was silently unconstrained
+    /// (the F6 accept-and-ignore class). Now: `json_schema` is compiled into a token-level FSM and
+    /// the sampler is masked per step; anything outside the V1 subset is a LOUD 400 naming the
+    /// offending keyword. `{"type":"text"}`/absent = unconstrained, exactly as before.
+    #[serde(default)]
+    response_format: Option<serde_json::Value>,
+    /// vLLM/SGLang-compatible `chat_template_kwargs`: an ARBITRARY dict forwarded to the model's
+    /// own chat template (W1, Phase 13: the customer's `{"enable_thinking": false}` used to be
+    /// dropped by serde and the model kept thinking). `enable_thinking` (bool) selects the
+    /// template's thinking / no-think branch; every other key passes through verbatim. A
+    /// non-object value, or a non-bool `enable_thinking`, is a loud 400 — never accepted-and-ignored.
+    #[serde(default)]
+    chat_template_kwargs: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -433,11 +462,93 @@ async fn chat_completions(
     //
     // REGRESSION FIX (2026-08-30): the 289e1a1 refactor lumped "high" into the no_think arm,
     // so every OpenAI-convention client sending reasoning_effort=high silently LOST thinking.
+    // W2 (Phase 13): `response_format` — compiled HERE, before any work: an unsupported construct
+    // is a 400 naming the keyword (never accepted-and-ignored), a supported schema arms the mask.
+    // Phase-13 W2 STATUS (2026-09-13): the schema compiler, the token-level FSM, the mask kernels
+    // and the scheduler plumbing are all in this build (unit-tested), but end-to-end ENFORCEMENT
+    // could not be verified in the phase's boot budget: the mask is armed and restrictive
+    // ("[schema] verify mask armed: ... allowed_tokens_pos0=2") yet a token outside it still
+    // reached the stream, so this build REFUSES schema requests loudly instead of accepting them
+    // and quietly ignoring the constraint — the F6 class this work exists to delete. Flip
+    // JSON_SCHEMA_ENFORCEMENT_ENABLED to true once the emission path is proven end-to-end.
+    const JSON_SCHEMA_ENFORCEMENT_ENABLED: bool = false;
+    let mut schema_mask: Option<std::sync::Arc<crate::json_schema::SchemaMask>> = None;
+    if let Some(rf) = req.response_format.as_ref() {
+        match crate::json_schema::compile_response_format(rf) {
+            Ok(None) => {}
+            Ok(Some(mut m)) if JSON_SCHEMA_ENFORCEMENT_ENABLED => {
+                m.set_vocab(state.tokenizer.vocab_pieces());
+                eprintln!("[req] response_format: constrained decoding armed ({})", m.summary());
+                schema_mask = Some(std::sync::Arc::new(m));
+            }
+            Ok(Some(m)) => {
+                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": {
+                    "message": format!(
+                        "this build does not enforce json_schema constrained decoding yet \
+                         (Phase 13 W2 partial): every token would be unconstrained, so the \
+                         request is refused instead of accepted-and-ignored. Drop response_format \
+                         or use {{\"type\":\"text\"}}. Parsed schema: {}",
+                        m.summary()),
+                    "type": "invalid_request_error", "code": "json_schema_not_enforced",
+                }}))).into_response();
+            }
+            Err(e) => {
+                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": {
+                    "message": e, "type": "invalid_request_error", "code": "unsupported_response_format",
+                }}))).into_response();
+            }
+        }
+    }
+    // W1: `chat_template_kwargs` (arbitrary dict → the model's own template). Validate LOUDLY
+    // before any render: a malformed value used to be invisible (serde dropped the field), and
+    // the customer was left with a model that ignored the request. 400, never accept-and-ignore.
+    if let Err(e) = crate::tokenizer::enable_thinking_kwarg(req.chat_template_kwargs.as_ref()) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": {
+            "message": e.to_string(), "type": "invalid_request_error", "code": "invalid_chat_template_kwargs",
+        }}))).into_response();
+    }
     let effort_owned = resolve_reasoning_effort(&state.tokenizer, req.reasoning_effort.as_deref(),
                                                 state.reasoning_effort.as_deref());
     let effort: Option<&str> = effort_owned.as_deref();
+    // OpenAI/vLLM tool_choice contract. The engine has no guided-decode forcing, so the
+    // semantics are implemented at the prompt level (the same approach llama.cpp's server
+    // takes): "none" removes the tools entirely (the model cannot call what it cannot see);
+    // "required" / a specific function append an explicit forcing instruction naming the
+    // constraint. Scoring harnesses (tool-eval-bench) drive scenarios through these modes.
+    let forced_fn: Option<String> = match req.tool_choice.as_ref() {
+        Some(v) => {
+            let s = v.as_str().unwrap_or("");
+            if s == "none" { Some("__none__".to_string()) }
+            else if s == "required" || s == "auto" { None }  // auto = no forcing
+            else { v.pointer("/function/name").and_then(|n| n.as_str()).map(|n| n.to_string()) }
+        }
+        None => None,
+    };
+    let tools_for_template = if forced_fn.as_deref() == Some("__none__") { None } else { req.tools.as_deref() };
+    let mut messages = req.messages.clone();
+    {
+        let force_line: Option<String> = match forced_fn.as_deref() {
+            Some("__none__") => None, // tools already removed; nothing to force
+            Some(name) => Some(format!("IMPORTANT: You MUST call the function `{name}` with appropriate arguments before answering. Do not answer in plain text.")),
+            None if req.tool_choice.as_ref().and_then(|v| v.as_str()) == Some("required") =>
+                Some("IMPORTANT: You MUST use one of the provided tools to answer. Do not answer in plain text.".to_string()),
+            None => None,
+        };
+        if let Some(line) = force_line {
+            // Append to the LAST message: recency dominates instruction-following; a
+            // system-level line is routinely outweighed by the turn's own phrasing.
+            if let Some(last) = messages.last_mut() {
+                match &mut last.content {
+                    Some(c) => { c.push_str("\n\n"); c.push_str(&line); }
+                    None => { last.content = Some(line); }
+                }
+            }
+        }
+    }
     let t_render = std::time::Instant::now();
-    let prompt = match state.tokenizer.apply_chat_template(&req.messages, req.tools.as_deref(), effort) {
+    let prompt = match state.tokenizer.apply_chat_template(&messages, tools_for_template, effort,
+                                                          req.chat_template_kwargs.as_ref(),
+                                                          state.thinking) {
         Ok(p) => p,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
@@ -535,7 +646,8 @@ async fn chat_completions(
     // cache off this second render+encode is pure TTFT cost (fix (e), EXPERT_TTFT_PREFILL_RESPONSE).
     let ckpt_at = if state.prefix_cache {
         state.tokenizer
-            .apply_chat_template_no_gen(&req.messages, req.tools.as_deref(), effort).ok()
+            .apply_chat_template_no_gen(&req.messages, req.tools.as_deref(), effort,
+                                        req.chat_template_kwargs.as_ref(), state.thinking).ok()
             .and_then(|s| state.tokenizer.encode(&s, true).ok())
             .map(|t| t.len())
             .filter(|&n| n > 0 && n < prompt_len)
@@ -571,6 +683,7 @@ async fn chat_completions(
     // Use request's penalties if explicitly set, else fall back to server defaults.
     let rep_penalty = req.repetition_penalty.unwrap_or(state.default_rep_penalty);
     let presence_penalty = req.presence_penalty.unwrap_or(state.default_presence_penalty);
+    let pp_source = if req.presence_penalty.is_some() { "request" } else { "server-default" };
     let frequency_penalty = req.frequency_penalty.unwrap_or(state.default_frequency_penalty);
 
     let (tx, mut rx) = mpsc::unbounded_channel::<TokEvent>();
@@ -584,12 +697,15 @@ async fn chat_completions(
         rep_penalty,
         presence_penalty,
         frequency_penalty,
+        min_new: req.min_tokens.unwrap_or(0),
+        ignore_eos: req.ignore_eos.unwrap_or(false),
         tx,
         seed: req.seed,
         ckpt_at,
         domain: crate::batch::classify_domain(&prompt),
         image_embeds,
         image_spans,
+        schema: schema_mask.clone(),
     };
     let _ = state.scheduler.send(request);
 
@@ -643,6 +759,9 @@ async fn chat_completions(
         let t0 = std::time::Instant::now();
         let req_tools = req.tools.clone();
         let include_usage = req.stream_options.as_ref().map(|o| o.include_usage).unwrap_or(true);
+        // Owned copy: the SSE generator is 'static, so it cannot capture the `&str` that borrows
+        // effort_owned (A3 log line only; the render/ckpt calls above still use `effort`).
+        let effort_for_log: Option<String> = effort.map(|s| s.to_string());
         // Think markers + the initial reasoning/content state. Derive the start mode from the
         // RENDERED PROMPT TAIL, not a family constant: qwen's template primes an OPEN think block
         // when thinking (prompt ends with `<think>`), but its no-think branch (enable_thinking=
@@ -684,6 +803,7 @@ async fn chat_completions(
             let mut stream_dec = tokenizer.stream_decoder();
             let mut acc = String::new();
             let mut n = 0usize;
+            let mut last_tok: Option<u32> = None;
             let mut stop_hit = false;
             let mut finish = "length".to_string();
             let mut first_tok: Option<std::time::Instant> = None;
@@ -699,6 +819,7 @@ async fn chat_completions(
                 match ev {
                     TokEvent::Tok(t) => {
                         n += 1;
+                        last_tok = Some(t);
                         if first_tok.is_none() { first_tok = Some(std::time::Instant::now()); }
                         let text = stream_dec.push(t);
                         if !text.is_empty() {
@@ -826,6 +947,11 @@ async fn chat_completions(
                               done_content.chars().take(1200).collect::<String>());
                 }
             }
+            // Phase-4 A2: same empty-argument alarm as the non-streaming path — an agent harness
+            // streams, so this branch is the one that actually gets used.
+            for a in crate::tools::empty_arg_alarms(&done_content, req_tools.as_deref(), &parsed.tool_calls) {
+                eprintln!("[tool-args-alarm] {a}");
+            }
             let (_, tool_calls, fin) = crate::tools::finalize_parsed(&done_content, parsed, &finish);
             if !tool_calls.is_empty() {
                 // Log the ARGUMENTS, not just the names — see the note on the non-streaming path.
@@ -848,6 +974,13 @@ async fn chat_completions(
                 if let Some(r) = &otel_req { r.delta(&c); }
                 yield Ok(Event::default().data(c));
                 content_emitted = acc.len();
+            }
+            {
+                let (r_txt, c_txt) = split_think(&acc, think_open, think_close);
+                log_generation(&state.tokenizer, &state.stop_ids, &completion_id, &finish,
+                               last_tok, prompt_len, n, r_txt.as_deref(), &c_txt,
+                               tool_calls.len(), req_tools.as_ref().map(|t| t.len()).unwrap_or(0),
+                               effort_for_log.as_deref(), presence_penalty, pp_source);
             }
             let final_chunk = format!("{{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"{}\"}}]}}",
                 completion_id, created, model_name, spec_finish_reason(&finish));
@@ -928,6 +1061,12 @@ async fn chat_completions(
                           content.chars().take(1200).collect::<String>());
             }
         }
+        // Phase-4 A2: a call to a tool whose schema declares parameters that arrives with EMPTY
+        // arguments while the model emitted a NON-EMPTY body is an argument drop, not a quiet
+        // success. Log the raw body so the class can never regress unseen again.
+        for a in crate::tools::empty_arg_alarms(&content, req.tools.as_deref(), &parsed.tool_calls) {
+            eprintln!("[tool-args-alarm] {a}");
+        }
         let (content, tool_calls, finish) = crate::tools::finalize_parsed(&content, parsed, &finish);
         if !tool_calls.is_empty() {
             // Log the ARGUMENTS, not just the names. When opencode reported a write as successful and
@@ -940,6 +1079,13 @@ async fn chat_completions(
         }
         let tool_calls = if tool_calls.is_empty() { None } else { Some(tool_calls) };
 
+        log_generation(&state.tokenizer, &state.stop_ids, &completion_id, &finish,
+                       tokens.last().copied(), prompt_len, tokens.len(), reasoning.as_deref(),
+                       content.as_deref().unwrap_or(""),
+                       tool_calls.as_ref().map(|v| v.len()).unwrap_or(0),
+                       req.tools.as_ref().map(|t| t.len()).unwrap_or(0),
+                       effort, presence_penalty, pp_source);
+        dump_tokens(&completion_id, &tokens);
         let response = ChatCompletionResponse {
             id: completion_id,
             object: "chat.completion".to_string(),
@@ -964,8 +1110,50 @@ async fn chat_completions(
         Json(response).into_response()
     }
 }
+/// Diagnostics-only (env `RUST_INFER_DUMP_TOKENS=1`): one line per generation with the EXACT
+/// generated token ids. Why it exists: a served-text comparison cannot distinguish "the same
+/// tokens" from "different tokens that detokenize alike", and the bitwise-losslessness claim for a
+/// speculative lane (AGENTS §2.6/§3, P14's `--spec-source dflash` A/B) is a statement about the
+/// TOKEN sequence. Harness plumbing only — no response byte, no scheduler behaviour is touched.
+/// (Twin of `RUST_INFER_DUMP_PROMPT`, which does the same for the prompt ids.)
+fn dump_tokens(id: &str, tokens: &[u32]) {
+    if std::env::var("RUST_INFER_DUMP_TOKENS").is_err() { return; }
+    let ids: Vec<String> = tokens.iter().map(|t| t.to_string()).collect();
+    eprintln!("[gen-ids] id={id} n={} ids=[{}]", tokens.len(), ids.join(","));
+}
+
+/// Phase-2 A3 observability: ONE line per generation carrying exactly the fields the Phase-1
+/// ledger had to reconstruct — or could not recover at all — from the harness transcripts:
+/// the final finish_reason, the terminal token id and whether it is a model stop token, and the
+/// reasoning/content token split. `reasoning_tokens`/`content_tokens` are ENCODE-based (the two
+/// text spans are re-tokenized), so their sum can differ from `completion_tokens` by
+/// template/special-token effects; they are diagnostics, not billing. Log lines only: no
+/// response byte, no sampling parameter and no scheduler behaviour is touched.
+fn log_generation(tok: &QwenTokenizer, stop_ids: &[u32], id: &str, finish: &str,
+                  terminal: Option<u32>, prompt_tokens: usize, completion_tokens: usize,
+                  reasoning: Option<&str>, content: &str, tool_calls: usize,
+                  tools_offered: usize, effort: Option<&str>, presence_penalty: f32,
+                  pp_source: &str) {
+    let count = |s: Option<&str>| s.map(|x| tok.encode(x, false).map(|v| v.len()).unwrap_or(0))
+        .unwrap_or(0);
+    let r_tok = count(reasoning);
+    let c_tok = count(Some(content));
+    let is_stop = terminal.map(|t| stop_ids.contains(&t)).unwrap_or(false);
+    eprintln!("[gen] id={} finish={} terminal_tok={} is_stop_tok={} reasoning_tokens={} \
+               content_tokens={} completion_tokens={} prompt_tokens={} tool_calls={} \
+               tools_offered={} effort={} presence_penalty={} pp_source={}",
+        id, finish, terminal.map(|t| t.to_string()).unwrap_or_else(|| "none".into()), is_stop,
+        r_tok, c_tok, completion_tokens, prompt_tokens, tool_calls, tools_offered,
+        effort.unwrap_or("<template-default>"), presence_penalty, pp_source);
+}
+
+/// Phase-9 A.2 — the status route now carries the engine's OWN per-window decode telemetry
+/// (`crate::tel`): mode (mtp|dflash2), tp width, df2 block, chosen depth, accept@k, yield
+/// (tokens per verify forward), step p50/p90. Lock-free read; it never touches a decode step.
+/// Clients (owner harness, accept_gate.py) use it to see TRUE alpha instead of inferring it
+/// from wall-clock tokens. `status` stays "ok" so existing liveness probes are unaffected.
 async fn health() -> impl IntoResponse {
-    Json(serde_json::json!({"status": "ok"}))
+    Json(serde_json::json!({"status": "ok", "telemetry": crate::tel::snapshot_json()}))
 }
 
 // ─── POST /v1/tokenize ────────────────────────────────────────────────────────────────
@@ -1048,8 +1236,18 @@ async fn tokenize(State(state): State<AppState>, Json(body): Json<serde_json::Va
         let effort = resolve_reasoning_effort(&state.tokenizer,
                                               body.get("reasoning_effort").and_then(|v| v.as_str()),
                                               state.reasoning_effort.as_deref());
+        // W1: the messages mode of /v1/tokenize renders EXACTLY like chat_completions, including
+        // `chat_template_kwargs` — otherwise tokenize(messages) diverges from usage.prompt_tokens.
+        let kw = match body.get("chat_template_kwargs") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(v @ serde_json::Value::Object(_)) => Some(v.clone()),
+            Some(_) => return bad("'chat_template_kwargs' must be a JSON object".into()),
+        };
+        if let Err(e) = crate::tokenizer::enable_thinking_kwarg(kw.as_ref()) {
+            return bad(e.to_string());
+        }
         let rendered = match state.tokenizer.apply_chat_template(
-            &msgs, tools.as_deref(), effort.as_deref()) {
+            &msgs, tools.as_deref(), effort.as_deref(), kw.as_ref(), state.thinking) {
             Ok(p) => p,
             Err(e) => return bad(format!("chat template failed: {e}")),
         };
@@ -1185,9 +1383,144 @@ async fn detokenize(State(state): State<AppState>, Json(body): Json<serde_json::
     .into_response()
 }
 
+/// vLLM-style RAW completion endpoint: the prompt continues verbatim — NO chat template, NO
+/// thinking markers. This is the surface llama-benchy (the user's benchmark of record) drives;
+/// parity requires it. Also carries `min_tokens`/`ignore_eos` (--exact-tg) end to end.
+#[derive(Deserialize)]
+struct CompletionRequest {
+    #[serde(default)]
+    model: Option<String>,
+    /// vLLM accepts string | token-id array (token arrays are used verbatim, untokenized).
+    #[serde(default)]
+    prompt: Option<serde_json::Value>,
+    #[serde(default)]
+    max_tokens: Option<usize>,
+    #[serde(default)]
+    temperature: Option<f32>,
+    #[serde(default)]
+    top_p: Option<f32>,
+    #[serde(default)]
+    top_k: Option<usize>,
+    #[serde(default)]
+    stream: bool,
+    #[serde(default)]
+    min_tokens: Option<usize>,
+    #[serde(default)]
+    ignore_eos: Option<bool>,
+    #[serde(default)]
+    seed: Option<u64>,
+}
+
+async fn completions(
+    State(state): State<AppState>,
+    Json(req): Json<CompletionRequest>,
+) -> Response {
+    let prompt_tokens: Vec<u32> = match req.prompt.as_ref() {
+        Some(serde_json::Value::String(t)) => match state.tokenizer.encode(t, true) {
+            Ok(v) => v,
+            Err(e) => return (StatusCode::BAD_REQUEST, format!("tokenize failed: {e}")).into_response(),
+        },
+        Some(serde_json::Value::Array(a)) if !a.is_empty() && a[0].is_number() =>
+            a.iter().filter_map(|v| v.as_u64().map(|x| x as u32)).collect(),
+        _ => return (StatusCode::BAD_REQUEST,
+                     "prompt must be a string or a non-empty token-id array".to_string()).into_response(),
+    };
+    let prompt_len = prompt_tokens.len();
+    if prompt_len + 8 >= state.max_seq_len {
+        return (StatusCode::BAD_REQUEST, format!(
+            "prompt {} tokens leaves no room within max_seq_len {}", prompt_len, state.max_seq_len)).into_response();
+    }
+    let req_max = req.max_tokens.unwrap_or(16)
+        .min(state.max_seq_len - prompt_len);
+    let (tx, mut rx) = mpsc::unbounded_channel::<TokEvent>();
+    let request = BatchRequest {
+        prompt: prompt_tokens.clone(),
+        max_new: req_max,
+        temperature: req.temperature.unwrap_or_else(default_temperature),
+        top_p: req.top_p.unwrap_or_else(default_top_p),
+        top_k: req.top_k.unwrap_or_else(default_top_k),
+        rep_penalty: 1.0,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
+        min_new: req.min_tokens.unwrap_or(0).min(req_max),
+        ignore_eos: req.ignore_eos.unwrap_or(false),
+        tx,
+        seed: req.seed,
+        ckpt_at: None,
+        domain: crate::batch::Domain::General,
+        received_at: std::time::Instant::now(),
+        image_embeds: None,
+        image_spans: Vec::new(),
+        schema: None,
+    };
+    let (_mn, _ie) = (request.min_new, request.ignore_eos);
+    let _ = state.scheduler.send(request);
+    eprintln!("[req] completions prompt_tokens={} max_tokens={} min_tokens={} ignore_eos={} stream={}",
+              prompt_len, req_max, _mn, _ie, req.stream);
+    let model_name = req.model.clone().unwrap_or_else(|| state.model_name.clone());
+    let cid = format!("cmpl-{}", uuid::Uuid::new_v4());
+    let created = chrono::Utc::now().timestamp();
+
+    if req.stream {
+        let t0 = std::time::Instant::now();
+        let stream = async_stream::stream! {
+            let mut ntok: usize = 0;
+            let mut first_tok: Option<std::time::Instant> = None;
+            while let Some(ev) = rx.recv().await {
+                match ev {
+                    TokEvent::Tok(t) => {
+                        if first_tok.is_none() { first_tok = Some(std::time::Instant::now()); }
+                        ntok += 1;
+                        let text = state.tokenizer.decode(&[t], true).unwrap_or_default();
+                        let chunk = serde_json::json!({
+                            "id": cid, "object": "text_completion.chunk", "created": created,
+                            "model": model_name,
+                            "choices": [{"index": 0, "text": text, "finish_reason": null}],
+                        });
+                        yield Ok::<_, std::convert::Infallible>(Event::default().data(chunk.to_string()));
+                    }
+                    TokEvent::Finish { reason } => {
+                        let fr = if reason == "length" { "length" } else { "stop" };
+                        let chunk = serde_json::json!({
+                            "id": cid, "object": "text_completion.chunk", "created": created,
+                            "model": model_name,
+                            "choices": [{"index": 0, "text": "", "finish_reason": fr}],
+                        });
+                        yield Ok::<_, std::convert::Infallible>(Event::default().data(chunk.to_string()));
+                        yield Ok::<_, std::convert::Infallible>(Event::default().data("[DONE]"));
+                        let dt = t0.elapsed().as_secs_f32();
+                        eprintln!("[req] done   completions tok={} ({:.1} tok/s wall) finish={}", ntok, if dt>1e-6 {ntok as f32/dt} else {0.0}, fr);
+                        break;
+                    }
+                }
+            }
+        };
+        return Sse::new(stream).into_response();
+    }
+    // non-streaming: collect everything, detokenize once, single response.
+    let mut toks: Vec<u32> = Vec::with_capacity(req_max);
+    let mut finish = "stop".to_string();
+    while let Some(ev) = rx.recv().await {
+        match ev {
+            TokEvent::Tok(t) => toks.push(t),
+            TokEvent::Finish { reason } => { finish = if reason == "length" { "length".into() } else { "stop".into() }; break; }
+        }
+    }
+    let text = state.tokenizer.decode(&toks, true).unwrap_or_default();
+    dump_tokens(&cid, &toks);
+    let json = serde_json::json!({
+        "id": cid, "object": "text_completion", "created": created, "model": model_name,
+        "choices": [{"index": 0, "text": text, "finish_reason": finish, "logprobs": null}],
+        "usage": {"prompt_tokens": prompt_len, "completion_tokens": toks.len(),
+                  "total_tokens": prompt_len + toks.len()},
+    });
+    (StatusCode::OK, axum::Json(json)).into_response()
+}
+
 pub fn create_router(state: AppState) -> Router {
     Router::new()
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/completions", post(completions))
         .route("/v1/tokenize", post(tokenize))
         .route("/v1/detokenize", post(detokenize))
         .route("/v1/models", get(list_models))

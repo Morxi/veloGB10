@@ -88,7 +88,7 @@ pub fn parse(text: &str, tools: Option<&[Value]>) -> ParsedOutput {
         // arguments. `rest` MUST be cleared before breaking -- leaving it would append the partial XML
         // to content (and duplicate the prose before it), which is the exact leak this guards against.
         let Some(close) = after.find(CALL_CLOSE) else { rest = ""; break };
-        if let Some(tc) = parse_one(&after[..close], tools, tool_calls.len()) {
+        for tc in parse_block(&after[..close], tools, tool_calls.len()) {
             tool_calls.push(tc);
         }
         rest = &after[close + CALL_CLOSE.len()..];
@@ -181,40 +181,356 @@ fn find_function_tag(body: &str) -> Option<(usize, usize)> {
     None
 }
 
-/// Parse the inside of one `<tool_call>…</tool_call>`.
-fn parse_one(body: &str, tools: Option<&[Value]>, idx: usize) -> Option<ToolCall> {
-    let (fopen, tlen) = find_function_tag(body)?;
-    let after = &body[fopen + tlen..];
-    let gt = after.find('>')?;
-    let name = after[..gt].trim().to_string();
-    if name.is_empty() { return None; }
-
-    let schema = tools.and_then(|ts| param_schema(ts, &name));
-
-    let mut args = serde_json::Map::new();
-    let mut rest = &after[gt + 1..];
-    while let Some(popen) = rest.find("<parameter=") {
-        let a = &rest[popen + "<parameter=".len()..];
-        let Some(gt2) = a.find('>') else { break };
-        let key = a[..gt2].trim().to_string();
-        let vstart = &a[gt2 + 1..];
-        let Some(pclose) = vstart.find("</parameter>") else { break };
-        // The template puts a newline after `>` and before `</parameter>`; they are delimiters, not
-        // part of the value. Trim only those, so interior whitespace of a multi-line value survives.
-        let raw = vstart[..pclose].trim_matches('\n');
-        args.insert(key.clone(), coerce(raw, schema.and_then(|s| s.get(&key))));
-        rest = &vstart[pclose + "</parameter>".len()..];
+/// Parse one `<tool_call>…</tool_call>` body into ZERO OR MORE calls.
+///
+/// Two shapes are supported; the body decides:
+///  * a JSON object (the Froggeric `tool_call_format=json` emission) — one call, with the
+///    tolerant salvage rules in `parse_json_call`;
+///  * the XML form — EVERY `<function=NAME>` in the block becomes its own call. Before Phase 2
+///    only the FIRST function tag produced a call and every later function's `<parameter=…>`
+///    pairs were merged into it, same-key values overwritten (RENDER_AUDIT.md 9.2).
+fn parse_block(body: &str, tools: Option<&[Value]>, idx: usize) -> Vec<ToolCall> {
+    let trimmed = body.trim_start();
+    if trimmed.starts_with('{') {
+        if let Some(tc) = parse_json_call(trimmed, tools, idx) {
+            return vec![tc];
+        }
+        // Unparseable JSON body: fall through to the XML path rather than dropping the call.
     }
+    parse_xml_calls(body, tools)
+}
 
-    let _ = idx;
-    Some(ToolCall {
-        id: format!("call_{}", CALL_SEQ.fetch_add(1, Ordering::Relaxed)),
+/// The XML form: one call per `<function=NAME>` tag, each owning the `<parameter=…>` pairs up
+/// to the next tag. Also accepts a JSON-object body inside the function tag (the Froggeric
+/// template's string-arguments history form) when no `<parameter=` pair is present.
+fn parse_xml_calls(body: &str, tools: Option<&[Value]>) -> Vec<ToolCall> {
+    let mut calls = Vec::new();
+    let mut tags: Vec<(usize, usize)> = Vec::new();
+    let mut from = 0usize;
+    while let Some((i, tlen)) = find_function_tag(&body[from..]) {
+        tags.push((from + i, tlen));
+        from += i + tlen;
+    }
+    for (n, &(start, tlen)) in tags.iter().enumerate() {
+        let end = tags.get(n + 1).map(|&(s, _)| s).unwrap_or(body.len());
+        let after = &body[start + tlen..end];
+        let Some(gt) = after.find('>') else { continue };
+        let name = after[..gt].trim().to_string();
+        if name.is_empty() { continue; }
+
+        let schema = tools.and_then(|ts| param_schema(ts, &name));
+
+        let mut args = serde_json::Map::new();
+        let mut rest = &after[gt + 1..];
+        while let Some(popen) = rest.find("<parameter=") {
+            let a = &rest[popen + "<parameter=".len()..];
+            let Some(gt2) = a.find('>') else { break };
+            let key = a[..gt2].trim().to_string();
+            let vstart = &a[gt2 + 1..];
+            let Some(pclose) = vstart.find("</parameter>") else { break };
+            // The template puts a newline after `>` and before `</parameter>`; they are delimiters,
+            // not part of the value. Trim only those, so interior whitespace of a multi-line value
+            // survives.
+            let raw = vstart[..pclose].trim_matches('\n');
+            args.insert(key.clone(), coerce(raw, schema.and_then(|s| s.get(&key))));
+            rest = &vstart[pclose + "</parameter>".len()..];
+        }
+        if args.is_empty() {
+            let jb = after[gt + 1..].trim();
+            let jb = jb.strip_suffix("</function>").unwrap_or(jb).trim();
+            // A body that LOOKS like JSON is a JSON body: the Froggeric template's
+            // `raw_tool_args_history` branch renders the model's own previous calls as a JSON
+            // object inside the function tag, and the model imitates that while closing with the
+            // `</parameter>` tag it also sees in the XML example. So the emitted shape is
+            // `{…json…}\n</parameter>` — ONE stray trailing close tag. Strip it (and the
+            // whitespace between) before parsing. Before this, every such body fell through to
+            // `args` = {} and the harness invoked a real tool with no arguments: 6/6 lost
+            // (phase3/EMPTY_ARGS_EVIDENCE.md, PHASE3_REPORT.md 4.3), while the 5/5 clean-JSON
+            // bodies parsed. A non-empty body that still fails to yield arguments is ALARMED,
+            // never silently dropped.
+            let jsonish = jb.starts_with('{') || jb.starts_with('[');
+            if jsonish {
+                let jb = strip_stray_param_close(jb);
+                // Phase-5 B1: `json_object_lenient` = strict parse, then the unescaped-quote
+                // repair. An array, an unrepairable body or a truncated one still alarms.
+                match json_object_lenient(jb) {
+                    Some(o) => for (k, v) in o { args.insert(k, v); },
+                    None => eprintln!("[tool-args-alarm] {jb}"),
+                }
+            } else if !jb.is_empty() {
+                eprintln!("[tool-args-alarm] {jb}");
+            }
+        }
+        calls.push(ToolCall {
+            id: format!("call_{}", CALL_SEQ.fetch_add(1, Ordering::Relaxed)),
+            kind: "function".to_string(),
+            function: crate::tokenizer::FunctionCall {
+                name,
+                arguments: serde_json::to_string(&Value::Object(args)).unwrap_or_else(|_| "{}".into()),
+            },
+        });
+    }
+    calls
+}
+
+/// One JSON-body call. Strict `{"name": T, "arguments": …}` is the shipped form and is tried
+/// first; the three MALFORMED shapes the Phase-1 ledger proved the model actually emits inside
+/// `<tool_call>` are salvaged after it (LEDGER_REPORT.md 1.1.1):
+///   * wrapper    `{"function": T, "arguments": {…}}` / `{"function": {"name": T, …}}`
+///   * flattened  `{"function": T, "k": v, …}` — the remaining keys ARE the arguments
+///   * name-first `{T, "k": "v"}` — not valid JSON; repaired, T is the tool name
+/// The salvage shapes require the recovered name to be a tool of the request catalog (when the
+/// catalog is known), so structured-output JSON with an unrelated `name` field is never promoted
+/// to a call. The strict form keeps its original behaviour (no catalog check).
+fn parse_json_call(body: &str, tools: Option<&[Value]>, idx: usize) -> Option<ToolCall> {
+    let t = body.trim();
+    if let Ok(v) = serde_json::from_str::<Value>(t) {
+        return call_from_object(v.as_object()?, tools, idx);
+    }
+    // 2b. Phase-5 B1: valid JSON except for UNESCAPED quotes inside a string value —
+    //     `{"language":"python","code":"print("correct")"}`. The NVFP4 lane emits this ~4x
+    //     more often than FP8 (phase-4 alarm census); before the repair every argument was
+    //     lost. Repair first, then run the SAME shape resolution as the strict path.
+    if repair_quotes_enabled() {
+        if let Some(rep) = repair_unescaped_quotes(t) {
+            if let Ok(Value::Object(o)) = serde_json::from_str::<Value>(&rep) {
+                if let Some(tc) = call_from_object(&o, tools, idx) {
+                    return Some(tc);
+                }
+            }
+        }
+    }
+    // 3. not valid JSON: `{T, "k": "v"}` (name-first, unquoted name) — repair.
+    let (name, args) = salvage_name_first(t, tools)?;
+    Some(json_call(name, args, idx))
+}
+
+/// Resolve ONE already-parsed JSON object into a call, using the four shapes the ledger proved
+/// the model emits: strict OpenAI `{"name":T,"arguments":…}`, flattened `{"name":T,"k":v,…}`,
+/// wrapper `{"function":T|{…},"arguments":…}` and flattened `{"function":T,"k":v,…}`. Returns
+/// `None` for any object that is not one of them (never guesses a name).
+fn call_from_object(o: &serde_json::Map<String, Value>, tools: Option<&[Value]>, idx: usize) -> Option<ToolCall> {
+    // 1. strict OpenAI form.
+    if let Some(name) = o.get("name").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+        if let Some(args) = o.get("arguments") {
+            return Some(json_call(name.to_string(), args_to_string(args), idx));
+        }
+        // 1b. flattened name form: {"name": T, "k": v, …}
+        if let Some(args) = flat_args(o, &["name"]) {
+            return Some(json_call(name.to_string(), args, idx));
+        }
+    }
+    // 2. function-key wrapper / flattened form.
+    if let Some(f) = o.get("function") {
+        let (name, args) = match f {
+            Value::String(s) if !s.is_empty() => match o.get("arguments") {
+                Some(a) => (s.clone(), args_to_string(a)),
+                None => (s.clone(), flat_args(o, &["function"]).unwrap_or_else(|| "{}".into())),
+            },
+            Value::Object(fo) => {
+                let name = fo.get("name").and_then(Value::as_str)?.to_string();
+                let a = fo.get("arguments").or_else(|| o.get("arguments"));
+                (name, a.map(args_to_string).unwrap_or_else(|| "{}".into()))
+            }
+            _ => return None,
+        };
+        if !name.is_empty() && known_tool(tools, &name) {
+            return Some(json_call(name, args, idx));
+        }
+        return None;
+    }
+    None
+}
+
+/// Phase-5 B1 negative control switch. Production is ALWAYS on (`#[cfg(not(test))]` below
+/// returns true); tests flip it off in their own thread to prove the repair — and not some
+/// other salvage path — is what recovers the archived bodies.
+#[cfg(not(test))]
+fn repair_quotes_enabled() -> bool { true }
+
+#[cfg(test)]
+thread_local! {
+    static REPAIR_QUOTES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+#[cfg(test)]
+fn repair_quotes_enabled() -> bool { REPAIR_QUOTES.with(|c| c.get()) }
+#[cfg(test)]
+fn set_repair_quotes(on: bool) { REPAIR_QUOTES.with(|c| c.set(on)) }
+
+/// Phase-5 B1 — repair UNESCAPED double quotes inside JSON string VALUES.
+///
+/// Lex the text and escape every `"` that is INSIDE a string but cannot be its closing
+/// delimiter. A closing quote is followed (after optional whitespace) by one of `, } ] :` —
+/// the only characters that can legally follow a string in JSON; a quote followed by anything
+/// else is part of the value and must be escaped. A backslash escapes the next character, so
+/// already-escaped input (`\"`) is copied verbatim and never re-escaped.
+///
+/// `None` means NOT REPAIRABLE: nothing changed, a string was left unterminated, or the
+/// repaired text still does not parse as a JSON object. The caller then keeps the
+/// `[tool-args-alarm]` — an ambiguous body is never guessed (and a TRUNCATED body, which this
+/// never completes, stays alarmed by policy: see the phase-5 truncated-body decision).
+fn repair_unescaped_quotes(s: &str) -> Option<String> {
+    let mut out = String::with_capacity(s.len() + 8);
+    let mut in_string = false;
+    let mut changed = false;
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if !in_string {
+            if c == '"' { in_string = true; }
+            out.push(c);
+            continue;
+        }
+        match c {
+            '\\' => {
+                out.push(c);
+                if let Some(n) = it.next() { out.push(n); }
+            }
+            '"' => {
+                let closes = it.clone()
+                    .find(|ch| !ch.is_whitespace())
+                    .map_or(true, |ch| matches!(ch, ',' | '}' | ']' | ':'));
+                if closes {
+                    in_string = false;
+                    out.push('"');
+                } else {
+                    out.push_str("\\\"");
+                    changed = true;
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    if !changed || in_string { return None; }
+    match serde_json::from_str::<Value>(&out) {
+        Ok(Value::Object(_)) => Some(out),
+        _ => None,
+    }
+}
+
+/// Parse a function body as a JSON arguments object, applying the unescaped-quote repair when
+/// strict parsing fails. `None` => the caller emits the alarm.
+fn json_object_lenient(jb: &str) -> Option<serde_json::Map<String, Value>> {
+    if let Ok(Value::Object(o)) = serde_json::from_str::<Value>(jb) {
+        return Some(o);
+    }
+    if repair_quotes_enabled() {
+        if let Some(rep) = repair_unescaped_quotes(jb) {
+            if let Ok(Value::Object(o)) = serde_json::from_str::<Value>(&rep) {
+                return Some(o);
+            }
+        }
+    }
+    None
+}
+
+/// Strip ONE stray trailing `</parameter>` (plus the whitespace between the JSON and that tag)
+/// from a function body that otherwise looks like JSON. The model emits
+/// `{…json…}\n</parameter>` because it imitates the JSON body our render puts in the history
+/// while closing with the XML tag the system prompt shows. Returns the input unchanged when the
+/// tag is absent.
+fn strip_stray_param_close(jb: &str) -> &str {
+    let t = jb.trim_end();
+    match t.strip_suffix("</parameter>") {
+        Some(rest) => rest.trim_end(),
+        None => t,
+    }
+}
+
+/// The RAW function body the model emitted for `name`, verbatim (only outer whitespace
+/// trimmed). Used by the empty-argument alarm; `None` when the tag is not in the text.
+fn raw_function_body<'a>(raw: &'a str, name: &str) -> Option<&'a str> {
+    let wf = format!("<function={name}>");
+    let bare = format!("function={name}>");
+    let i = raw.find(&wf).or_else(|| raw.find(&bare))?;
+    let tlen = if raw[i..].starts_with(&wf) { wf.len() } else { bare.len() };
+    let rest = &raw[i + tlen..];
+    let end = ["</function>", "</tool_call>", "<function="].iter()
+        .filter_map(|m| rest.find(m))
+        .min()
+        .unwrap_or(rest.len());
+    Some(rest[..end].trim())
+}
+
+/// Phase-4 A2 — the empty-argument alarm.
+///
+/// For every parsed call whose arguments are EMPTY while the tool's schema declares parameters,
+/// return the raw function body the model emitted, when that body is non-empty. Callers log each
+/// returned body as `[tool-args-alarm] <raw body>`. This is the net that makes ANY future
+/// regression of the silent-argument-drop class visible in every serving log, instead of
+/// surfacing as a tool that "ran" and did nothing.
+pub fn empty_arg_alarms<'a>(raw: &'a str, tools: Option<&[Value]>, calls: &[ToolCall]) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    let Some(ts) = tools else { return out };
+    for c in calls {
+        let a = c.function.arguments.trim();
+        if !(a.is_empty() || a == "{}") { continue; }
+        let declares = param_schema(ts, &c.function.name).map_or(false, |p| !p.is_empty());
+        if !declares { continue; }
+        if let Some(body) = raw_function_body(raw, &c.function.name) {
+            if !body.is_empty() { out.push(body); }
+        }
+    }
+    out
+}
+
+fn json_call(name: String, arguments: String, idx: usize) -> ToolCall {
+    ToolCall {
+        id: format!("call_{:02x}", idx),
         kind: "function".to_string(),
-        function: FunctionCall {
-            name,
-            arguments: serde_json::to_string(&Value::Object(args)).unwrap_or_else(|_| "{}".into()),
-        },
-    })
+        function: crate::tokenizer::FunctionCall { name, arguments },
+    }
+}
+
+/// `arguments` value → the JSON string our ToolCall carries: a string is kept verbatim, an
+/// object/array is re-serialized, null becomes `{}`.
+fn args_to_string(a: &Value) -> String {
+    match a {
+        Value::String(s) => s.clone(),
+        Value::Null => "{}".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Every object key except `skip`, serialized as an arguments object (the flattened shape).
+fn flat_args(o: &serde_json::Map<String, Value>, skip: &[&str]) -> Option<String> {
+    let m: serde_json::Map<String, Value> = o.iter()
+        .filter(|(k, _)| !skip.contains(&k.as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    if m.is_empty() { None } else { Some(Value::Object(m).to_string()) }
+}
+
+/// Is `name` a tool of the request catalog? Unknown/absent catalog → true (the call is inside a
+/// `<tool_call>` block, i.e. the model already declared the intent).
+fn known_tool(tools: Option<&[Value]>, name: &str) -> bool {
+    match tools {
+        Some(ts) if !ts.is_empty() => ts.iter().any(|t| {
+            t.pointer("/function/name").and_then(Value::as_str) == Some(name)
+                || t.get("name").and_then(Value::as_str) == Some(name)
+        }),
+        _ => true,
+    }
+}
+
+/// Repair the invalid `{T, "k": "v"}` shape: first token is the tool name (quoted or bare), the
+/// rest is the argument object once wrapped in braces.
+fn salvage_name_first(t: &str, tools: Option<&[Value]>) -> Option<(String, String)> {
+    let inner = t.strip_prefix('{')?.trim_start();
+    let (name, rest) = if let Some(stripped) = inner.strip_prefix('"') {
+        let end = stripped.find('"')?;
+        (stripped[..end].to_string(), &stripped[end + 1..])
+    } else {
+        let end = inner.find(|c| c == ',' || c == '}')?;
+        (inner[..end].trim().to_string(), &inner[end..])
+    };
+    if name.is_empty() || !known_tool(tools, &name) { return None; }
+    let rest = rest.trim_start().trim_start_matches(',').trim();
+    let rest = rest.strip_suffix('}').unwrap_or(rest).trim();
+    if rest.is_empty() { return Some((name, "{}".to_string())); }
+    let repaired = format!("{{{rest}}}");
+    let v: Value = serde_json::from_str(&repaired).ok()?;
+    if !v.is_object() { return None; }
+    Some((name, v.to_string()))
 }
 
 /// `tools[i].function.parameters.properties` for the named function.
@@ -396,5 +712,335 @@ mod tests {
                           <arg_key:opensource>city", Some(&tools()));
         assert!(out2.tool_calls.is_empty());
         assert_eq!(out2.content, "thinking");
+    }
+
+    /// Phase-2 A2 acceptance: a `<tool_call>` with TWO `<function=>` blocks yields TWO calls,
+    /// each with its own arguments. Before the fix the second function was merged into the first
+    /// and same-key values overwrote each other (the probe in RENDER_AUDIT.md 9.2).
+    #[test]
+    fn two_functions_in_one_tool_call_block() {
+        let out = parse("<tool_call>\n<function=read_file>\n<parameter=file_id>\n/a\n</parameter>\n\
+                         </function>\n<function=read_file>\n<parameter=file_id>\n/b\n</parameter>\n\
+                         </function>\n</tool_call>", Some(&tools()));
+        assert_eq!(out.tool_calls.len(), 2, "each <function=> must be its own call");
+        let a0: Value = serde_json::from_str(&out.tool_calls[0].function.arguments).unwrap();
+        let a1: Value = serde_json::from_str(&out.tool_calls[1].function.arguments).unwrap();
+        assert_eq!(out.tool_calls[0].function.name, "read_file");
+        assert_eq!(out.tool_calls[1].function.name, "read_file");
+        assert_eq!(a0["file_id"], "/a");
+        assert_eq!(a1["file_id"], "/b", "same-key values must not overwrite across functions");
+        // Distinct-key variant: no cross-contamination either.
+        let out = parse("<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n\
+                         </function>\n<function=get_weather>\n<parameter=days>\n3\n</parameter>\n\
+                         </function>\n</tool_call>", Some(&tools()));
+        assert_eq!(out.tool_calls.len(), 2);
+        let b0: Value = serde_json::from_str(&out.tool_calls[0].function.arguments).unwrap();
+        let b1: Value = serde_json::from_str(&out.tool_calls[1].function.arguments).unwrap();
+        assert_eq!(b0["city"], "Paris");
+        assert!(b0.get("days").is_none(), "second function's params leaked into the first");
+        assert_eq!(b1["days"], 3);   // schema coercion still applies per call
+        assert!(b1.get("city").is_none());
+        // Multiple <tool_call> blocks per turn keep working (regression guard).
+        let out = parse("<tool_call>\n<function=get_weather>\n<parameter=city>\nRome\n</parameter>\n\
+                         </function>\n</tool_call>\n<tool_call>\n<function=get_weather>\n\
+                         <parameter=city>\nOslo\n</parameter>\n</function>\n</tool_call>", Some(&tools()));
+        assert_eq!(out.tool_calls.len(), 2);
+    }
+
+    /// Phase-2 A5: the three malformed JSON shapes the Phase-1 ledger proved are salvaged.
+    #[test]
+    fn json_salvage_shapes() {
+        let tools = vec![
+            serde_json::json!({"type": "function", "function": {"name": "get_weather",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"},
+                                                               "days": {"type": "integer"}}}}}),
+        ];
+        // (a) wrapper {"function": T, "arguments": {...}}
+        let out = parse("<tool_call>\n{\"function\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>", Some(&tools));
+        assert_eq!(out.tool_calls.len(), 1);
+        assert_eq!(out.tool_calls[0].function.name, "get_weather");
+        let a: Value = serde_json::from_str(&out.tool_calls[0].function.arguments).unwrap();
+        assert_eq!(a["city"], "Paris");
+        // (b) flattened {"function": T, k: v, ...}
+        let out = parse("<tool_call>\n{\"function\": \"get_weather\", \"city\": \"Paris\", \"days\": 3}\n</tool_call>", Some(&tools));
+        assert_eq!(out.tool_calls.len(), 1);
+        let a: Value = serde_json::from_str(&out.tool_calls[0].function.arguments).unwrap();
+        assert_eq!(a["city"], "Paris");
+        assert_eq!(a["days"], 3);
+        // (c) invalid name-first {T, "k": "v"}
+        let out = parse("<tool_call>\n{\"get_weather\", \"city\": \"Oslo\"}\n</tool_call>", Some(&tools));
+        assert_eq!(out.tool_calls.len(), 1);
+        assert_eq!(out.tool_calls[0].function.name, "get_weather");
+        let a: Value = serde_json::from_str(&out.tool_calls[0].function.arguments).unwrap();
+        assert_eq!(a["city"], "Oslo");
+        // Strict OpenAI form still wins unchanged.
+        let out = parse("<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Rome\"}}\n</tool_call>", Some(&tools));
+        assert_eq!(out.tool_calls.len(), 1);
+        assert_eq!(out.tool_calls[0].function.name, "get_weather");
+        // A JSON object that is NOT a tool call is not promoted to one.
+        let out = parse("<tool_call>\n{\"function\": \"not_a_tool\", \"arguments\": {}}\n</tool_call>", Some(&tools));
+        assert!(out.tool_calls.is_empty(), "unknown name must not become a call");
+    }
+
+    /// Phase-4 A1 acceptance: the SIX archived `json-body + stray </parameter>` bodies the model
+    /// literally emitted in the Phase-3 audit (phase3/EMPTY_ARGS_EVIDENCE.md, requests 2, 33, 38,
+    /// 40, 46, 50). Every one of them reached the harness as `{}` before the fix — 6/6 lost.
+    /// The fixtures are the emitted bytes, and the assertions are the exact arguments.
+    #[test]
+    fn phase4_archived_json_body_with_stray_parameter_tag() {
+        let tools = vec![
+            serde_json::json!({"type":"function","function":{"name":"send_email","parameters":{"type":"object","properties":{
+                "to":{"type":"string"},"subject":{"type":"string"},"body":{"type":"string"}}}}}),
+            serde_json::json!({"type":"function","function":{"name":"book_room","parameters":{"type":"object","properties":{
+                "room_id":{"type":"string"},"date":{"type":"string"},"time":{"type":"string"},
+                "duration_minutes":{"type":"integer"},"attendees":{"type":"array"}}}}}),
+            serde_json::json!({"type":"function","function":{"name":"get_incident","parameters":{"type":"object","properties":{
+                "incident_id":{"type":"string"}}}}}),
+            serde_json::json!({"type":"function","function":{"name":"update_incident","parameters":{"type":"object","properties":{
+                "incident_id":{"type":"string"},"expected_version":{"type":"integer"},"severity":{"type":"string"},
+                "assignee":{"type":"string"},"tags":{"type":"array"}}}}}),
+            serde_json::json!({"type":"function","function":{"name":"list_incidents","parameters":{"type":"object","properties":{
+                "status":{"type":"string"},"quarter":{"type":"string"},"page_token":{"type":"string"}}}}}),
+            serde_json::json!({"type":"function","function":{"name":"get_oncall_route","parameters":{"type":"object","properties":{}}}}),
+        ];
+        // (tool name, raw emitted body, expected arguments) — verbatim from the archive.
+        let cases: Vec<(&str, &str, Value)> = vec![
+            // request #2 — TC-18 / TC-87
+            ("send_email",
+             r#"{"to":"hans.mueller@firma.de","subject":"Meeting Terminänderung","body":"Der Termin wurde auf 15 Uhr verschoben. Bitte bestätigen Sie Ihre Teilnahme."}"#,
+             serde_json::json!({"to":"hans.mueller@firma.de","subject":"Meeting Terminänderung",
+                                "body":"Der Termin wurde auf 15 Uhr verschoben. Bitte bestätigen Sie Ihre Teilnahme."})),
+            // request #33 — TC-84
+            ("book_room",
+             r#"{"room_id":"berlin_5b","date":"2026-03-25","time":"14:00","duration_minutes":45,"attendees":["elena@company.com","ravi@company.com"]}"#,
+             serde_json::json!({"room_id":"berlin_5b","date":"2026-03-25","time":"14:00","duration_minutes":45,
+                                "attendees":["elena@company.com","ravi@company.com"]})),
+            // request #38 — TC-86
+            ("get_incident", r#"{"incident_id":"INC-442"}"#,
+             serde_json::json!({"incident_id":"INC-442"})),
+            // request #40 — TC-86
+            ("update_incident",
+             r#"{"incident_id":"INC-442","expected_version":8,"severity":"P1","assignee":"Mika","tags":["customer-impact","database"]}"#,
+             serde_json::json!({"incident_id":"INC-442","expected_version":8,"severity":"P1","assignee":"Mika",
+                                "tags":["customer-impact","database"]})),
+            // request #46 — TC-87 (page 2)
+            ("list_incidents", r#"{"status":"open","quarter":"Q3","page_token":"p2"}"#,
+             serde_json::json!({"status":"open","quarter":"Q3","page_token":"p2"})),
+            // request #50 — TC-87 (the digest email; body is the longest archived emission)
+            ("send_email",
+             r#"{"to":"oncall@company.com","subject":"Q3 Open P1 Incident Digest","body":"Q3 Open P1 Incident Digest\n\nPagination completed (final page confirmed, next_page_token = null).\n\nDeduplicated open P1 incidents (first-seen order):\n1. INC-901\n2. INC-902\n3. INC-903\n4. INC-904\n5. INC-905\n6. INC-906\n\nExact count: 6\n\nDuplicates removed: INC-902 (repeated on page 2), INC-905 (repeated on page 4).","incident_ids":["INC-901","INC-902","INC-903","INC-904","INC-905","INC-906"],"exact_count":6}"#,
+             serde_json::json!({"to":"oncall@company.com","subject":"Q3 Open P1 Incident Digest",
+                "body":"Q3 Open P1 Incident Digest\n\nPagination completed (final page confirmed, next_page_token = null).\n\nDeduplicated open P1 incidents (first-seen order):\n1. INC-901\n2. INC-902\n3. INC-903\n4. INC-904\n5. INC-905\n6. INC-906\n\nExact count: 6\n\nDuplicates removed: INC-902 (repeated on page 2), INC-905 (repeated on page 4).",
+                "incident_ids":["INC-901","INC-902","INC-903","INC-904","INC-905","INC-906"],"exact_count":6})),
+        ];
+        for (name, body, want) in cases {
+            let raw = format!("prose\n<tool_call>\n<function={name}>\n{body}\n</parameter>\n</function>\n</tool_call>");
+            let out = parse(&raw, Some(&tools));
+            assert_eq!(out.tool_calls.len(), 1, "one call for {name}");
+            let tc = &out.tool_calls[0];
+            assert_eq!(tc.function.name, name);
+            let got: Value = serde_json::from_str(&tc.function.arguments).unwrap();
+            assert_eq!(got, want, "arguments lost/incorrect for {name}: {}", tc.function.arguments);
+            assert_ne!(tc.function.arguments, "{}", "arguments must not come back empty");
+            // The A2 alarm must be silent when the arguments were recovered.
+            assert!(empty_arg_alarms(&raw, Some(&tools), &out.tool_calls).is_empty());
+        }
+        // Variant with no `</function>` (the model sometimes omits it before `</tool_call>`).
+        let raw = "<tool_call>\n<function=get_incident>\n{\"incident_id\":\"INC-442\"}\n</parameter>\n</tool_call>";
+        let out = parse(raw, Some(&tools));
+        let a: Value = serde_json::from_str(&out.tool_calls[0].function.arguments).unwrap();
+        assert_eq!(a["incident_id"], "INC-442");
+        // Clean JSON body inside the function tag (5/5 in the audit) keeps working unchanged.
+        let raw = "<tool_call>\n<function=get_incident>\n{\"incident_id\":\"INC-999\"}\n</function>\n</tool_call>";
+        let out = parse(raw, Some(&tools));
+        let a: Value = serde_json::from_str(&out.tool_calls[0].function.arguments).unwrap();
+        assert_eq!(a["incident_id"], "INC-999");
+        // A genuinely EMPTY body (the one legitimate zero-arg call in the audit) is still `{}` and
+        // is NOT alarmed: there was nothing to lose.
+        let raw = "<tool_call>\n<function=get_oncall_route>\n</function>\n</tool_call>";
+        let out = parse(raw, Some(&tools));
+        assert_eq!(out.tool_calls[0].function.arguments, "{}");
+        assert!(empty_arg_alarms(raw, Some(&tools), &out.tool_calls).is_empty());
+        // Two `<function=>` blocks, the first carrying the hybrid body — the second must still own
+        // its own arguments (Phase-2 A2 must not regress).
+        let raw = "<tool_call>\n<function=list_incidents>\n{\"status\":\"open\",\"quarter\":\"Q3\",\"page_token\":\"p2\"}\n</parameter>\n\
+                   </function>\n<function=get_incident>\n{\"incident_id\":\"INC-442\"}\n</parameter>\n</function>\n</tool_call>";
+        let out = parse(raw, Some(&tools));
+        assert_eq!(out.tool_calls.len(), 2);
+        let a0: Value = serde_json::from_str(&out.tool_calls[0].function.arguments).unwrap();
+        let a1: Value = serde_json::from_str(&out.tool_calls[1].function.arguments).unwrap();
+        assert_eq!(a0["page_token"], "p2");
+        assert_eq!(a1["incident_id"], "INC-442");
+    }
+
+    /// Phase-4 A2: a parameterized tool arriving with `{}` while the emitted body was NON-EMPTY is
+    /// reported with the raw body; a zero-arg tool (schema declares no parameters) never is.
+    #[test]
+    fn empty_arg_alarm_reports_raw_body() {
+        let tools = vec![
+            serde_json::json!({"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{
+                "city":{"type":"string"}}}}}),
+            serde_json::json!({"type":"function","function":{"name":"get_oncall_route","parameters":{"type":"object","properties":{}}}}),
+        ];
+        // A body the JSON fallback cannot read (unterminated object): args stay {}, call survives,
+        // and the raw body is alarmed rather than dropped silently.
+        let raw = "<tool_call>\n<function=get_weather>\n{\"city\": \"Paris\"\n</function>\n</tool_call>";
+        let out = parse(raw, Some(&tools));
+        assert_eq!(out.tool_calls.len(), 1);
+        assert_eq!(out.tool_calls[0].function.arguments, "{}");
+        let alarms = empty_arg_alarms(raw, Some(&tools), &out.tool_calls);
+        assert_eq!(alarms.len(), 1);
+        assert!(alarms[0].contains("\"city\": \"Paris\""), "alarm must carry the raw body: {alarms:?}");
+        // Zero-arg tool: empty arguments are legitimate.
+        let raw = "<tool_call>\n<function=get_oncall_route>\n</function>\n</tool_call>";
+        let out = parse(raw, Some(&tools));
+        assert!(empty_arg_alarms(raw, Some(&tools), &out.tool_calls).is_empty());
+        // Unknown catalog: no schema to compare against, so no alarm (never guess).
+        assert!(empty_arg_alarms(raw, None, &out.tool_calls).is_empty());
+    }
+
+    // ───────────────────────── Phase-5 B1: unescaped-quote repair ─────────────────────────
+
+    fn p5_tools() -> Vec<Value> {
+        vec![
+            serde_json::json!({"type":"function","function":{"name":"run_code","parameters":{"type":"object","properties":{
+                "language":{"type":"string"},"code":{"type":"string"}}}}}),
+            serde_json::json!({"type":"function","function":{"name":"list_incidents","parameters":{"type":"object","properties":{
+                "status":{"type":"string"},"quarter":{"type":"string"},"page_token":{"type":"string"}}}}}),
+            serde_json::json!({"type":"function","function":{"name":"get_oncall_route","parameters":{"type":"object","properties":{}}}}),
+        ]
+    }
+
+    fn p5_args(raw: &str, tools: &[Value]) -> (Value, usize) {
+        let out = parse(raw, Some(tools));
+        assert_eq!(out.tool_calls.len(), 1, "exactly one call expected from {raw}");
+        let a: Value = serde_json::from_str(&out.tool_calls[0].function.arguments).unwrap();
+        (a, empty_arg_alarms(raw, Some(tools), &out.tool_calls).len())
+    }
+
+    /// Phase-5 B1 acceptance: the ARCHIVED NVFP4 alarm body — the model wrote a code string
+    /// containing unescaped quotes (`print("correct")`) inside a JSON body, so serde rejected
+    /// the whole object and every argument was lost (phase4/N1a+N1b `[tool-args-alarm]`, 1
+    /// occurrence per leg). The repair escapes only the quotes that cannot close the string.
+    #[test]
+    fn phase5_unescaped_quote_body_is_repaired() {
+        let tools = p5_tools();
+        let (a, alarms) = p5_args(
+            "<tool_call>\n<function=run_code>\n{\"language\":\"python\",\"code\":\"print(\"correct\")\"}\n</function>\n</tool_call>",
+            &tools);
+        assert_eq!(a["language"], "python");
+        assert_eq!(a["code"], r#"print("correct")"#, "the inner quotes must survive verbatim");
+        assert_eq!(alarms, 0, "a recovered body must NOT be alarmed");
+
+        // Same body in the hybrid shape (JSON body + stray </parameter>) the FP8 lane emits.
+        let (a, alarms) = p5_args(
+            "<tool_call>\n<function=run_code>\n{\"language\":\"python\",\"code\":\"print(\"correct\")\"}\n</parameter>\n</function>\n</tool_call>",
+            &tools);
+        assert_eq!(a["code"], r#"print("correct")"#);
+        assert_eq!(alarms, 0);
+
+        // Hostile case: a code snippet with braces AND unescaped quotes inside the value.
+        let (a, _) = p5_args(
+            "<tool_call>\n<function=run_code>\n{\"language\":\"python\",\"code\":\"if (x) { print(\"y\") }\"}\n</function>\n</tool_call>",
+            &tools);
+        assert_eq!(a["code"], r#"if (x) { print("y") }"#);
+
+        // Multiple stray quotes in one value.
+        let (a, _) = p5_args(
+            "<tool_call>\n<function=run_code>\n{\"code\":\"a(\"b\")c(\"d\")e\"}\n</function>\n</tool_call>",
+            &tools);
+        assert_eq!(a["code"], r#"a("b")c("d")e"#);
+
+        // A stray quote in a KEY is repaired too (the same lexer rule applies).
+        let (a, _) = p5_args(
+            "<tool_call>\n<function=run_code>\n{\"co\"de\":\"x\"}\n</function>\n</tool_call>",
+            &tools);
+        assert_eq!(a["co\"de"], "x");
+
+        // Empty string values are untouched by the repair (already valid JSON).
+        let (a, _) = p5_args(
+            "<tool_call>\n<function=run_code>\n{\"language\":\"python\",\"code\":\"\"}\n</function>\n</tool_call>",
+            &tools);
+        assert_eq!(a["code"], "");
+    }
+
+    /// NEGATIVE CONTROL: with the repair DISABLED the archived body is NOT recovered — it comes
+    /// back as `{}` and the alarm fires, which is exactly the pre-Phase-5 behavior. If this test
+    /// ever passes with the repair off, some other path is doing the work and the B1 claim is
+    /// false.
+    #[test]
+    fn phase5_negative_control_repair_disabled() {
+        let tools = p5_tools();
+        let raw = "<tool_call>\n<function=run_code>\n{\"language\":\"python\",\"code\":\"print(\"correct\")\"}\n</function>\n</tool_call>";
+        set_repair_quotes(false);
+        let (a, alarms) = p5_args(raw, &tools);
+        assert_eq!(a, serde_json::json!({}), "with the repair OFF the arguments must be lost");
+        assert_eq!(alarms, 1, "with the repair OFF the alarm must fire");
+        set_repair_quotes(true);
+        let (a, alarms) = p5_args(raw, &tools);
+        assert_eq!(a["code"], r#"print("correct")"#, "with the repair ON the arguments return");
+        assert_eq!(alarms, 0);
+    }
+
+    /// The repair must never COMPLETE a truncated body (Phase-5 B2 policy: a silently closed
+    /// JSON is a wrong-args hazard). Archived occurrence: phase4/R3 (FP8, parallel 3).
+    #[test]
+    fn phase5_truncated_body_is_not_salvaged() {
+        let tools = p5_tools();
+        let raw = "<tool_call>\n<function=list_incidents>\n{\"status\":\"open\",\"quarter\":\"Q3\",\"page_token\":\"p4\"\n</parameter>\n</function>\n</tool_call>";
+        let (a, alarms) = p5_args(raw, &tools);
+        assert_eq!(a, serde_json::json!({}), "a truncated body must never be auto-completed");
+        assert_eq!(alarms, 1, "a truncated body must stay alarmed");
+        // A body whose final `}` never arrived AND whose string never closed, inside a block
+        // that was itself cut off (no </function>): the whole call is dropped — never
+        // half-parsed, never auto-completed (the pre-existing truncation rule).
+        let raw2 = "<tool_call>\n<function=run_code>\n{\"code\":\"print(\"correct)";
+        let out2 = parse(raw2, Some(&tools));
+        assert!(out2.tool_calls.is_empty(), "a truncated block must yield NO call at all");
+        // Control: the SAME content with a closing `}` and closing quote IS a complete object
+        // (the model wrote an unbalanced snippet, not a truncated one) — the repair salvages it
+        // and the value is what the model literally wrote. Documented, not accidental.
+        let raw2b = "<tool_call>\n<function=run_code>\n{\"code\":\"print(\"correct)\"}\n</function>\n</tool_call>";
+        let (a2b, alarms2b) = p5_args(raw2b, &tools);
+        assert_eq!(a2b["code"], "print(\"correct)");
+        assert_eq!(alarms2b, 0);
+        // Missing comma between two pairs: escaping both stray quotes must NOT rescue it (the
+        // repaired text still fails to parse), so the alarm stays.
+        let raw3 = "<tool_call>\n<function=run_code>\n{\"language\":\"x\" \"code\":\"y\"}\n</function>\n</tool_call>";
+        let (a3, alarms3) = p5_args(raw3, &tools);
+        assert_eq!(a3, serde_json::json!({}));
+        assert_eq!(alarms3, 1);
+    }
+
+    /// The repair is a no-op on input that is already valid JSON: `repair_unescaped_quotes`
+    /// returns None (nothing changed), and the strict path handles the body unchanged.
+    #[test]
+    fn phase5_repair_leaves_valid_json_alone() {
+        let body = r#"{"language":"python","code":"print(\"correct\")"}"#;
+        assert!(repair_unescaped_quotes(body).is_none(), "valid JSON must not be rewritten");
+        let tools = p5_tools();
+        let (a, alarms) = p5_args(
+            &format!("<tool_call>\n<function=run_code>\n{body}\n</function>\n</tool_call>"),
+            &tools);
+        assert_eq!(a["code"], r#"print("correct")"#);
+        assert_eq!(alarms, 0);
+        // A nested object/array value with braces is untouched.
+        let body2 = r#"{"language":"python","code":"d = {\"k\": [1, 2]}"}"#;
+        assert!(repair_unescaped_quotes(body2).is_none());
+    }
+
+    /// Strict-form repair: the model wraps an unescaped-quote body in the OpenAI shape, which
+    /// used to fall through to the XML path and produce an `arguments` object containing the
+    /// whole envelope. With the repair the call is resolved by the strict path.
+    #[test]
+    fn phase5_strict_form_with_unescaped_quotes() {
+        let tools = p5_tools();
+        let raw = "<tool_call>\n{\"name\":\"run_code\",\"arguments\":{\"language\":\"python\",\"code\":\"print(\"hi\")\"}}\n</tool_call>";
+        let out = parse(raw, Some(&tools));
+        assert_eq!(out.tool_calls.len(), 1);
+        assert_eq!(out.tool_calls[0].function.name, "run_code");
+        let a: Value = serde_json::from_str(&out.tool_calls[0].function.arguments).unwrap();
+        assert_eq!(a["code"], r#"print("hi")"#);
+        assert!(empty_arg_alarms(raw, Some(&tools), &out.tool_calls).is_empty());
     }
 }

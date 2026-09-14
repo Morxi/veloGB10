@@ -201,7 +201,10 @@ pub struct PackedFp8 {
 }
 
 /// The per-tensor payload of a baked artifact — which weight-only format the
-/// sidecar carries.
+/// sidecar carries. Clone: the round-shard branch (PLAN/ROUND_SHARD_W2_WORKDOC.md §3)
+/// picks a tensor by name and then SLICES it, so it needs an owned copy to slice
+/// (the unsharded branch still borrows).
+#[derive(Clone)]
 pub enum QuantTensor {
     Nvfp4(PackedNvfp4),
     Fp8(PackedFp8),
@@ -210,6 +213,80 @@ pub enum QuantTensor {
 impl QuantTensor {
     pub fn name(&self) -> &str {
         match self { QuantTensor::Nvfp4(p) => &p.name, QuantTensor::Fp8(p) => &p.name }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PLAN/ROUND_SHARD_W2_WORKDOC.md §3.1: the round-shard bands, in the PACKED domain.
+// Every format's packed layout is row-major in M, so:
+//   * M-bands (q/k/v/gate/up, the OUTPUT-row split) are contiguous row slices;
+//   * K-bands (o/down, the K split) are byte-column slices that must stay aligned to
+//     the format's scale group AND to the MMA repack's K constraint (nvfp4 K%32 with
+//     k0%32==0; fp8 K%16 with k0%16==0) — the repack asserts are the backstop, these
+//     asserts are the first line (an odd k-block count would silently skip the last
+//     block and still look like a model: quant.rs:1027-1030).
+// The struct's `m`/`k` are trimmed so `upload_nvfp4`/`upload_fp8` (and their
+// `gs`-length / row-scale bookkeeping) need no change.
+// ---------------------------------------------------------------------------
+impl PackedNvfp4 {
+    /// Output-row band [r0, r1): q/k/v/gate/up. Requires r0 % 1 (row granularity).
+    pub fn slice_rows(&self, r0: usize, r1: usize) -> PackedNvfp4 {
+        assert!(r0 < r1 && r1 <= self.m, "nvfp4 slice_rows {r0}..{r1} of m={}", self.m);
+        let kb = self.k / 2;
+        let sb = self.k / 16;
+        let mut qweight = Vec::with_capacity((r1 - r0) * kb);
+        let mut scales = Vec::with_capacity((r1 - r0) * sb);
+        for r in r0..r1 {
+            qweight.extend_from_slice(&self.qweight[r * kb..(r + 1) * kb]);
+            scales.extend_from_slice(&self.scales[r * sb..(r + 1) * sb]);
+        }
+        PackedNvfp4 { name: self.name.clone(), qweight, scales,
+                      global_scale: self.global_scale, m: r1 - r0, k: self.k }
+    }
+
+    /// K band [k0, k1): o/down. `k0` and the band length must be multiples of 32 (the
+    /// paired-k MMA group); scale columns move by k0/16.
+    pub fn slice_k(&self, k0: usize, k1: usize) -> PackedNvfp4 {
+        assert!(k0 < k1 && k1 <= self.k, "nvfp4 slice_k {k0}..{k1} of k={}", self.k);
+        assert!(k0 % 32 == 0 && (k1 - k0) % 32 == 0,
+                "nvfp4 K-band must be 32-aligned: k0={k0} len={} (the MMA repack asserts K%32;                  an unaligned band would silently drop the last k-block)", k1 - k0);
+        let kb = self.k / 2;
+        let sb = self.k / 16;
+        let mut qweight = Vec::with_capacity(self.m * ((k1 - k0) / 2));
+        let mut scales = Vec::with_capacity(self.m * ((k1 - k0) / 16));
+        for r in 0..self.m {
+            qweight.extend_from_slice(&self.qweight[r * kb + k0 / 2..r * kb + k1 / 2]);
+            scales.extend_from_slice(&self.scales[r * sb + k0 / 16..r * sb + k1 / 16]);
+        }
+        PackedNvfp4 { name: self.name.clone(), qweight, scales,
+                      global_scale: self.global_scale, m: self.m, k: k1 - k0 }
+    }
+}
+
+impl PackedFp8 {
+    /// Output-row band [r0, r1): q/k/v/gate/up (`row_scale` moves with M).
+    pub fn slice_rows(&self, r0: usize, r1: usize) -> PackedFp8 {
+        assert!(r0 < r1 && r1 <= self.m, "fp8 slice_rows {r0}..{r1} of m={}", self.m);
+        let kb = self.k;
+        let mut qweight = Vec::with_capacity((r1 - r0) * kb);
+        for r in r0..r1 { qweight.extend_from_slice(&self.qweight[r * kb..(r + 1) * kb]); }
+        PackedFp8 { name: self.name.clone(), qweight,
+                    row_scale: self.row_scale[r0..r1].to_vec(), m: r1 - r0, k: self.k }
+    }
+
+    /// K band [k0, k1): o/down. `k0` and the band length must be multiples of 16 (the MMA
+    /// repack asserts K%16); row scales are K-independent and stay whole.
+    pub fn slice_k(&self, k0: usize, k1: usize) -> PackedFp8 {
+        assert!(k0 < k1 && k1 <= self.k, "fp8 slice_k {k0}..{k1} of k={}", self.k);
+        assert!(k0 % 16 == 0 && (k1 - k0) % 16 == 0,
+                "fp8 K-band must be 16-aligned: k0={k0} len={}", k1 - k0);
+        let kb = self.k;
+        let mut qweight = Vec::with_capacity(self.m * (k1 - k0));
+        for r in 0..self.m {
+            qweight.extend_from_slice(&self.qweight[r * kb + k0..r * kb + k1]);
+        }
+        PackedFp8 { name: self.name.clone(), qweight, row_scale: self.row_scale.clone(),
+                    m: self.m, k: k1 - k0 }
     }
 }
 

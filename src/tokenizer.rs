@@ -11,14 +11,106 @@ pub struct QwenTokenizer {
     /// field of `tokenizer_config.json`). `None` only when no template file is found
     /// next to the tokenizer, in which case the legacy hand-rolled template is used.
     chat_env: Option<minijinja::Environment<'static>>,
+    /// Server-wide `tool_call_format` template kwarg (Froggeric-class templates: 'xml' default,
+    /// 'json' = the model's native Qwen tool-call syntax our parser handles). None = the
+    /// template's own default applies.
+    pub tool_call_format: Option<String>,
+    /// Froggeric-class agentic guard: pass `auto_disable_thinking_with_tools=true` to the
+    /// template (thinking auto-disables when the request carries tools — the template's own
+    /// fix for tool-call stalls under thinking; default off = the template's default).
+    pub auto_disable_think_tools: bool,
+    /// Template provenance captured at load: (origin, sha256 hex, byte length). Phase-2 A3
+    /// observability — the boot line must show WHICH template the process renders with: the
+    /// base model dir ships the STOCK Qwen template, and a leg booted against it silently renders
+    /// a different prompt (RENDER_AUDIT.md 9.1).
+    pub template_meta: Option<(String, String, u64)>,
+    /// True when the loaded template has a `tc.arguments is string` branch (Froggeric-class).
+    /// Only then is the RAW OpenAI `arguments` string handed to the template — that is what the
+    /// reference renders verbatim inside `<function=…>` (RENDER_AUDIT.md 2.2). Templates without
+    /// the branch still need the parsed-object form (they iterate `arguments | items`).
+    pub raw_tool_args_history: bool,
+}
+
+/// The server-wide `--thinking` policy (W1, Phase 13): may the ENGINE override the model
+/// template's own thinking default, and in which direction?
+///
+///   Auto (default) — pass NOTHING to the template. The model's own `chat_template.jinja`
+///                    decides. This is what makes a user-edited template (thinking defaulted
+///                    OFF) actually take effect: the engine no longer hardcodes
+///                    `enable_thinking=true` into every render, which was overriding the
+///                    template's own default branch.
+///   On             — render the template's thinking branch (`enable_thinking=true`).
+///   Off            — render its no-think branch (`enable_thinking=false`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThinkingMode { Auto, On, Off }
+
+impl ThinkingMode {
+    /// Parse the CLI spelling. Unknown values are the caller's error (never silently defaulted).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" | "" => Some(Self::Auto),
+            "on" | "true" | "yes" | "1" => Some(Self::On),
+            "off" | "false" | "no" | "0" | "no_think" => Some(Self::Off),
+            _ => None,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self { Self::Auto => "auto", Self::On => "on", Self::Off => "off" }
+    }
+    /// The value to hand the template, or `None` to pass nothing at all (Auto).
+    pub fn as_option(self) -> Option<bool> {
+        match self { Self::Auto => None, Self::On => Some(true), Self::Off => Some(false) }
+    }
+}
+
+/// Resolve `enable_thinking` for ONE render. Precedence, most specific wins:
+///   1. the request's `chat_template_kwargs.enable_thinking` (a bool) — the client said it;
+///   2. the request's `reasoning_effort` in its off-class (`off` / `no_think`) — OpenAI's
+///      no-think conventions, which the Qwen template cannot accept as an effort value;
+///   3. the server's `--thinking` policy (On/Off; Auto contributes nothing);
+///   4. `None` — pass nothing and let the model's OWN template decide.
+///
+/// This is the whole W1 fix in one place: a customer sending
+/// `chat_template_kwargs: {"enable_thinking": false}` must reach the render, and a customer
+/// who edits the template instead must get THEIR default when nobody asks otherwise.
+pub fn resolve_enable_thinking(kwarg: Option<bool>, effort: Option<&str>,
+                               server: ThinkingMode) -> Option<bool> {
+    kwarg
+        .or_else(|| match effort { Some("off") | Some("no_think") => Some(false), _ => None })
+        .or(server.as_option())
+}
+
+/// Extract `enable_thinking` from a request's `chat_template_kwargs`, with the two failure
+/// modes that used to be silent:
+///   - the field must be a JSON object (not a string/array/null);
+///   - `enable_thinking`, when present, must be a boolean.
+/// Both raise, so the handler turns them into a loud 400 instead of dropping the client's
+/// request on the floor (the accept-and-ignore class of F6).
+pub fn enable_thinking_kwarg(kwargs: Option<&serde_json::Value>) -> Result<Option<bool>> {
+    let Some(v) = kwargs else { return Ok(None) };
+    let Some(map) = v.as_object() else {
+        anyhow::bail!("'chat_template_kwargs' must be a JSON object (got {})",
+                      match v { serde_json::Value::Null => "null".to_string(), other => other.to_string() });
+    };
+    match map.get("enable_thinking") {
+        None => Ok(None),
+        Some(serde_json::Value::Bool(b)) => Ok(Some(*b)),
+        Some(other) => anyhow::bail!("'chat_template_kwargs.enable_thinking' must be a boolean (got {other})"),
+    }
 }
 
 impl QwenTokenizer {
     pub fn from_file(path: &str) -> Result<Self> {
         let tokenizer = load_tokenizer(path)?;
-        let chat_env = load_chat_env(path);
+        let (chat_env, template_meta, raw_tool_args_history) = match load_chat_env(path) {
+            Some((env, meta, raw)) => (Some(env), Some(meta), raw),
+            None => (None, None, false),
+        };
         let model_dir = Path::new(path).parent().map(|p| p.to_path_buf());
-        Ok(Self { tokenizer, chat_env, model_dir })
+        Ok(Self {
+            tokenizer, chat_env, model_dir, tool_call_format: None, auto_disable_think_tools: false,
+            template_meta, raw_tool_args_history,
+        })
     }
 
     pub fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>> {
@@ -87,6 +179,13 @@ impl QwenTokenizer {
     ///
     /// Nothing here is Qwen-specific: it is whatever the model ships. The name fallback at the end
     /// only fires if the model declares nothing at all.
+    /// Every (token id, piece BYTES) pair of the model vocabulary. This is the token layer of
+    /// the JSON-schema FSM walk (W2): the trie is built over bytes because a piece is not always
+    /// valid UTF-8 on its own, and the schema machine consumes bytes.
+    pub fn vocab_pieces(&self) -> Vec<(u32, Vec<u8>)> {
+        self.tokenizer.get_vocab(true).into_iter().map(|(s, id)| (id as u32, s.into_bytes())).collect()
+    }
+
     pub fn stop_token_ids(&self, config_eos: u32) -> Vec<u32> {
         let vocab = self.tokenizer.get_vocab(true);
         let mut ids: Vec<u32> = vec![config_eos];
@@ -156,8 +255,10 @@ impl QwenTokenizer {
     /// the request struct, so serde discarded it silently), which is why every agent harness failed.
     pub fn apply_chat_template(&self, messages: &[ChatMessage],
                                tools: Option<&[serde_json::Value]>,
-                               reasoning_effort: Option<&str>) -> Result<String> {
-        self.render_chat(messages, tools, true, reasoning_effort)
+                               reasoning_effort: Option<&str>,
+                               tpl_kwargs: Option<&serde_json::Value>,
+                               thinking: ThinkingMode) -> Result<String> {
+        self.render_chat(messages, tools, true, reasoning_effort, tpl_kwargs, thinking)
     }
 
     /// The same prompt WITHOUT the trailing `<|im_start|>assistant\n<think>\n`.
@@ -171,20 +272,45 @@ impl QwenTokenizer {
     /// token: `879 of 880 matched`. That single token cost a full re-prefill of the entire conversation.
     pub fn apply_chat_template_no_gen(&self, messages: &[ChatMessage],
                                       tools: Option<&[serde_json::Value]>,
-                                      reasoning_effort: Option<&str>) -> Result<String> {
-        self.render_chat(messages, tools, false, reasoning_effort)
+                                      reasoning_effort: Option<&str>,
+                                      tpl_kwargs: Option<&serde_json::Value>,
+                                      thinking: ThinkingMode) -> Result<String> {
+        self.render_chat(messages, tools, false, reasoning_effort, tpl_kwargs, thinking)
     }
 
     fn render_chat(&self, messages: &[ChatMessage], tools: Option<&[serde_json::Value]>,
-                   add_generation_prompt: bool, reasoning_effort: Option<&str>) -> Result<String> {
+                   add_generation_prompt: bool, reasoning_effort: Option<&str>,
+                   tpl_kwargs: Option<&serde_json::Value>, thinking: ThinkingMode) -> Result<String> {
         if let Some(env) = &self.chat_env {
-            let msgs: Vec<serde_json::Value> = messages.iter().map(|m| m.to_template_json()).collect();
+            let msgs: Vec<serde_json::Value> =
+                messages.iter().map(|m| m.to_template_json(self.raw_tool_args_history)).collect();
             let mut ctx = serde_json::json!({
                 "messages": msgs,
                 "tools": tools,
                 "add_generation_prompt": add_generation_prompt,
-                "enable_thinking": true,
             });
+            // W1: `chat_template_kwargs` (the vLLM/SGLang field OpenAI clients send) is an
+            // ARBITRARY dict forwarded to the model's own template context. Managed keys are
+            // handled with explicit precedence below; every other key passes through verbatim so
+            // a template can consume whatever variable it declares. The engine-owned context keys
+            // (messages/tools/add_generation_prompt) are never clobberable by a request.
+            let mut kw_enable: Option<bool> = None;
+            if let Some(v) = tpl_kwargs {
+                let map = v.as_object().ok_or_else(|| anyhow::anyhow!(
+                    "'chat_template_kwargs' must be a JSON object"))?;
+                for (k, val) in map {
+                    match k.as_str() {
+                        "enable_thinking" => {
+                            kw_enable = Some(val.as_bool().ok_or_else(|| anyhow::anyhow!(
+                                "'chat_template_kwargs.enable_thinking' must be a boolean (got {val})"))?);
+                        }
+                        "messages" | "tools" | "add_generation_prompt" => {
+                            anyhow::bail!("'chat_template_kwargs' may not override engine key '{k}'");
+                        }
+                        _ => { ctx[k.as_str()] = val.clone(); }
+                    }
+                }
+            }
             // hy_v3 optional reasoning: the template's `reasoning_effort` knob ('no_think'|'low'|
             // 'high'; undefined => 'no_think'). Passed as a STRING only — a JSON null raises in the
             // template. Other families' templates ignore the variable.
@@ -197,11 +323,23 @@ impl QwenTokenizer {
             // path (dsv4_chat) handles its "no_think" knob separately; this branch only ever
             // sees the Qwen "chat" template.
             if let Some(e) = reasoning_effort {
-                if e == "off" || e == "no_think" {
-                    ctx["enable_thinking"] = serde_json::Value::Bool(false);
-                } else {
+                if e != "off" && e != "no_think" {
                     ctx["reasoning_effort"] = serde_json::Value::String(e.to_string());
                 }
+            }
+            // W1 fix: `enable_thinking` is passed ONLY when somebody actually asked for a
+            // direction (request kwarg > no-think effort > --thinking on/off). In Auto with no
+            // request directive we pass NOTHING, so the model's own template decides — a
+            // user-edited template with thinking defaulted OFF now renders its own default
+            // instead of being overridden by a hardcoded engine value.
+            if let Some(et) = resolve_enable_thinking(kw_enable, reasoning_effort, thinking) {
+                ctx["enable_thinking"] = serde_json::Value::Bool(et);
+            }
+            if let Some(f) = &self.tool_call_format {
+                ctx["tool_call_format"] = serde_json::Value::String(f.clone());
+            }
+            if self.auto_disable_think_tools {
+                ctx["auto_disable_thinking_with_tools"] = serde_json::Value::Bool(true);
             }
             let rendered = env.get_template("chat")
                 .map_err(|e| anyhow::anyhow!("minijinja get_template: {}", e))?
@@ -411,7 +549,7 @@ impl ChatMessage {
     /// OpenAI hands us `arguments` as a JSON **string**. Passing the string straight through makes the
     /// template blow up (or worse, silently emit nonsense), so parse it back into an object here. If it
     /// is not valid JSON we pass an empty object rather than failing the whole request.
-    fn to_template_json(&self) -> serde_json::Value {
+    fn to_template_json(&self, raw_tool_args: bool) -> serde_json::Value {
         let mut m = serde_json::Map::new();
         m.insert("role".into(), serde_json::Value::String(self.role.clone()));
         let content = match &self.content {
@@ -441,8 +579,17 @@ impl ChatMessage {
         }
         if let Some(tcs) = &self.tool_calls {
             let arr: Vec<serde_json::Value> = tcs.iter().map(|tc| {
-                let args: serde_json::Value = serde_json::from_str(&tc.function.arguments)
-                    .unwrap_or_else(|_| serde_json::json!({}));
+                // Froggeric-class templates render the RAW arguments string verbatim inside
+                // `<function=…>` when it is a string — exactly what the reference
+                // (transformers/vLLM) produces for the harness's canonical OpenAI form. The
+                // object form takes the template's `is mapping` branch instead and expands
+                // `<parameter=…>` blocks (RENDER_AUDIT.md 2.2).
+                let args: serde_json::Value = if raw_tool_args {
+                    serde_json::Value::String(tc.function.arguments.clone())
+                } else {
+                    serde_json::from_str(&tc.function.arguments)
+                        .unwrap_or_else(|_| serde_json::json!({}))
+                };
                 serde_json::json!({
                     "id": tc.id,
                     "type": tc.kind,
@@ -502,7 +649,7 @@ mod tests {
                 reasoning_content: None,
             },
         ];
-        let rendered = tok.apply_chat_template(&messages, None, None)
+        let rendered = tok.apply_chat_template(&messages, None, None, None, ThinkingMode::Auto)
             .expect("render must not raise 'too many arguments' on non-string tool args");
         assert!(rendered.contains("read"), "tool name should appear in the prompt");
         assert!(rendered.contains("60"), "numeric argument should render unescaped");
@@ -618,7 +765,7 @@ mod tests {
             },
             ChatMessage::user("Continue it for another 1000 words."),
         ];
-        let rendered = tok.apply_chat_template(&messages, None, None).expect("render");
+        let rendered = tok.apply_chat_template(&messages, None, None, None, ThinkingMode::Auto).expect("render");
 
         eprintln!("===== RENDERED PROMPT START =====\n{}\n===== RENDERED PROMPT END =====", rendered);
 
@@ -645,6 +792,167 @@ mod tests {
             "expected exactly one priming <think> tag, got:\n{}",
             rendered
         );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // W1 (Phase 13): the thinking toggle. Two prongs, one root cause each:
+    //   (a) `chat_template_kwargs: {"enable_thinking": false}` was dropped by serde entirely;
+    //   (b) the engine hardcoded `enable_thinking: true` into EVERY render, so a user-edited
+    //       `chat_template.jinja` whose default is "off" could never take effect.
+    // These tests lock the precedence table and the render behaviour; the GPU leg (one 35B boot)
+    // only has to confirm the live server path.
+    // ---------------------------------------------------------------------------------------
+
+    /// The CLI spelling -> mode mapping (and the fact that unknown spellings are rejected rather
+    /// than silently defaulted to Auto).
+    #[test]
+    fn thinking_mode_parse() {
+        assert_eq!(ThinkingMode::parse("auto"), Some(ThinkingMode::Auto));
+        assert_eq!(ThinkingMode::parse("AUTO"), Some(ThinkingMode::Auto));
+        assert_eq!(ThinkingMode::parse("on"), Some(ThinkingMode::On));
+        assert_eq!(ThinkingMode::parse("true"), Some(ThinkingMode::On));
+        assert_eq!(ThinkingMode::parse("off"), Some(ThinkingMode::Off));
+        assert_eq!(ThinkingMode::parse("no_think"), Some(ThinkingMode::Off));
+        assert_eq!(ThinkingMode::parse("maybe"), None);
+        assert_eq!(ThinkingMode::Auto.as_option(), None);
+        assert_eq!(ThinkingMode::On.as_option(), Some(true));
+        assert_eq!(ThinkingMode::Off.as_option(), Some(false));
+    }
+
+    /// Precedence, most specific wins: request kwarg > no-think effort > --thinking > template.
+    #[test]
+    fn resolve_enable_thinking_precedence() {
+        use ThinkingMode::*;
+        assert_eq!(resolve_enable_thinking(None, None, Auto), None);
+        assert_eq!(resolve_enable_thinking(None, None, On), Some(true));
+        assert_eq!(resolve_enable_thinking(None, None, Off), Some(false));
+        assert_eq!(resolve_enable_thinking(Some(false), None, On), Some(false));
+        assert_eq!(resolve_enable_thinking(Some(true), None, Off), Some(true));
+        assert_eq!(resolve_enable_thinking(None, Some("off"), Auto), Some(false));
+        assert_eq!(resolve_enable_thinking(None, Some("no_think"), Auto), Some(false));
+        assert_eq!(resolve_enable_thinking(None, Some("xhigh"), Auto), None);
+        assert_eq!(resolve_enable_thinking(None, Some("high"), Auto), None);
+    }
+
+    /// `chat_template_kwargs` validation: the two malformed shapes must RAISE (they become a loud
+    /// 400), never be dropped on the floor.
+    #[test]
+    fn enable_thinking_kwarg_validation() {
+        assert_eq!(enable_thinking_kwarg(None).unwrap(), None);
+        assert_eq!(enable_thinking_kwarg(Some(&serde_json::json!({}))).unwrap(), None);
+        assert_eq!(enable_thinking_kwarg(Some(&serde_json::json!({"enable_thinking": false}))).unwrap(), Some(false));
+        assert_eq!(enable_thinking_kwarg(Some(&serde_json::json!({"enable_thinking": true}))).unwrap(), Some(true));
+        assert_eq!(enable_thinking_kwarg(Some(&serde_json::json!({"preserve_thinking": true}))).unwrap(), None);
+        assert!(enable_thinking_kwarg(Some(&serde_json::json!("not-an-object"))).is_err());
+        assert!(enable_thinking_kwarg(Some(&serde_json::json!({"enable_thinking": "false"}))).is_err());
+    }
+
+    /// Find a tokenizer fixture for the render-level tests: env override first, then the local
+    /// model dirs. Tests SKIP (never fail) when the box has no model - the convention the other
+    /// template tests in this file already use.
+    fn fixture_tokenizer() -> Option<(QwenTokenizer, String)> {
+        let cands: Vec<String> = std::env::var("GB10_TEST_TOKENIZER").ok().into_iter()
+            .chain([
+                "models/3.6-35b-nvfp4-mixed/tokenizer.json".to_string(),
+                "models/3.8-27b-nvfp4-full-all/tokenizer.json".to_string(),
+                "models/0.8b-nvfp4-mixed/tokenizer.json".to_string(),
+                "4b/tokenizer.json".to_string(),
+            ]).collect();
+        for c in cands {
+            if let Ok(t) = QwenTokenizer::from_file(&c) { return Some((t, c)); }
+        }
+        None
+    }
+
+    /// The customer's exact request: `chat_template_kwargs: {"enable_thinking": false}` must render
+    /// the template's NO-THINK branch (a closed, empty think block); `true`/absent must render the
+    /// thinking branch. Skips when no model fixture is present.
+    #[test]
+    fn render_enable_thinking_kwarg_real_template() {
+        let Some((tok, path)) = fixture_tokenizer() else {
+            eprintln!("skip: no tokenizer fixture for the W1 render test");
+            return;
+        };
+        let msgs = vec![ChatMessage::user("Reply with one word.")];
+        let base = tok.apply_chat_template(&msgs, None, None, None, ThinkingMode::Auto)
+            .expect("render (auto)");
+        let off = tok.apply_chat_template(&msgs, None, None,
+                                           Some(&serde_json::json!({"enable_thinking": false})),
+                                           ThinkingMode::Auto).expect("render (off)");
+        let on = tok.apply_chat_template(&msgs, None, None,
+                                          Some(&serde_json::json!({"enable_thinking": true})),
+                                          ThinkingMode::Auto).expect("render (on)");
+        eprintln!("[W1] fixture={path}");
+        eprintln!("[W1] auto tail={:?}", &base[base.len().saturating_sub(40)..]);
+        eprintln!("[W1] off  tail={:?}", &off[off.len().saturating_sub(40)..]);
+        assert!(off.ends_with("<think>\n\n</think>\n\n"),
+                "enable_thinking=false must render the closed think block; tail={:?}",
+                &off[off.len().saturating_sub(60)..]);
+        assert!(on.ends_with("<think>\n"),
+                "enable_thinking=true must prime the think block; tail={:?}",
+                &on[on.len().saturating_sub(60)..]);
+        assert!(base.ends_with("<think>\n"),
+                "the template's own default (this family) primes the think block; tail={:?}",
+                &base[base.len().saturating_sub(60)..]);
+    }
+
+    /// PRONG (b): a user-edited template whose DEFAULT is "no thinking" must be honoured when the
+    /// request asks for nothing. Built in a temp dir from a synthetic template + a real tokenizer.
+    #[test]
+    fn template_edit_default_off_is_honoured() {
+        let Some((_, path)) = fixture_tokenizer() else {
+            eprintln!("skip: no tokenizer fixture for the W1 template-edit test");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("w1_tpl_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::copy(&path, dir.join("tokenizer.json")).expect("copy tokenizer");
+        std::fs::write(dir.join("chat_template.jinja"), concat!(
+            "{{- '<|im_start|>user\n' }}{{ messages[0].content }}{{ '<|im_end|>\n' }}",
+            "{%- if add_generation_prompt %}{{- '<|im_start|>assistant\n' }}",
+            "{%- if enable_thinking is defined and enable_thinking is true %}{{- '<think>\n' }}",
+            "{%- else %}{{- '<think>\n\n</think>\n\n' }}{%- endif %}{%- endif %}",
+        )).expect("write template");
+
+        let tok = QwenTokenizer::from_file(&dir.join("tokenizer.json").to_string_lossy()).expect("load");
+        assert!(tok.chat_env.is_some(), "synthetic template must compile");
+        let msgs = vec![ChatMessage::user("hi")];
+        let auto = tok.apply_chat_template(&msgs, None, None, None, ThinkingMode::Auto).expect("auto");
+        let on = tok.apply_chat_template(&msgs, None, None, None, ThinkingMode::On).expect("on");
+        let off = tok.apply_chat_template(&msgs, None, None, None, ThinkingMode::Off).expect("off");
+        assert!(auto.ends_with("<think>\n\n</think>\n\n"),
+                "template default OFF must win when the request asks nothing: {auto:?}");
+        assert!(on.ends_with("<think>\n"), "--thinking on must override the template default: {on:?}");
+        assert!(off.ends_with("<think>\n\n</think>\n\n"), "--thinking off keeps it off: {off:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Arbitrary (non-managed) `chat_template_kwargs` reach the template context verbatim, and the
+    /// engine-owned keys cannot be clobbered by a request.
+    #[test]
+    fn chat_template_kwargs_passthrough_and_guards() {
+        let Some((_, path)) = fixture_tokenizer() else {
+            eprintln!("skip: no tokenizer fixture for the kwargs passthrough test");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("w1_kw_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::copy(&path, dir.join("tokenizer.json")).expect("copy tokenizer");
+        std::fs::write(dir.join("chat_template.jinja"),
+            "{{- messages|length }}:{{ my_custom_var|default('unset') }}").expect("write template");
+        let tok = QwenTokenizer::from_file(&dir.join("tokenizer.json").to_string_lossy()).expect("load");
+        let msgs = vec![ChatMessage::user("hi")];
+        let r = tok.apply_chat_template(&msgs, None, None,
+                                        Some(&serde_json::json!({"my_custom_var": "hello"})),
+                                        ThinkingMode::Auto).expect("render with custom kwarg");
+        assert!(r.contains("hello"), "arbitrary kwarg must reach the template: {r}");
+        let err = tok.apply_chat_template(&msgs, None, None,
+                                          Some(&serde_json::json!({"messages": []})),
+                                          ThinkingMode::Auto);
+        assert!(err.is_err(), "a request must not be able to clobber the engine's `messages` key");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -684,7 +992,7 @@ fn load_tokenizer(path: &str) -> Result<Tokenizer> {
 /// to the `chat_template` string inside `tokenizer_config.json`. Returns `None`
 /// (so the legacy template is used) only if neither exists or the template fails
 /// to compile.
-fn load_chat_env(tokenizer_path: &str) -> Option<minijinja::Environment<'static>> {
+fn load_chat_env(tokenizer_path: &str) -> Option<(minijinja::Environment<'static>, (String, String, u64), bool)> {
     let dir = Path::new(tokenizer_path).parent()?;
     let jinja_path = dir.join("chat_template.jinja");
     let (source, origin) = if jinja_path.exists() {
@@ -696,6 +1004,18 @@ fn load_chat_env(tokenizer_path: &str) -> Option<minijinja::Environment<'static>
         let s = tc.get("chat_template")?.as_str()?.to_string();
         (s, tc_path.display().to_string())
     };
+    // Provenance for the boot line (Phase-2 A3): hash the template TEXT that is compiled, so a
+    // leg can never silently run against a different template than the one it claims.
+    let nbytes = source.len() as u64;
+    let digest = {
+        use sha2::Digest;
+        let mut h = sha2::Sha256::new();
+        h.update(source.as_bytes());
+        format!("{:x}", h.finalize())
+    };
+    // Only Froggeric-class templates have a string-arguments branch; for those the raw OpenAI
+    // arguments string is the reference-faithful history form (see to_template_json).
+    let raw_tool_args = source.contains("arguments is string");
     // The template source must outlive the environment. The server is a long-running
     // process that loads each model exactly once, so a one-time leak of a few KB is
     // acceptable and avoids per-request recompilation.
@@ -704,14 +1024,51 @@ fn load_chat_env(tokenizer_path: &str) -> Option<minijinja::Environment<'static>
     register_pycompat(&mut env);
     match env.add_template("chat", static_src) {
         Ok(_) => {
-            eprintln!("[tokenizer] loaded chat template from {}", origin);
-            Some(env)
+            eprintln!("[tokenizer] loaded chat template from {} (sha256 {} {} bytes, raw_tool_args_history={})",
+                      origin, &digest[..12], nbytes, raw_tool_args);
+            Some((env, (origin, digest, nbytes), raw_tool_args))
         }
         Err(e) => {
             eprintln!("[tokenizer] WARNING: chat template failed to compile ({}); using legacy manual template", e);
             None
         }
     }
+}
+
+/// Python `json.dumps(..., ensure_ascii=False)` separators: `", "` between items and `": "`
+/// between key and value. serde_json's default formatter writes compact separators, which made
+/// our tool-definition block 345-1,346 tokens shorter than the reference render on the harness
+/// catalogs (RENDER_AUDIT.md 2.1). Combined with the `preserve_order` features (serde_json +
+/// minijinja) this makes the template's `tojson` byte-identical to transformers' `tojson`
+/// filter for the same catalog. Non-ASCII passes through unescaped, as in Python with
+/// ensure_ascii=False.
+struct PyJsonFormatter;
+impl serde_json::ser::Formatter for PyJsonFormatter {
+    fn begin_array_value<W: ?Sized + std::io::Write>(&mut self, writer: &mut W, first: bool)
+        -> std::io::Result<()> {
+        if first { Ok(()) } else { writer.write_all(b", ") }
+    }
+    fn begin_object_key<W: ?Sized + std::io::Write>(&mut self, writer: &mut W, first: bool)
+        -> std::io::Result<()> {
+        if first { Ok(()) } else { writer.write_all(b", ") }
+    }
+    fn begin_object_value<W: ?Sized + std::io::Write>(&mut self, writer: &mut W)
+        -> std::io::Result<()> {
+        writer.write_all(b": ")
+    }
+}
+
+/// Serialize a minijinja value the way Python's `json.dumps(x, ensure_ascii=False)` does
+/// (default separators, insertion order). Used by the `tojson` filter — the only JSON the
+/// templates emit into the prompt.
+fn to_python_json(v: &minijinja::value::Value) -> Result<String, minijinja::Error> {
+    use serde::Serialize;
+    let mut buf: Vec<u8> = Vec::with_capacity(256);
+    let mut ser = serde_json::Serializer::with_formatter(&mut buf, PyJsonFormatter);
+    v.serialize(&mut ser).map_err(|e| minijinja::Error::new(
+        minijinja::ErrorKind::InvalidOperation, format!("tojson: {e}")))?;
+    String::from_utf8(buf).map_err(|e| minijinja::Error::new(
+        minijinja::ErrorKind::InvalidOperation, format!("tojson: {e}")))
 }
 
 /// Register an `unknown_method_callback` that bridges Jinja2/Python string methods —
@@ -735,12 +1092,11 @@ fn register_pycompat(env: &mut minijinja::Environment<'static>) {
     env.add_filter("tojson", |v: minijinja::value::Value, kwargs: minijinja::value::Kwargs|
                    -> Result<String, minijinja::Error> {
         // The hy_v3 template calls `value | tojson(ensure_ascii=False)` when replaying non-string
-        // tool_call arguments. serde_json already emits literal UTF-8 (== ensure_ascii=False
-        // semantics — the only value any known template passes), so the kwarg is consumed and
-        // ignored; WITHOUT this a kwarg'd call raises "too many arguments" and the whole request 500s.
+        // tool_call arguments. Python's json.dumps(ensure_ascii=False) emits literal UTF-8, which
+        // is what to_python_json does, so the kwarg is consumed and ignored; WITHOUT this a
+        // kwarg'd call raises "too many arguments" and the whole request 500s.
         let _ = kwargs.get::<Option<bool>>("ensure_ascii").ok().flatten();
-        serde_json::to_string(&v).map_err(|e| minijinja::Error::new(
-            minijinja::ErrorKind::InvalidOperation, format!("tojson: {e}")))
+        to_python_json(&v)
     });
     env.add_function("raise_exception", |msg: String| -> Result<minijinja::value::Value, minijinja::Error> {
         Err(minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, msg))

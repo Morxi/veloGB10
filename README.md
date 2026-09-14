@@ -271,8 +271,10 @@ Two properties are treated as non-negotiable and are enforced by gates, not by h
 ## What it does today
 
 - **OpenAI-compatible server** — streaming, tool calling (schema-aware argument coercion, with a
-  single canonical serializer across streaming and non-streaming), seedable sampling, continuous
-  batching, prefix caching, and OpenAI `reasoning_effort` levels (`none/low/medium/high/xhigh/max`).
+  single canonical serializer across streaming and non-streaming, and **reference-exact tool
+  rendering** — key insertion order preserved so the `<tools>` block matches transformers/vLLM
+  byte-for-byte), seedable sampling, continuous batching, prefix caching, and OpenAI
+  `reasoning_effort` levels (`none/low/medium/high/xhigh/max`).
   Also exposes vLLM-compatible `POST /v1/tokenize` and `POST /v1/detokenize` endpoints for
   benchmarking.
 - **Built-in OpenTelemetry** — `--otel-endpoint <URL>` streams OTLP/HTTP-JSON generation telemetry
@@ -285,8 +287,12 @@ Two properties are treated as non-negotiable and are enforced by gates, not by h
   opportunistically: a non-vision or incompatible model serves text-only, never a startup crash.
 - **MTP speculative decoding** — native multi-token prediction heads with an auto-depth policy
   that measures its own cost/acceptance trade-off live and re-picks depth (or disables itself)
-  per workload. No configuration required. An additional opt-in `--spec-source dflash2-tree` mode
-  adds tree verification alongside MTP/DFlash2.
+  per workload. No configuration required.
+- **Pluggable drafters** — `--spec-source` selects the speculative source (`mtp`, `dflash2`,
+  `dflash2-auto`, `dflash2-tree`, **`dflash`** — the DFlash v1 lane, **`dspark`** — the DSpark
+  drafter, or `none`), with `--draft-dir` pointing at the drafter artifact. DFlash v1 and DSpark run
+  under TP=2/TP=4 as well as single-node. `--df2-block 8|16` selects the DFlash2 draft block size
+  (16 measured +23% pooled at TP=4 on the mission set; opt-in, default 8).
 - **Two-node / four-node TP serving** — see below.
 - **NVFP4 / FP8 mixed-precision quantization** — offline quantizer producing HF-compatible
   compressed-tensors artifacts; NVFP4 tensor-core GEMMs for the serving path, plus direct load of
@@ -463,7 +469,11 @@ construction. Both are pure tokenizer calls (no forward, no KV, no GPU work).
 | `--output-prompts [n]` | off | Log each chat request human-readable (params, messages, rendered prompt); optional render cap `n` |
 | `--mtp <auto\|on\|off>` | auto | MTP speculative decoding. `auto` measures whether it pays and self-tunes depth from live acceptance; greedy verify is bitwise-lossless, temp>0 distribution-exact. `on`/`off` force it (benchmarking) |
 | `--mtp-depth <N>` | auto | Pin draft depth instead of auto-picking (benchmarking) |
-| `--spec-source <mode>` | auto | Speculative source: `mtp` / `dflash2` / `dflash2-rq` / `dflash2-auto` / `dflash2-tree` (tree verification, opt-in) / `none` |
+| `--spec-source <mode>` | auto | Speculative source: `mtp` / `dflash` (DFlash v1 lane) / `dflash2` / `dflash2-rq` / `dflash2-auto` / `dflash2-tree` (tree verification) / `dflash2-synth` / `dspark` (DSpark drafter) / `none` |
+| `--draft-dir <DIR>` | — | Drafter artifact directory (used with `--spec-source dflash*`/`dspark`) |
+| `--df2-block <8\|16>` | 8 | DFlash2 draft block size (16 is opt-in; measured +23% pooled at TP=4 on the mission set) |
+| `--prefill-sched <inline\|cursor>` | inline | Prefill scheduling: `cursor` runs the window loop in the step loop (two-lane prefill) |
+| `--tripwire` | off | Release-live pool/OOB tripwire (with `--pool-census`, `--tripwire-selftest`) |
 | `--ngram-draft <N>` | 0 | EXPERIMENTAL prompt-lookup drafting, n-gram order N (0 = off) |
 | `--prefix-cache <on\|off>` | off | Reuse a conversation's cached prefix (~3× faster follow-up turns). Not bit-exact across reuse; greedy MTP stays lossless |
 | `--default-repetition-penalty <F>` | 1.0 | Repetition penalty (1.0 = off) |

@@ -4,6 +4,12 @@
 #include <cuda_bf16.h>
 #include <cstdint>
 
+// DF2 block-16: window_B packs the sliding window and the draft block length. The low bits
+// MUST hold BLOCK (8 today, 16 with --df2-block 16), so the field is 5 bits wide — at 4 bits
+// BLOCK=16 would be truncated to 0 and every band-attention launch would read B=0.
+#define DF2_WB_SHIFT 5
+#define DF2_WB_MASK  0x1F
+
 // ---- Build-ID stamp: makes a stale PTX impossible to run silently ----
 // build.rs hashes the .cu bytes and passes the result as -DKERNEL_BUILD_ID. GpuModel::load reads this
 // global back out of the loaded module and asserts it equals the ID compiled into the BINARY. A fresh
@@ -539,7 +545,7 @@ extern "C" __global__ void __launch_bounds__(128) gqa_attn_band_b(
     const int nkv = nh_packed & 0x3FF;
     const int ntot   = (int)(ntot_stride >> 16);
     const int stride = (int)(ntot_stride & 0xFFFF);
-    const int window = window_B >> 4;
+    const int window = window_B >> DF2_WB_SHIFT;
     // VOLATILE smem is LOAD-BEARING: ptxas -O2/-O3 (CUDA 13.0.88, sm_121) miscompiles this
     // kernel's barrier-ordered scores/red pattern — sporadically reorders a shared access
     // across bar.sync, so one block reads stale smem and emits a whole-block wrong output
@@ -555,7 +561,7 @@ extern "C" __global__ void __launch_bounds__(128) gqa_attn_band_b(
     int lo = qp - (window - 1);
     if (lo < 0) lo = 0;
 
-    const int B = window_B & 0xF;             // S10R: unpacked (scores bound; see ring twin)
+    const int B = window_B & DF2_WB_MASK;             // S10R: unpacked (scores bound; see ring twin)
     volatile float* qs = sm;              // [hd]
     // S10R — WINDOW-BOUNDED scores region, relative index j - lo (same bound + proof as
     // gqa_attn_band_ring_b; PLAN/B8_S10R_DISSECTION.md §4): min(window+B, ntot) slots.
@@ -650,8 +656,8 @@ extern "C" __global__ void __launch_bounds__(128) gqa_attn_band_ring_b(
     const int ntot    = ntot_dev ? *ntot_dev : (int)(ntot_stride >> 32);
     const int C_ring  = (int)((ntot_stride >> 16) & 0xFFFF);
     const int stride  = (int)(ntot_stride & 0xFFFF);
-    const int window  = window_B >> 4;
-    const int B       = window_B & 0xF;
+    const int window  = window_B >> DF2_WB_SHIFT;
+    const int B       = window_B & DF2_WB_MASK;
     const int C = ntot - B;                    // committed ctx rows
     // VOLATILE smem is LOAD-BEARING: ptxas -O2/-O3 (CUDA 13.0.88, sm_121) miscompiles this
     // kernel's barrier-ordered scores/red pattern — sporadically reorders a shared access
@@ -902,18 +908,114 @@ extern "C" __global__ void __launch_bounds__(256) top16_b(
 // tie-break) computed redundantly by every lane — no divergence, no atomics, deterministic.
 //   hp [7,256] f32; cand [7,16] u32; unary [7,16] f32; pred/succ [vocab,256] bf16 row-major;
 //   tokens [7] u32; scores_out [7,16] f32 row-major [p*16+k].
+// ===== F8-CATCHUP two-stage draft head =====
+// Stage 1 of the quality-neutral head cut (13.5 ms bf16 full-vocab pass -> ~3 ms NVFP4 coarse
+// pass + exact bf16 re-rank of a 256-token shortlist). The COARSE ranking only has to keep the
+// true bf16 top-16 inside the shortlist (recall@256); the FINAL logits the tree consumes are
+// recomputed EXACTLY in bf16 from the original head rows and original hiddens, so downstream
+// (top16_b, walk) is bit-identical to the plain bf16 path whenever the shortlist contains the
+// bf16 top-16. Both kernels are deterministic (fixed orders, no float atomics).
+
+// Coarse shortlist: per token-column j, the 256 ids with the largest bf16 keys. Histogram of the
+// order-preserving key16>>8 (256 bins), threshold bin t* = highest t with count(>t) <= 255, all
+// above-t ids collected by atomic smem order (the SET is what matters — stage 2 re-ranks), then
+// filled to exactly 256 from bin t* in ASCENDING id order (deterministic subset).
+//   logits [vocab, 7] col-major (bf16); out_idx [7, 256] u32.
+extern "C" __global__ void __launch_bounds__(256) df2_top256_b(
+    unsigned* __restrict__ out_idx, const __nv_bfloat16* __restrict__ logits,
+    int vocab, int cols) {
+    const int col = blockIdx.x;
+    if (col >= cols) return;
+    const __nv_bfloat16* lg = logits + (long long)col * vocab;
+    unsigned* dst = out_idx + (long long)col * 256;
+    __shared__ int hist[256];
+    __shared__ int sh_t;
+    __shared__ int sh_cnt;
+    const int tid = threadIdx.x;
+    hist[tid] = 0;
+    __syncthreads();
+    for (int i = tid; i < vocab; i += 256)
+        atomicAdd(&hist[df2_key16(*reinterpret_cast<const unsigned short*>(lg + i)) >> 8], 1);
+    __syncthreads();
+    if (tid == 255) {
+        int cum = 0, t = 255;
+        while (t >= 0) { cum += hist[t]; if (cum > 256) break; --t; }
+        // threshold bin: collect keys with bin > (t+1 clamped into range); the strictly-above
+        // count is <= 256 by the walk invariant (255-fill covers the degenerate top-bin case)
+        sh_t = t + 1 > 255 ? 255 : t + 1;
+    }
+    __syncthreads();
+    const int t = sh_t;
+    if (tid == 0) *reinterpret_cast<volatile int*>(&sh_cnt) = 0;
+    __syncthreads();
+    for (int i = tid; i < vocab; i += 256) {
+        const unsigned key = df2_key16(*reinterpret_cast<const unsigned short*>(lg + i));
+        if ((int)(key >> 8) > t) {
+            const int p = atomicAdd(&sh_cnt, 1);
+            if (p < 256) dst[p] = (unsigned)i;
+        }
+    }
+    __syncthreads();
+    int have = sh_cnt < 256 ? sh_cnt : 256;
+    __syncthreads();
+    if (have < 256) {
+        // fill the remainder from the threshold bin — one strided pass per thread, atomic
+        // cursor (SET semantics only: stage 2 re-ranks, so slot order is irrelevant)
+        for (int i = tid; i < vocab && have < 256; i += 256) {
+            const unsigned key = df2_key16(*reinterpret_cast<const unsigned short*>(lg + i));
+            if ((int)(key >> 8) == t) {
+                const int p = atomicAdd(&sh_cnt, 1);
+                if (p < 256) dst[p] = (unsigned)i;
+            }
+        }
+    }
+}
+
+// Stage 2: exact bf16 re-rank. Each block recomputes logits[col][idx] as the fp32 dot of the
+// ORIGINAL bf16 head row with the ORIGINAL hidden column (identical accumulation order to
+// gemm_binv_b's row-dot: 256 threads x 20 elements, ascending serial tree — bitwise equal is NOT
+// required vs gemm_binv_b, only "the exact bf16 head applied to the exact hidden"; ties then
+// resolve exactly as the plain path would on THESE logits).
+//   logits [vocab, 7] col-major; idx [7,256] u32; W head [vocab, hidden] bf16 row-major;
+//   x base = hidden col-0 pointer (col j at x + j*hidden).
+extern "C" __global__ void __launch_bounds__(256) df2_head_rerank_b(
+    __nv_bfloat16* __restrict__ logits, const unsigned* __restrict__ idx,
+    const __nv_bfloat16* __restrict__ W, const __nv_bfloat16* __restrict__ x,
+    int vocab, int hidden, int cols) {
+    const int slot = blockIdx.x & 255;
+    const int col = blockIdx.x >> 8;
+    if (col >= cols) return;
+    const unsigned row = idx[(long long)col * 256 + slot];
+    const __nv_bfloat16* w = W + (long long)row * hidden;
+    const __nv_bfloat16* xv = x + (long long)col * hidden;
+    const int tid = threadIdx.x;
+    float acc = 0.f;
+    for (int i = tid; i < hidden; i += 256)
+        acc += __bfloat162float(w[i]) * __bfloat162float(xv[i]);
+    __shared__ float red[256];
+    red[tid] = acc;
+    __syncthreads();
+    for (int s = 128; s > 0; s >>= 1) {
+        if (tid < s) red[tid] += red[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) logits[(long long)col * vocab + row] = __float2bfloat16(red[0]);
+}
+
 extern "C" __global__ void __launch_bounds__(256) df2_sel_walk_b(
     unsigned* __restrict__ tokens, float* __restrict__ scores_out,
     const float* __restrict__ hp, const unsigned* __restrict__ cand,
     const float* __restrict__ unary,
     const __nv_bfloat16* __restrict__ pred_codebook, const __nv_bfloat16* __restrict__ succ_codebook,
-    unsigned anchor, const unsigned* anchor_dev, int rank) {
+    unsigned anchor, const unsigned* anchor_dev, int rank, int nlevels) {
     __shared__ float sh_sc[16];
     __shared__ float sh_warp[8];
     const int tid = threadIdx.x;
     const int R = rank;                        // 256
     unsigned prev = anchor_dev ? *anchor_dev : anchor;
-    for (int p = 0; p < 7; ++p) {
+    // DF2 block-16: nlevels is the chain length (block-1: 7 today, 15 at block 16). The
+    // per-position work below is unchanged; only the trip count is a parameter.
+    for (int p = 0; p < nlevels; ++p) {
         const float a = __bfloat162float(pred_codebook[(long long)prev * R + tid]) * hp[p * R + tid];
         for (int k = 0; k < 16; ++k) {
             const float prod = a * __bfloat162float(succ_codebook[(long long)cand[p * 16 + k] * R + tid]);
@@ -961,7 +1063,10 @@ extern "C" __global__ void __launch_bounds__(256) df2_sel_walk_sample_b(
     const float* __restrict__ unary,
     const __nv_bfloat16* __restrict__ pred_codebook, const __nv_bfloat16* __restrict__ succ_codebook,
     unsigned anchor, const unsigned* anchor_dev,
-    const unsigned int* seeds, float temperature, int rank) {
+    const unsigned int* seeds, float temperature, int rank_nlevels) {
+    // cudarc caps a launch at 12 arguments, so rank (8 bits) and nlevels (8 bits) ride packed.
+    const int rank = rank_nlevels >> 8;
+    const int nlevels = rank_nlevels & 0xFF;
     __shared__ float sh_sc[16];
     __shared__ float sh_warp[8];
     __shared__ unsigned sh_prev;
@@ -969,7 +1074,10 @@ extern "C" __global__ void __launch_bounds__(256) df2_sel_walk_sample_b(
     const int R = rank;                        // 256
     unsigned prev = anchor_dev ? *anchor_dev : anchor;
     float inv_t = (temperature > 0.f) ? (1.0f / temperature) : 1.0f;
-    for (int p = 0; p < 7; ++p) {
+    // DF2 block-16: nlevels = block-1 (7 today, 15 at block 16). The output layout keeps the
+    // `[nlevels]` drawn-token/q prefix and the `[nlevels + 16p + k]` candidate tables, so the
+    // host-side strides are nlevels-derived rather than the constant 7.
+    for (int p = 0; p < nlevels; ++p) {
         const float a = __bfloat162float(pred_codebook[(long long)prev * R + tid]) * hp[p * R + tid];
         for (int k = 0; k < 16; ++k) {
             const float prod = a * __bfloat162float(succ_codebook[(long long)cand[p * 16 + k] * R + tid]);
@@ -995,7 +1103,7 @@ extern "C" __global__ void __launch_bounds__(256) df2_sel_walk_sample_b(
             #pragma unroll
             for (int k = 0; k < 16; ++k) {
                 float e = __expf((sh_sc[k] - mx) * inv_t);
-                out_q[7 + p * 16 + k] = e;                    // unnormalized scratch
+                out_q[nlevels + p * 16 + k] = e;                    // unnormalized scratch
                 sum += e;
             }
             // P3(b) fix: normalize ALL 16 entries BEFORE the draw. The prior code normalized
@@ -1005,7 +1113,7 @@ extern "C" __global__ void __launch_bounds__(256) df2_sel_walk_sample_b(
             // weights (qsum != 1), biasing the reject-side distribution. The draw itself is
             // bit-identical (same cumsum, same ru, same chosen); only the table is corrected.
             #pragma unroll
-            for (int k = 0; k < 16; ++k) out_q[7 + p * 16 + k] /= sum;
+            for (int k = 0; k < 16; ++k) out_q[nlevels + p * 16 + k] /= sum;
             // multinomial draw: first candidate whose cumulative mass strictly exceeds u
             // (the vendor's `uniforms.ge(cumsum)` pick). q_rows = the drawn candidate's weight.
             unsigned int sr = seeds[p];
@@ -1013,13 +1121,13 @@ extern "C" __global__ void __launch_bounds__(256) df2_sel_walk_sample_b(
             float ru = (sr >> 8) * (1.0f / 16777216.0f);
             float cum = 0.f; int chosen = 15;
             for (int k = 0; k < 16; ++k) {
-                cum += out_q[7 + p * 16 + k];
+                cum += out_q[nlevels + p * 16 + k];
                 if (ru < cum) { chosen = k; break; }
             }
             const unsigned tok = cand[p * 16 + chosen];
             out_tok[p] = tok;
-            out_q[p] = out_q[7 + p * 16 + chosen];
-            for (int k = 0; k < 16; ++k) out_tok[7 + p * 16 + k] = cand[p * 16 + k];
+            out_q[p] = out_q[nlevels + p * 16 + chosen];
+            for (int k = 0; k < 16; ++k) out_tok[nlevels + p * 16 + k] = cand[p * 16 + k];
             sh_prev = tok;
         }
         __syncthreads();

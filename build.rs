@@ -56,6 +56,7 @@ fn main() {
         ("gpu_dsv4_attn.cu", "gpu_dsv4_attn.ptx", "sm_121"),
         ("gpu_dsv4_comp.cu", "gpu_dsv4_comp.ptx", "sm_121"),
         ("gpu_dflash.cu", "gpu_dflash.ptx", "sm_121"),
+        ("gpu_dspark.cu", "gpu_dspark.ptx", "sm_121"),
         ("gpu_vision.cu", "gpu_vision.ptx", "sm_121"),
         ("mxfp4_bench.cu", "mxfp4_bench.ptx", "sm_121a"),
         ("gpu_mxfp4.cu", "gpu_mxfp4.ptx", "sm_121a"),

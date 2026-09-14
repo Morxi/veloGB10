@@ -62,6 +62,8 @@ pub struct BatchRequest {
     pub rep_penalty: f32,
     pub presence_penalty: f32,
     pub frequency_penalty: f32,
+    pub min_new: usize,
+    pub ignore_eos: bool,
     pub tx: mpsc::UnboundedSender<TokEvent>,
     pub seed: Option<u64>,
     /// Token index of the MESSAGE BOUNDARY — the prompt as rendered without the generation prompt.
@@ -81,6 +83,10 @@ pub struct BatchRequest {
     /// (absolute positions in the EXPANDED prompt). None/empty for text-only traffic (unchanged).
     pub image_embeds: Option<Vec<f32>>,
     pub image_spans: Vec<crate::vision_encoder::ImageSpan>,
+    /// W2 (Phase 13): the compiled JSON-schema FSM for this request (None = unconstrained).
+    /// Compiled ONCE by the server from `response_format`; the scheduler advances it per committed
+    /// token and hands the sampler a per-step vocabulary mask.
+    pub schema: Option<std::sync::Arc<crate::json_schema::SchemaMask>>,
 }
 
 struct Lane {
@@ -98,7 +104,13 @@ struct Lane {
     rep_penalty: f32,
     presence_penalty: f32,
     frequency_penalty: f32,
+    min_new: usize,
+    ignore_eos: bool,
     history: Vec<u32>,
+    /// W2 (Phase 13): the request's compiled JSON-schema FSM (None = unconstrained) and the
+    /// machine's CURRENT state, advanced once per COMMITTED token.
+    schema: Option<std::sync::Arc<crate::json_schema::SchemaMask>>,
+    schema_state: u32,
     tx: mpsc::UnboundedSender<TokEvent>,
     /// MTP KV cursor: the main-model position of the last committed token = next MTP write pos - 1.
     /// Only meaningful when this lane is served via the MTP path.
@@ -151,8 +163,80 @@ impl Lane {
     /// off has no primed MTP KV and must never take the MTP path, and a lane admitted while it was on
     /// can simply stop (its MTP KV is only ever read by the MTP path, so abandoning it is safe).
     fn use_mtp(&self, active: bool) -> bool {
-        active && self.mtp_primed && !self.mtp_stale
+        // W2: a schema-constrained lane may use the GREEDY MTP chain - its verify columns carry
+        // the schema mask chain and the host clamps the accepted prefix to the schema-valid draft
+        // length. The SAMPLED spec chain (rejection sampling over unmasked draft candidates) is
+        // not — and a wrong-but-fast speculative emission is exactly the failure class W2 exists
+        // wired for schemas: those lanes take the plain (masked) decode path. W2 v1.
+        active && self.mtp_primed && !self.mtp_stale && (self.schema.is_none() || self.greedy)
     }
+}
+
+/// PLAN/SCHEDULER_2LANE_WORKDOC.md §3.1 — the per-lane PREFILL CURSOR.
+///
+/// Before this existed, `admit()` ran the whole chunked-prefill window loop INLINE on the scheduler
+/// thread, so every window of a newly-admitted prompt was executed *before* that iteration's
+/// `decode_step(b)`: a co-resident lane's next token waited for `ceil(plen / PREFILL_CHUNK)`
+/// windows, measured at 25.4 s across a 16,800-token admission (P0, this session). The cursor holds
+/// exactly what that loop's locals held, so the loop body could move VERBATIM (§3.2: the window
+/// formula must not change — the pf8 padding family is width-dependent and its failures are found
+/// by hitting an (n, bucket) gap in production, not by reasoning).
+///
+/// State machine (§3.4): `Prefilling{cursor}` → (lane install) → `Active`. A cursor is NOT a lane:
+/// it is not in `self.lanes`, so it is served by nothing, is not counted in the decode `b`, and is
+/// invisible to the prefix-cache matcher (its `slot_cache`/`slot_ring_len` writes happen at
+/// COMPLETION, which is exactly where they happen today).
+struct PfCursor {
+    /// The physical slot reserved at admission (popped from `free_slots`).
+    phys: usize,
+    prompt: Vec<u32>,
+    plen: usize,
+    reuse: usize,
+    w0: usize,
+    ckpt_at: Option<usize>,
+    grid_reuse: bool,
+    req_imgs: Vec<ImageIdentity>,
+    /// W2 (Phase 13): the request's compiled JSON-schema FSM, carried from `admit()` into the
+    /// lane-install tail (`pf_finish`) so the lane starts in the machine's start state.
+    schema: Option<std::sync::Arc<crate::json_schema::SchemaMask>>,
+    /// Speculation decisions taken at ADMISSION (unchanged, §2: `will_use_df2`/`will_use_dspark`
+    /// are decided once, never per window).
+    will_use_mtp: bool,
+    will_use_df2: bool,
+    will_use_dspark: bool,
+    df2_carry: bool,
+    dspark_carry: bool,
+    /// Window-loop state (moved verbatim).
+    first_tok: u32,
+    first_sent: bool,
+    pf_hash_str: String,
+    df2_primed_ok: bool,
+    dspark_primed_ok: bool,
+    /// Lane-install payload — `admit()`'s post-loop tail.
+    tx: mpsc::UnboundedSender<TokEvent>,
+    greedy: bool,
+    domain: Domain,
+    temperature: f32,
+    top_p: f32,
+    top_k: usize,
+    max_new: usize,
+    min_new: usize,
+    ignore_eos: bool,
+    rep_penalty: f32,
+    presence_penalty: f32,
+    frequency_penalty: f32,
+    seed: u64,
+    /// Server-side TTFT accounting (`[req] ttft=`), stamped when the request was created.
+    received_at: std::time::Instant,
+    trace_pf: bool,
+    admit_t0: std::time::Instant,
+    t_memsets: f64,
+    t_prefill: f64,
+    t_prime: f64,
+    /// V3 vision: the merged embeddings + spans for THIS request. Armed onto
+    /// `state.vision_embeds` around each of this cursor's own windows and disarmed after them —
+    /// the splice is a GLOBAL state field and a co-resident lane's window must never see it.
+    vision: Option<(crate::gpu::B, Vec<crate::vision_encoder::ImageSpan>)>,
 }
 
 /// Whether MTP pays for itself is a measurable question, not a configuration one.
@@ -223,7 +307,7 @@ use crate::gpu::MAX_AUTO_DEPTH;
 /// the serving loop via `df2_effective_src`; MTP stays permanently selectable (`--spec-source
 /// mtp`, the standing directive) and is the fallback whenever the round is absent.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum SpecSource { Mtp, Dspark, DFlash2, DFlash2Rq, DFlash2Auto, DFlash2Tree, Plain }
+pub enum SpecSource { Mtp, Dspark, DFlash, DFlash2, DFlash2Rq, DFlash2Auto, DFlash2Tree, Plain }
 
 /// PLAN/25 Phase 1 (tree-verify spike): the DF2 TREE lane — the selector round's candidate
 /// table walked into a two-branch tree (the walk chain + the best per-level alternates),
@@ -288,6 +372,8 @@ impl SpecSource {
     pub fn from_cli(s: &str) -> Option<SpecSource> {
         match s {
             "mtp" => Some(SpecSource::Mtp),
+            "dspark" => Some(SpecSource::Dspark),
+            "dflash" | "dflash-v1" | "dflash1" => Some(SpecSource::DFlash),
             "dflash2" | "df2" => Some(SpecSource::DFlash2),
             "dflash2-rq" | "df2rq" => Some(SpecSource::DFlash2Rq),
             "dflash2-auto" | "df2-auto" | "df2auto" => Some(SpecSource::DFlash2Auto),
@@ -300,6 +386,7 @@ impl SpecSource {
         match self {
             SpecSource::Mtp => "mtp",
             SpecSource::Dspark => "dspark",
+            SpecSource::DFlash => "dflash",
             SpecSource::DFlash2 => "dflash2",
             SpecSource::DFlash2Rq => "dflash2-rq",
             SpecSource::DFlash2Auto => "dflash2-auto",
@@ -307,6 +394,31 @@ impl SpecSource {
             SpecSource::Plain => "none",
         }
     }
+}
+
+// The lane owns a blocking CUDA stream (inside the drafter) and device buffers, exactly like
+// `GpuModel` (see `unsafe impl Send for GpuModel`, src/gpu.rs). The lane is only ever touched from
+// the scheduler's single task/thread — the same discipline the rest of the serving state uses.
+unsafe impl Send for DflashLane {}
+
+/// P14 — the DFlash v1 lane's resident state: the 6-layer block drafter, its incremental ctx KV
+/// cache, its own device pool and the consumed ctx feature (one column per committed position).
+///
+/// The drafter is a single-sequence block model (no batch dim), so the lane is b == 1 only; it is
+/// greedy-only (the block's argmax drafts are verified against the target's argmax — the MTP
+/// chain's losslessness argument, unchanged).
+pub struct DflashLane {
+    pub draf: crate::dflash::DflashDrafter,
+    pub kv: crate::dflash::DflashKv,
+    pub pool: crate::gpu::Pool,
+    /// `[nctx*h, kv_stride]` bf16: the conditioning columns consumed so far (absolute positions).
+    pub feat: cudarc::driver::CudaSlice<half::bf16>,
+    pub nctx: usize,
+    pub block: usize,
+    pub mask: u32,
+    /// The span the NEXT draft appends: cache rows `[row0, row0+ncols)`.
+    pub row0: usize,
+    pub ncols: usize,
 }
 
 /// S5F — one recorded speculation step (the on-engine τ matrix telemetry). `drafts` = the
@@ -358,6 +470,17 @@ pub fn spec_source_for(domain: &str, ctx: usize, dspark_tau_table: &[(String, us
 /// pub(crate): the grouped-MoE prefill scratch in gpu.rs sizes itself off this bound (and asserts
 /// batch×k against it at dispatch) — a window-size change must never silently overflow the scratch.
 pub const PREFILL_CHUNK: usize = 8192;
+
+/// F8 acceptance A6/B6 (2026-09-06): block-granular GDN checkpoints. The whole-slot cache
+/// held the GDN state at exactly TWO points (live end + prompt boundary); tool-calling
+/// clients re-render our turns, so the longest common prefix lands a median ~200 tokens
+/// before the held state and EVERY turn re-prefilled the full transcript (edit-heavy cell:
+/// 71 s of prefill per turn vs the recipe's ~0). RING checkpoints snapshot the GDN state at
+/// RING_CKPT_STRIDE-token boundaries of the ABSOLUTE position into a per-slot ring of the
+/// most-recent RING_CKPT_K entries — a new request resumes at the best boundary ≤ LCP and
+/// prefills only the slack + divergent tail.
+pub const RING_CKPT_STRIDE: usize = 512;
+pub const RING_CKPT_K: usize = 16;
 
 const MTP_EVAL_WINDOW: u64 = 128;
 /// First window after activation (and after each re-probe): catch a losing head quickly.
@@ -630,6 +753,50 @@ fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
     a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
 }
 
+/// DF2_CARRY decision, as a pure function so the cases are unit-testable (see `mod df2_carry`).
+///
+/// The DFlash2 ring is a single already-resident shared buffer, so carrying it across a
+/// prefix-cache hit costs **zero bytes** — the only question is whether the rows the draft will
+/// read still hold the right positions. Two conditions make that true, and the second is why a
+/// length-only copy of DSpark's A6 carry (`slot_dspark_len[phys] >= reuse`) is WRONG here:
+///
+/// 1. **Identity** — `ring_slot == Some(phys)`. The round is ONE shared buffer while the
+///    per-slot bookkeeping is per-slot, so "this slot once ran the drafter" does not imply the
+///    ring still holds THIS slot's prefix. DSpark used to guard on length alone and was therefore
+///    exposed to a stale ring after any other slot used the drafter in between; with
+///    `max_batch > 1` that interleaving is reachable, so DFlash2 records the identity — and
+///    DSpark now does too (`DsparkRound::ring_slot`, PLAN/DSPARK_RING_IDENTITY_SPEC.md).
+///
+/// 2. **Frontier** — `reuse <= ring_len <= plen`. The DF2 ring is a MODULO ring (`pos % RING`,
+///    RING = 2048); DSpark's is LINEAR (`c_ring = max_c`, no wrap), which is exactly why A6's
+///    length check suffices there and does not here. After a lane that ran to frontier `N` the
+///    ring holds precisely positions `[N-RING, N)`; every older row has been recycled. The
+///    draft at the anchor reads the trailing band `[plen-RING+1, plen)`; the suffix prime writes
+///    `[reuse, plen)`; those two are complementary residues of that band, so the CARRIED rows
+///    must cover `[plen-RING+1, reuse)`, which requires `reuse <= N` (they were written) and
+///    `N <= plen` (they have not yet been overwritten). Both bounds are equalities in the
+///    natural multi-turn flow (`N` is the previous turn's prompt + its emitted tokens, and the
+///    new prompt is that plus the client's next message), which is why this fires at all.
+///
+/// Carrying with `N > plen` would feed the draft keys from the wrong ring rows. Verify still
+/// rejects bad drafts, so the output text would stay correct and losslessness would stay green
+/// while tau quietly fell — the "silently wrong but self-consistent" class AGENTS §3 warns
+/// about. Refuse instead.
+#[allow(clippy::too_many_arguments)]
+fn df2_carry_ok(enabled: bool, is_df2_src: bool, reuse: usize, plen: usize,
+                phys: usize, ring_slot: Option<usize>, ring_len: usize,
+                len_only: bool) -> bool {
+    enabled
+        && is_df2_src
+        && reuse > 0
+        && ring_slot == Some(phys)
+        && ring_len >= reuse
+        // `len_only` is a DIAGNOSTICS-ONLY instrument (GB10_DF2_CARRY_LEN_ONLY=1): it drops the
+        // frontier term, reproducing DSpark's length-only shape so SPEC §7 gate 7 can force a
+        // known-bad carry and confirm the measurement catches it. Never a serving option.
+        && (len_only || ring_len <= plen)
+}
+
 /// An image's content identity inside a slot's cached sequence: the token-span start plus a hash
 /// of the merged embeddings that were actually spliced there. The slot-level prefix reuse matches
 /// purely on token identity, and two images of the same resolution expand to IDENTICAL `image_pad`
@@ -748,6 +915,19 @@ pub struct BatchScheduler {
     max_batch: usize,
     rx: mpsc::UnboundedReceiver<BatchRequest>,
     lanes: Vec<Option<Lane>>,
+    /// PLAN/SCHEDULER_2LANE_WORKDOC.md §3.1 — the ONE in-flight prefill (the per-lane cursor).
+    ///
+    /// At most one request is ever mid-prefill, and that is a DELIBERATE v1 policy, not a shortcut:
+    ///   * the shared draft-round objects (`df2`, `dspark`) are primed window-by-window and their
+    ///     `reset`/`rewind`/identity claim are GLOBAL — two interleaved primes would clobber each
+    ///     other's rings and degrade τ with no correctness signal at all (the exact class
+    ///     PLAN/DSPARK_RING_IDENTITY_SPEC.md exists for). One cursor at a time makes that
+    ///     impossible BY CONSTRUCTION, whereas today's atomic `admit()` only makes it unlikely;
+    ///   * a new admission's `df2_carry`/`dspark_carry` decision reads the SHARED ring state, so
+    ///     admitting while a prime is in flight would decide on half-written state.
+    /// The measured win (§4 P0) does not need more than one: the stall is a co-resident DECODING
+    /// lane waiting for a prefill, and only one prefill has to be in flight for that.
+    pf: Option<Box<PfCursor>>,
     /// Free physical slots (stack) available for new admissions. Each active lane owns a physical
     /// slot (`Lane::phys`) holding its persistent KV + GDN state; on finish the slot is returned here
     /// instead of copying state into a contiguous prefix (slot indirection via `bufs.slot_ids_dev`).
@@ -781,6 +961,20 @@ pub struct BatchScheduler {
     slot_ckpt_images: Vec<Vec<ImageIdentity>>,
     /// First of `max_batch` state slots holding the prompt checkpoints (lane i -> prompt_ckpt_slot + i).
     prompt_ckpt_slot: usize,
+    /// First of `max_batch * RING_CKPT_K` state slots holding the periodic GDN ring
+    /// checkpoints (lane i, entry j -> ring_ckpt_slot + i*RING_CKPT_K + j). Entry lengths
+    /// live in `slot_ring_len`; 0 = invalid. States are pure functions of tokens [0, len),
+    /// so entries with len ≤ the reused prefix stay valid across suffix re-prefills.
+    ring_ckpt_slot: usize,
+    /// Absolute lengths of the ring checkpoints per slot (RING_CKPT_K entries; 0 = invalid).
+    slot_ring_len: Vec<Vec<usize>>,
+    /// Round-robin write cursor per slot for the ring checkpoints.
+    ring_cursor: Vec<usize>,
+    /// For each slot: the sequence length up to which the DSPARK round's ring rows are valid
+    /// (set when a dspark-primed lane finishes in this slot; 0 = none). A prefix-hit lane
+    /// with reuse ≤ this carries the ring over (rewind nprev; prime only the suffix) instead
+    /// of degrading to MTP — the edit-heavy τ lever.
+    slot_dspark_len: Vec<usize>,
     /// Prompt-lookup draft n-gram order (0 = off). When the last `ngram_draft` tokens of a lane's
     /// context recur earlier, the follower is proposed as a draft instead of the 1-layer head's guess.
     /// Free (host-side) and lossless (the verify checks every draft); a big acceptance win on copyable
@@ -792,6 +986,9 @@ pub struct BatchScheduler {
     /// Batched MTP verify across lanes (LANES design Step 3c): pack several concurrent lanes' draft
     /// chains into ONE forest verify. Opt-in; needs the full MAX_VERIFY checkpoint region.
     mtp_lanes: bool,
+    /// P11 W5a: --prefill-sched inline — drain the whole prefill inside admission (the pre-P10
+    /// schedule). Default false = the cursor schedule.
+    pf_inline: bool,
     /// Reuse a cached prefix instead of prefilling it again. OFF by default, and that is a deliberate
     /// correctness choice, not caution: reusing a prefix RE-CHUNKS the prefill, and prefill runs on
     /// cuBLAS, which picks a different kernel per shape (AGENTS.md §2.4). So a cached turn is not
@@ -854,6 +1051,8 @@ pub struct BatchScheduler {
     // ---- S5F: the DFlash2 speculation source (the S4F integrated round, b==1 only) ----
     /// The DFlash2 round (S4F): drafter weights + ring KV + the block pass. `None` = absent or
     /// failed artifact → the source falls back to the MTP path (standing directive).
+    /// P14 — the DFlash v1 lane (greedy block drafter); present only under `--spec-source dflash`.
+    dflash: Option<DflashLane>,
     df2: Option<crate::dflash2::round::Df2Round>,
     /// The trunk's tap-capture sink writer twin (the round reads the staging via attach_sink).
     df2_sink: Option<std::sync::Arc<crate::dflash2::capture::Df2TapSink>>,
@@ -862,8 +1061,29 @@ pub struct BatchScheduler {
     df2_sink_tree: Option<std::sync::Arc<crate::dflash2::capture::Df2TapSink>>,
     /// The prefill window's wide tap buffer (the prompt-prime capture target).
     df2_prime: Option<std::sync::Arc<crate::dflash2::capture::Df2PrimeSink>>,
+    /// WI1: the DSpark round (Qwen3.8-27B-DSpark drafter, `--spec-source dspark`). `None` =
+    /// absent/failed artifact, so the standing MTP fallback applies, never a hard failure.
+    dspark: Option<crate::dspark::round::DsparkRound>,
+    /// The DSpark lane's tap-capture sink twin (dspark::TAP_LAYERS arms on the trunk).
+    dspark_sink: Option<std::sync::Arc<crate::dflash2::capture::Df2TapSink>>,
+    /// The DSpark lane's prompt-prime wide sink (the prefill window's taps).
+    dspark_prime: Option<std::sync::Arc<crate::dflash2::capture::Df2PrimeSink>>,
     /// One-time "DFlash2 requested but unavailable → serving via MTP" log (the fallback proof).
     df2_fallback_logged: bool,
+    /// P14 — one-shot notices for the v1 lane (missing artifact / unprimed request).
+    dflash_fallback_logged: bool,
+    /// P14 — the admit path armed the ctx-feature prime for the (single) window loop to consume.
+    dflash_prime_armed: bool,
+    /// P14 — the ctx prime for the request in flight completed (see the prefill hook).
+    dflash_prime_done: bool,
+    dflash_carry_logged: bool,
+    /// One-time "DSpark requested but unavailable -> serving via MTP" log (the fallback proof).
+    dspark_fallback_logged: bool,
+    /// WI1 DSpark lane telemetry (the df2 counters' twins; the [dspark] step log's source).
+    dspark_stat_steps: u64,
+    dspark_stat_drafts: u64,
+    dspark_stat_accepted: u64,
+    dspark_stat_emitted: u64,
     /// P3(a) close: route GREEDY (temp-0) General requests to GREEDY drafts — the DEFAULT since
     /// the 2026-08-23 quad temp-0 sweep (prose τ +10.5% step-weighted, code control
     /// bit-identical). Sampled-temp General keeps the real-q walk. `--df2-prose-lane rq`
@@ -871,6 +1091,16 @@ pub struct BatchScheduler {
     /// `df2_effective_src`; affects only the `DFlash2Auto` source's General domain (explicit
     /// `--spec-source` values stay explicit).
     prose_lane_greedy: bool,
+    /// DF2_CARRY: keep DFlash2 in the draft seat across a PREFIX-CACHE HIT. Default OFF until
+    /// the `PLAN/DF2_CARRY_SPEC.md` §7 acceptance run is green.
+    ///
+    /// Today `will_use_df2` requires `reuse == 0`, so every cache hit degrades to MTP — on the
+    /// owner's tool-eval workload that is 184 of 197 requests (DF2 250 steps vs MTP 9 500).
+    /// With this ON the lane carries the round's ring (0 extra bytes) and primes only the suffix,
+    /// exactly as DSpark's A6 carry does. The guard is NOT DSpark's length-only check: the DF2
+    /// ring is a modulo ring, so `df2_carry` also requires the frontier to lie inside the new
+    /// prompt (see the admit site).
+    df2_carry_enabled: bool,
     /// S5F3 draft-parity step dump (dump-only; None = the standing path, zero overhead).
     step_dump: Option<crate::dflash2::stepdump::StepDump>,
     /// PLAN/25 Phase 0: run the coverage-trace OP SEQUENCE (eager keep-logits verify, logging
@@ -894,6 +1124,16 @@ pub struct BatchScheduler {
     df2_tree_stat_steps: u64,   // df2_tree_step invocations
     df2_tree_stat_rescues: u64, // accepted path crossed into the B branch (the tree's whole point)
     df2_tree_stat_nodes: u64,   // verified tree nodes (cost side: the chain would be depth+1)
+    // ---- P14: DFlash v1 lane telemetry (block drafter; the lane was INVISIBLE at /health) ----
+    dflash_stat_steps: u64,     // dflash_lane_step invocations
+    dflash_stat_drafts: u64,    // block-1 proposals per step
+    dflash_stat_accepted: u64,  // matched verify argmax
+    dflash_stat_emitted: u64,   // emitted tokens (accepted drafts + the bonus)
+    /// accept@k for the BLOCK lane: `dflash_acc_n[k]` = steps that reached column k,
+    /// `dflash_acc_a[k]` = steps where column k was accepted. len = MAX_BLOCK (16), not tel::MAXK
+    /// (8, the MTP depth ceiling) — the block drafter proposes up to 15 columns.
+    dflash_acc_a: [u64; crate::dflash::MAX_BLOCK],
+    dflash_acc_n: [u64; crate::dflash::MAX_BLOCK],
     // ---- S5F: per-step speculation recorder (the on-engine τ matrix harness) ----
     /// When `spec_steps_on`, every speculation step (MTP or DFlash2 lane) pushes a record.
     spec_steps: Vec<SpecStepRec>,
@@ -921,13 +1161,22 @@ impl BatchScheduler {
                mtp: MtpPolicy, prefix_cache: bool, ngram_draft: usize, tree_draft: bool, mtp_lanes: bool) -> Self {
         BatchScheduler::with_df2(gpu, max_batch, kv_stride, eos, rx, mtp, prefix_cache,
                                  ngram_draft, tree_draft, mtp_lanes,
-                                 None, None, None, None)
+                                 None, None, None, None, None, None, None)
     }
+
+    /// P11 W5a: the --prefill-sched inline escape (default false = the cursor schedule).
+    pub fn set_pf_inline(&mut self, on: bool) { self.pf_inline = on; }
 
     /// P3(b) L1: set the prose-lane routing (default `false` = rq sampled selector; `true` =
     /// greedy drafts for General-domain requests under `DFlash2Auto`).
     pub fn set_prose_lane_greedy(&mut self, on: bool) {
         self.prose_lane_greedy = on;
+    }
+
+    /// DF2_CARRY: `--df2-carry on|off` (default off — SPEC §7 gates the default flip). SPMD:
+    /// ships on TpConfig, so every rank resolves the same value and makes the same admit choice.
+    pub fn set_df2_carry(&mut self, on: bool) {
+        self.df2_carry_enabled = on;
     }
 
     /// S5F: `new` + the DFlash2 round (loaded by the caller; `None` = absent/failed artifact → the
@@ -939,6 +1188,9 @@ impl BatchScheduler {
                     df2: Option<crate::dflash2::round::Df2Round>,
                     df2_sink: Option<std::sync::Arc<crate::dflash2::capture::Df2TapSink>>,
                     df2_prime: Option<std::sync::Arc<crate::dflash2::capture::Df2PrimeSink>>,
+                    mut dspark: Option<crate::dspark::round::DsparkRound>,
+                    dspark_sink: Option<std::sync::Arc<crate::dflash2::capture::Df2TapSink>>,
+                    dspark_prime: Option<std::sync::Arc<crate::dflash2::capture::Df2PrimeSink>>,
                     step_dump: Option<crate::dflash2::stepdump::StepDump>) -> Self {
         // When MTP is on, reserve one extra physical slot as a shared GDN-rollback snapshot target
         // (MTP lanes run one at a time, so a single snapshot slot suffices). It is never assigned to
@@ -963,12 +1215,48 @@ impl BatchScheduler {
         // per-column GDN checkpoints for up to MAX_VERIFY columns — size the band for that
         // capability whenever the round is present, not just when the source is the tree.
         let src_is_tree = matches!(mtp.spec_source(), SpecSource::DFlash2Tree);
-        let n_ckpt = if mtp_has_head { if df2.is_some() || tree_draft || mtp_lanes || src_is_tree { crate::gpu::MAX_VERIFY } else { mtp_depth.saturating_sub(1).max(1) } } else { 0 };
+        // P14: the DFlash v1 lane (--spec-source dflash) verifies the artifact's WHOLE block — for
+        // the 3.6-35B drafter that is `1 + (block-1)` = 16 columns, exactly MAX_VERIFY — and the GDN
+        // scan writes one checkpoint per column at `mtp_snapshot_slot + t`, t < n-1, with no bounds
+        // check (`kernels/gpu_batch.cu:1299`, `:4120`). Sized off `mtp_depth` (8 ⇒ 7 checkpoints) the
+        // 16-column verify overran the band by 8 slots per GDN layer: every emitted token came back
+        // token 0 (`!`) because the verify's own logits were computed from corrupted state, at ~400
+        // tok/s wall — the "step speed without acceptance is not a result" signature
+        // (HANDOFF 2026-09-12). Capability, not current source: the v1 lane can engage on ANY
+        // scheduler that carries the artifact (the probe/harness flip sources per job), exactly the
+        // rule the DF2 tree already follows. `install_dflash_lane` runs after construction, so the
+        // capability is detected from the artifact's presence OR the resolved source.
+        let dflash_v1 = matches!(mtp.spec_source(), SpecSource::DFlash)
+            || crate::draft_dir_env().is_some();
+        // The band below is sized MAX_VERIFY; a block constant WIDER than that would make the v1
+        // verify overrun it. Compile-time, not a boot warning: this relation is a property of two
+        // constants, and a silent runtime warning is exactly the class of notice nobody reads.
+        const _: () = assert!(crate::dflash::MAX_BLOCK <= crate::gpu::MAX_VERIFY,
+            "DFlash MAX_BLOCK must not exceed MAX_VERIFY: the v1 verify width is bounded by \
+             MAX_VERIFY (past it the verify leaves the batch-invariant path) and the GDN \
+             checkpoint band is sized MAX_VERIFY");
+        let n_ckpt = if mtp_has_head || dflash_v1 {
+            if df2.is_some() || tree_draft || mtp_lanes || src_is_tree || dflash_v1 {
+                crate::gpu::MAX_VERIFY
+            } else {
+                mtp_depth.saturating_sub(1).max(1)
+            }
+        } else { 0 };
         // One PROMPT checkpoint slot per lane, after the MTP snapshot slots. These hold the GDN state
         // as it stood at the END OF PREFILL — see `prompt_ckpt_slot`. They are pure state: no KV, and
         // none at all when prefix caching is off (51 MB/slot on 9B, 154 MB on 27B).
         let prompt_ckpt_slot = max_batch + n_ckpt;
-        let n_state_slots = max_batch + n_ckpt + if prefix_cache { max_batch } else { 0 };
+        let ring_ckpt_slot = prompt_ckpt_slot + max_batch;
+        // A6: the periodic ring checkpoints add max_batch*RING_CKPT_K state slots (154 MB/slot
+        // class on 27B; K=16 x stride 512 keeps the same 8K coverage window as the old K=4 x
+        // 2048 at 4x finer boundaries → ~2.5 GB per lane; the cached-turn slack drops from a
+        // 2047-token re-prefill (~3.2 s at the mid-M lane) to <=511 tokens. b=1 deployments.)
+        let n_state_slots = max_batch + n_ckpt
+            + if prefix_cache { max_batch * (1 + RING_CKPT_K) } else { 0 };
+        if prefix_cache {
+            eprintln!("[cache] prefix cache ON — prompt ckpt + ring {RING_CKPT_K}x{RING_CKPT_STRIDE} \
+                       GDN checkpoints per slot ({n_state_slots} state slots)");
+        }
         let mut state = gpu.new_batch_state(max_batch, n_state_slots, kv_stride);
         gpu.dev().synchronize().unwrap(); // ensure state allocs visible to non-blocking stream
         let mut pool = Pool::new(gpu.dev().clone());
@@ -1117,12 +1405,20 @@ impl BatchScheduler {
         // PLAN/25 Phase 1: `dflash2-tree` arms the WIDE (MAX_VERIFY-col) tap sink on the trunk —
         // the topo verify's n > BLOCK per-column taps land there; the accepted path is gathered
         // into the round's 8-col staging at commit. No-op for every other source.
+        // WI1: arm the DSpark sinks BEFORE `gpu` moves into Self (the DF2 twins' pre-move
+        // pattern), and bind the round to its sink (S5F3: keep the Arc; the lane copies the
+        // sink's LIVE staging before each inject).
+        if let Some(ds) = dspark.as_mut() {
+            if let Some(sk) = &dspark_sink { gpu.set_dspark_capture(sk.clone()); ds.attach_sink(sk); }
+            if let Some(ps) = &dspark_prime { gpu.set_dspark_prime_sink(ps.clone()); }
+        }
         let df2_sink_tree = if matches!(mtp.spec_source(), SpecSource::DFlash2Tree) {
             let ws = std::sync::Arc::new(crate::dflash2::capture::Df2TapSink::new_cols(gpu.dev(), crate::gpu::MAX_VERIFY));
             gpu.set_df2_capture_tree(ws.clone());
             Some(ws)
         } else { None };
         let mut s = Self {
+            dflash: None,
             gpu, pool, state, bufs, graphs, kv_stride, eos, max_batch, rx,
             lanes: (0..max_batch).map(|_| None).collect(),
             free_slots: (0..max_batch).rev().collect(),
@@ -1131,10 +1427,15 @@ impl BatchScheduler {
             slot_cache_images: vec![Vec::new(); max_batch],
             slot_ckpt_images: vec![Vec::new(); max_batch],
             prompt_ckpt_slot,
+            ring_ckpt_slot,
+            slot_ring_len: vec![vec![0usize; RING_CKPT_K]; max_batch],
+            ring_cursor: vec![0usize; max_batch],
+            slot_dspark_len: vec![0usize; max_batch],
             prefix_cache,
             ngram_draft,
             tree_draft,
             mtp_lanes,
+            pf_inline: false,
             gpu_sample,
             sample_graphs,
             mtp,
@@ -1161,8 +1462,21 @@ impl BatchScheduler {
             df2_sink,
             df2_sink_tree,
             df2_prime,
+            dspark,
+            dspark_sink,
+            dspark_prime,
             df2_fallback_logged: false,
+            dflash_fallback_logged: false,
+            dflash_prime_armed: false,
+            dflash_prime_done: false,
+            dflash_carry_logged: false,
+            dspark_fallback_logged: false,
+            dspark_stat_steps: 0,
+            dspark_stat_drafts: 0,
+            dspark_stat_accepted: 0,
+            dspark_stat_emitted: 0,
             prose_lane_greedy: false,
+            df2_carry_enabled: false,
             cov_trace: step_dump.is_some(),
             cov_req_n: 0,
             step_dump,
@@ -1178,6 +1492,12 @@ impl BatchScheduler {
             df2_stat_drafts: 0,
             df2_stat_accepted: 0,
             df2_stat_emitted: 0,
+            dflash_stat_steps: 0,
+            dflash_stat_drafts: 0,
+            dflash_stat_accepted: 0,
+            dflash_stat_emitted: 0,
+            dflash_acc_a: [0; crate::dflash::MAX_BLOCK],
+            dflash_acc_n: [0; crate::dflash::MAX_BLOCK],
             spec_steps: Vec::new(),
             spec_steps_on: false,
             mtp_draft_log: std::env::var("MTP_DRAFT_LOG").ok().and_then(|p| {
@@ -1191,6 +1511,7 @@ impl BatchScheduler {
             // Device-resident token loop: the first step must upload everything (the capture
             // warmup left stale values in token_ids_dev/pos/ring), so the state starts dirty.
             resident_dirty: true,
+            pf: None,
         };
         // S5F: capture the DFlash2 draft-round CUDA graph once (the MTP verify-graph pattern).
         // The graph replays with per-step (anchor, nprev) written to device ints; the R13
@@ -1209,44 +1530,54 @@ impl BatchScheduler {
     }
 
     /// Run the scheduler loop until the request channel closes and no lanes remain.
+    ///
+    /// PLAN/SCHEDULER_2LANE_WORKDOC.md §3.1/§3.3 — the two-lane (cursor) loop. Shape per iteration:
+    ///
+    ///   1. DRAIN queued requests (cheap: admission only creates a cursor),
+    ///   2. BLOCK for work only when there is none — a pending cursor IS work,
+    ///   3. ADVANCE at most one prefill window of the single in-flight cursor,
+    ///   4. DECODE the `b` lanes that are actually eligible (a mid-prefill request is not a lane).
+    ///
+    /// The ONE structural difference from the pre-cursor loop is the position of the window work:
+    /// it used to run to completion INSIDE `admit()` (all `ceil(plen/PREFILL_CHUNK)` windows before
+    /// that iteration's `decode_step`), so a co-resident lane's next token waited for the whole
+    /// prompt — measured at 25,370 ms across a 16,800-token admission (P0). Now it waits for at
+    /// most one window (12.6 s), and the window formula itself is unchanged (§3.2).
     pub async fn run(mut self) {
         loop {
-            // Admit queued requests into free lanes (front-packed).
-            while self.num_active() < self.max_batch
-                  && self.lanes[self.num_active()].is_none() {
-                match self.rx.try_recv() {
-                    Ok(req) => self.admit(req),
-                    Err(_) => break,
-                }
-            }
-            let b = self.num_active();
-            if b == 0 {
-                match self.rx.recv().await {
-                    Some(req) => { self.admit(req); continue; }
-                    None => break,
-                }
-            }
             // F8 diagnosis (temporary, GB10_LOOP_TRACE): split the wall around decode_step so the
             // serve-vs-bench per-step gap (261 vs 188 ms) can be attributed.
             let loop_trace = std::env::var("GB10_LOOP_TRACE").is_ok();
             let t_admit = if loop_trace { Some(std::time::Instant::now()) } else { None };
-            while self.num_active() < self.max_batch
+            // Admit queued requests into free lanes (front-packed). Capacity counts BOTH the
+            // decode-eligible lanes and the in-flight cursor: a mid-prefill request already owns a
+            // physical slot, so it must not be oversubscribed.
+            // `self.pf.is_none()` is re-tested EVERY iteration: a successful admit creates a
+            // cursor, and at most one may exist (the shared df2/dspark rounds are primed
+            // window-by-window). Without that term a max-batch>=3 server would try to admit a
+            // second request and silently drop the first cursor's prefill.
+            while self.pf.is_none()
+                  && self.num_active() + usize::from(self.pf.is_some()) < self.max_batch
                   && self.lanes[self.num_active()].is_none() {
                 match self.rx.try_recv() {
                     Ok(req) => self.admit(req),
                     Err(_) => break,
                 }
             }
-            let b = self.num_active();
-            if b == 0 {
+            if self.num_active() == 0 && self.pf.is_none() {
                 match self.rx.recv().await {
-                    Some(req) => { self.admit(req); continue; }
+                    Some(req) => self.admit(req),
+                    // Fall THROUGH (no `continue`): the cursor just created must get its first
+                    // window this iteration, or the loop blocks on an empty channel forever.
                     None => break,
                 }
             }
+            // One window of the in-flight prefill (no-op when nothing is prefilling).
+            self.pf_advance();
+            let b = self.num_active();
             let t_step = if loop_trace { Some(std::time::Instant::now()) } else { None };
             let t_yield0 = if loop_trace { Some(std::time::Instant::now()) } else { None };
-            self.decode_step(b);
+            if b > 0 { self.decode_step(b); }
             let decode_ms = t_step.map(|t0| t0.elapsed().as_secs_f32() * 1e3);
             // Yield to tokio so streaming handlers can flush SSE events between decode steps.
             tokio::task::yield_now().await;
@@ -1291,8 +1622,20 @@ impl BatchScheduler {
             mix(l.mtp_pos as u32);
             total_generated += l.generated as u64;
         }
+        // PLAN/SCHEDULER_2LANE §3.4/§3.5: a mid-prefill request is NOT a lane, so its progress is
+        // folded EXPLICITLY. Without this term two ranks that advanced different window counts would
+        // agree on everything visible (lanes, policy, width) while holding different prefill state —
+        // the divergence would only surface as a KV/state mismatch much later.
+        if let Some(c) = self.pf.as_ref() {
+            mix(c.phys as u32);
+            mix(c.w0 as u32);
+            mix(c.plen as u32);
+        }
         mix(self.mtp.active() as u32);
         mix(self.mtp.depth() as u32);
+        // P11/FOREST: the pack flag changes the verify shape per step; fold it so a one-sided
+        // mtp_lanes resolution (mixed builds on one link) fails LOUD at step 0, not as drift.
+        mix(self.mtp_lanes as u32);
         // B8/G1: k_verify (the verify WIDTH this step ran) joins the extended agree token — ranks
         // that disagree on the width execute different barrier sequences (I9 class). agree_ext
         // folds it into the hash word at bits [27..31); the depth IS the width for chain MTP.
@@ -1350,35 +1693,44 @@ impl BatchScheduler {
         self.tp_serving = true;
         let mut step: u64 = 0;
         let mut closed = false;
+        // PERSISTENT across iterations (cursor scheduler). With one prefill cursor at a time, a
+        // request can be drained while another is still prefilling; if `pending` were rebuilt every
+        // iteration (as it was when admission was unconditional) that request would be DROPPED at
+        // the end of the iteration — its `tx` goes with it and the client's SSE stream closes with
+        // no tokens and no error. The 2-lane bar caught exactly that: lane 1 was admitted never,
+        // and its client saw the body end 1.5 s in.
+        let mut pending: Vec<BatchRequest> = Vec::new();
         loop {
             let mut events: Vec<crate::tp_serve::TpEvent> = Vec::new();
-            let mut pending: Vec<BatchRequest> = Vec::new();
             if !closed {
                 loop {
-                    let projected = self.num_active() + pending.len();
+                    // Capacity counts the in-flight prefill cursor too (it owns a physical slot).
+                    let projected = self.num_active() + pending.len() + usize::from(self.pf.is_some());
                     if projected >= self.max_batch || self.lanes[projected].is_some() { break; }
                     match self.rx.try_recv() {
-                        Ok(req) => {
-                            events.push(crate::tp_serve::TpEvent::Admit((&req).into()));
-                            pending.push(req);
-                        }
+                        Ok(req) => pending.push(req),
                         Err(mpsc::error::TryRecvError::Empty) => break,
                         Err(mpsc::error::TryRecvError::Disconnected) => { closed = true; break; }
                     }
                 }
                 // Idle: block for the next request, exactly like run() — the mirror blocks on the
                 // session stream meanwhile, so both ranks sleep in step.
-                if self.num_active() == 0 && pending.is_empty() && !closed {
+                if self.num_active() == 0 && pending.is_empty() && self.pf.is_none() && !closed {
                     match self.rx.recv().await {
-                        Some(req) => {
-                            events.push(crate::tp_serve::TpEvent::Admit((&req).into()));
-                            pending.push(req);
-                        }
+                        Some(req) => pending.push(req),
                         None => closed = true,
                     }
                 }
             }
-            if closed && pending.is_empty() && self.num_active() == 0 {
+            // AT MOST ONE admission per step, and its `Admit` event is shipped in THIS step's event
+            // list — the mirror admits exactly what the wire says, so the two ranks can never hold a
+            // different number of cursors. (Draining several requests and admitting them all, as the
+            // pre-cursor loop did, is impossible now: only one prefill cursor may exist.)
+            let admit_now = self.pf.is_none() && !pending.is_empty();
+            // Shutdown only when NOTHING is left — including an in-flight prefill cursor: sending
+            // Shutdown while a cursor is mid-prefill would exit the mirror with a half-prefilled
+            // lane on the head (§3.4's one new teardown hazard).
+            if closed && pending.is_empty() && self.num_active() == 0 && self.pf.is_none() {
                 for s in streams.iter_mut() {
                     crate::tp_serve::send_serving(s, &crate::tp_serve::ServingMsg::Shutdown)?;
                 }
@@ -1391,6 +1743,9 @@ impl BatchScheduler {
                     events.push(crate::tp_serve::TpEvent::Cancel { lane: i });
                 }
             }
+            if admit_now {
+                events.push(crate::tp_serve::TpEvent::Admit((&pending[0]).into()));
+            }
             // Fan the SAME per-step event list out to every node (world-1 mirrors). The head is the
             // hub; every mirror must replay an identical scheduler state at the same step index.
             let msg = crate::tp_serve::ServingMsg::Step(
@@ -1398,10 +1753,26 @@ impl BatchScheduler {
             for s in streams.iter_mut() {
                 crate::tp_serve::send_serving(s, &msg)?;
             }
-            for req in pending { self.admit(req); }
+            if admit_now { self.admit(pending.remove(0)); }
+            // §3.5: the window advance sits at a FIXED POINT in the step — after the Step message
+            // has been shipped and after admissions, before `decode_step`. That is what keeps every
+            // prefill all-reduce pair-able by the mirror (the barrier structure changes in
+            // ORDERING relative to decode's own collectives, never in COUNT).
+            self.pf_advance();
             let b = self.num_active();
             if b > 0 { self.decode_step(b); self.tp_agree_step(step)?; }
+            // A cursor can exist while b == 0 (the whole batch is prefilling): nothing to agree
+            // about yet, but the step index advances on both ranks identically because the cursor
+            // policy is a pure function of state (one cursor, one window, no wall clock).
+
             step += 1;
+            // D3: serving-mode barrier histogram. GB10_TP_TRACE already timestamps every barrier
+            // (K1 duration / peer bounce / K2 wait / whole barrier / gap) and the bench path dumps
+            // it at exit; this makes the same table available while SERVING, every 512 steps, so
+            // the fixed per-step cost can be split sync vs read without a bench harness.
+            if b > 0 && step % 512 == 0 && std::env::var("GB10_TP_TRACE").is_ok() {
+                self.gpu.tp_trace_dump(&format!("serve step {step}"));
+            }
             // Yield to tokio so streaming handlers can flush SSE events between decode steps.
             tokio::task::yield_now().await;
         }
@@ -1449,6 +1820,10 @@ impl BatchScheduler {
                             }
                         }
                     }
+                    // Symmetric with the head: replay the admissions, advance the SAME one window
+                    // of the SAME cursor, then decode. The replayed Admit events are the only input
+                    // either rank uses, so the two cursors cannot diverge.
+                    self.pf_advance();
                     let b = self.num_active();
                     if b > 0 { self.decode_step(b); self.tp_agree_step(step)?; }
                     step += 1;
@@ -1504,6 +1879,8 @@ impl BatchScheduler {
                 rep_penalty: 1.0,
                 presence_penalty: 0.0,
                 frequency_penalty: 0.0,
+                min_new: 0,
+                ignore_eos: false,
                 tx,
                 seed: Some(job.seed),
                 ckpt_at: None,
@@ -1511,7 +1888,12 @@ impl BatchScheduler {
                 received_at: std::time::Instant::now(),
                 image_embeds: None,
                 image_spans: Vec::new(),
+                schema: None,
             });
+            // The bench harness has no scheduler loop of its own, so it drains the cursor inline —
+            // the SAME window sequence (one window per call), just without interleaving. This keeps
+            // `run_spec_bench` byte-equivalent to the pre-cursor inline admit.
+            while self.pf.is_some() { self.pf_advance(); }
             // The prefill filled the prime sink — copy the prompt's tap rows into the dump.
             if let Some(d) = self.step_dump.as_mut() {
                 d.job_prime(job_plen, self.df2_prime.as_ref(), self.gpu.dev());
@@ -1553,6 +1935,8 @@ impl BatchScheduler {
     pub fn set_cov_trace(&mut self, on: bool) { self.cov_trace = on; }
 
     fn admit(&mut self, req: BatchRequest) {
+        // W2: the request's compiled schema (moved into the lane below).
+        let req_schema = req.schema.clone();
         // R9: register the live gpu+state once so net::agree's mismatch path can dump GDN state.
         if std::env::var("GB10_TP_DIAG").is_ok() { r9_register_state(&self.gpu, &self.state); }
         // Each free slot offers TWO points we could resume from, because we hold the GDN state at two
@@ -1568,45 +1952,128 @@ impl BatchScheduler {
         // sits immediately after its last token, so we need at least one token left to prefill and we
         // cannot resume from a point the state never occupied. Prefer the longer.
         #[derive(Clone, Copy, PartialEq)]
-        enum From_ { Live, Ckpt }
+        enum From_ { Live, Ckpt, Ring(usize) }
         // Image-content identities for this request (empty for text-only). A prefix candidate whose
         // reused range includes a DIFFERENT image is discarded below, so the visual content of the
         // shared prefix is never replayed from a stale image.
         let req_imgs = request_image_identities(req.image_embeds.as_ref(), &req.image_spans);
+        // Part-B (load invariance): reuse ONLY at ring-grid points (absolute-position multiples of
+        // RING_CKPT_STRIDE). A Live/Ckpt hit resumes at an arbitrary length, which puts the first
+        // prefill window's start mid-grid — its width differs run-to-run with the cache state, and
+        // window width perturbs the prefill hiddens by ulps (the documented chunked-prefill caveat).
+        // That made the SAME request's token stream depend on WHO ELSE had used the box: the
+        // load-invariance failure. Ring-only reuse makes the window decomposition a pure function
+        // of plen — [0,512),[512,1024),...,[512k,plen) — identical for cold, warm, solo, and
+        // loaded runs, because the ring snapshot at 512k was itself produced by that same
+        // window sequence (snapshots are bit-exact). Cost: reuse precision drops from token-exact
+        // to the 512-token grid — a hit re-prefills up to RING_CKPT_STRIDE-1 extra tokens
+        // (<=0.75 s at ~690 tok/s TP2 prefill; typical ~0.35 s), and verbatim-replay clients
+        // (opencode) re-prefill the round-down remainder instead of skipping 100%.
+        // GB10_PREFIX_GRID_REUSE=0 restores token-exact Live/Ckpt reuse (diagnostics-only A/B).
+        let grid_reuse = std::env::var("GB10_PREFIX_GRID_REUSE").map_or(true, |v| v != "0");
         let best = if !self.prefix_cache { None } else { self.free_slots.iter().enumerate()
             .flat_map(|(i, &sl)| {
                 let live = common_prefix_len(&self.slot_cache[sl], &req.prompt);
                 let ckpt = common_prefix_len(&self.slot_ckpt_seq[sl], &req.prompt);
-                [(i, sl, live, From_::Live, self.slot_cache[sl].len()),
-                 (i, sl, ckpt, From_::Ckpt, self.slot_ckpt_seq[sl].len())]
+                let mut cands = Vec::new();
+                if !grid_reuse {
+                    cands.push((i, sl, live, From_::Live, self.slot_cache[sl].len(), live));
+                    cands.push((i, sl, ckpt, From_::Ckpt, self.slot_ckpt_seq[sl].len(), live));
+                }
+                // A6 ring checkpoints: entry j holds the GDN state at absolute length
+                // slot_ring_len[sl][j] — reusable when that whole prefix matches (lcp ≥ len).
+                // The live LCP against slot_cache bounds every ring candidate at once.
+                if live > 0 {
+                    for (j, &rlen) in self.slot_ring_len[sl].iter().enumerate() {
+                        if rlen > 0 && rlen <= live && rlen < req.prompt.len() {
+                            cands.push((i, sl, rlen, From_::Ring(j), rlen, live));
+                        }
+                    }
+                }
+                cands
             })
-            .filter(|&(_, sl, l, from, seq_len)|
-                l > 0 && l == seq_len && l < req.prompt.len()
+            .filter(|&(_, sl, l, from, seq_len, _live)|
+                l > 0 && match from {
+                    // live/ckpt: the state sits at the END of the cached sequence — the cache
+                    // must be a strict prefix (at least one token left to prefill).
+                    From_::Live | From_::Ckpt => l == seq_len && l < req.prompt.len(),
+                    // ring: the state sits at rlen — already filtered to rlen ≤ lcp above.
+                    From_::Ring(_) => true,
+                }
                 && match from {
                     From_::Live => images_compatible(&self.slot_cache_images[sl], &req_imgs, l),
                     From_::Ckpt => images_compatible(&self.slot_ckpt_images[sl], &req_imgs, l),
+                    From_::Ring(_) => images_compatible(&self.slot_cache_images[sl], &req_imgs, l),
                 })
-            .max_by_key(|&(_, _, l, _, _)| l) };
+            .max_by_key(|&(_, _, l, _, _, _)| l) };
 
-        let (phys, reuse, from) = match best {
-            Some((idx, sl, l, f, _)) => { self.free_slots.remove(idx); (sl, l, Some(f)) }
+        let (phys, reuse, from, live_at_admit) = match best {
+            Some((idx, sl, l, f, _, live)) => { self.free_slots.remove(idx); (sl, l, Some(f), live) }
             None => match self.free_slots.pop() {
-                Some(s) => (s, 0, None),
-                None => return, // no free physical slot (caller checks capacity)
+                Some(s) => (s, 0, None, common_prefix_len(&self.slot_cache[s], &req.prompt)),
+                None => {
+                    // NO SILENT DROPS (P10 lesson): dropping a BatchRequest drops its `tx`, which
+                    // closes the client's SSE stream with no tokens and no error — the same
+                    // client-visible symptom as the pf8 OOB class. Capacity is the CALLER's job, so
+                    // reaching here means the caller's accounting and the slot table disagree;
+                    // say so, and tell the client instead of hanging it.
+                    eprintln!("[req] DROPPED: no free physical slot (free_slots=0) — caller capacity                                accounting disagrees with the slot table");
+                    let _ = req.tx.send(TokEvent::Finish { reason: "capacity".to_string() });
+                    return;
+                }
             },
         };
 
-        // Resuming from the checkpoint means winding the slot's GDN state BACK to the prompt boundary.
-        // (KV is untouched: positions 0..reuse still hold this very prefix's keys, and the suffix
-        // prefill overwrites everything after.)
-        if from == Some(From_::Ckpt) {
-            self.gpu.copy_gdn_slot(&self.state, self.prompt_ckpt_slot + phys, phys);
+        // Resuming from the checkpoint (or a ring entry) means winding the slot's GDN state BACK
+        // to that point. (KV is untouched: positions 0..reuse still hold this very prefix's keys,
+        // and the suffix prefill overwrites everything after.)
+        match from {
+            Some(From_::Ckpt) => {
+                self.gpu.copy_gdn_slot(&self.state, self.prompt_ckpt_slot + phys, phys);
+            }
+            Some(From_::Ring(j)) => {
+                self.gpu.copy_gdn_slot(&self.state, self.ring_ckpt_slot + phys * RING_CKPT_K + j, phys);
+                if std::env::var("GB10_DUMP_PFHASH").is_ok() {
+                    // Phase-8 [pfhash]: state ACTUALLY sitting in the slot right after the ring
+                    // restore — compare against [ring-hash] printed at snapshot time (cold run).
+                    eprintln!("[pre-hash] reuse={}{}", reuse, self.gpu.pf_hash(&self.state, phys, None));
+                }
+            }
+            _ => {}
+        }
+        // Ring entries past the reuse point are invalidated: their positions get re-occupied by
+        // the new prefill's snapshots. Entries at lengths ≤ reuse stay valid (state is a pure
+        // function of the token prefix, which did not change).
+        let src_early = self.mtp.spec_source();
+        for rlen in self.slot_ring_len[phys].iter_mut() {
+            if *rlen > reuse { *rlen = 0; }
+        }
+        // A6: the DSpark ring rows [0, reuse) are exactly valid when the previous dspark lane in
+        // THIS slot covered them (single-tenant b==1 ring; rows are a pure function of the token
+        // prefix). Carry the ring over (rewind nprev) instead of degrading the lane to MTP.
+        // IDENTITY (PLAN/DSPARK_RING_IDENTITY_SPEC.md): length alone is NOT sufficient — the round
+        // is ONE shared buffer while this bookkeeping is per slot, so an interleaved request on
+        // another slot can leave the ring holding a foreign prefix. Require the claim to name THIS
+        // slot; otherwise `rewind` would preserve rows that are not this prefix's and the lane
+        // would draft from them (a tau loss, invisible to every losslessness gate).
+        let dspark_ring_slot = self.dspark.as_ref().and_then(|d| d.ring_slot());
+        // Diagnostics-only negative control (PLAN/DSPARK_RING_IDENTITY_SPEC.md §4 gate 2): drop
+        // ONLY the identity term, reproducing the pre-guard length-only carry so the hazard can be
+        // made to bite (the twin of DF2's GB10_DF2_CARRY_LEN_ONLY). Never set outside a gate run.
+        let dspark_ring_blind = std::env::var("GB10_DSPARK_RING_BLIND").is_ok();
+        let dspark_carry = reuse > 0 && src_early == SpecSource::Dspark
+            && self.slot_dspark_len[phys] >= reuse
+            && (dspark_ring_slot == Some(phys) || dspark_ring_blind);
+        if !dspark_carry {
+            self.slot_dspark_len[phys] = 0;
+            // The claim must be dropped alongside the length — every path that today zeroes the
+            // length invalidates the identity too (mirrors `Df2Round::invalidate_ring`).
+            if let Some(d) = self.dspark.as_mut() { d.invalidate_ring(); }
         }
 
         // On a miss, report the prefix we COULD have reused. This is the only way to see the size of
         // the opportunity we are leaving on the floor — and it is what exposed the 88% waste.
-        if reuse == 0 {
-            if let Some((best, cached)) = self.free_slots.iter().chain(std::iter::once(&phys))
+        if reuse == 0 {            if let Some((best, cached)) = self.free_slots.iter().chain(std::iter::once(&phys))
                 .flat_map(|&sl| [(common_prefix_len(&self.slot_cache[sl], &req.prompt), self.slot_cache[sl].len()),
                                  (common_prefix_len(&self.slot_ckpt_seq[sl], &req.prompt), self.slot_ckpt_seq[sl].len())])
                 .max_by_key(|&(l, _)| l) {
@@ -1626,6 +2093,8 @@ impl BatchScheduler {
         let plen = req.prompt.len();
         let prompt = req.prompt;
         let max_new = req.max_new;
+        let min_new = req.min_new;
+        let ignore_eos = req.ignore_eos;
         let req_ckpt_at = req.ckpt_at;
         let rep_penalty = req.rep_penalty;
         let presence_penalty = req.presence_penalty;
@@ -1637,8 +2106,88 @@ impl BatchScheduler {
         // reused prefix, so it falls back to MTP/batched; prefix-cache + DFlash2 is out of scope
         // for S5F and documented as such).
         let src = self.mtp.spec_source();
+        // DF2_CARRY: the DFlash2 twin of the A6 prefix-cache carve-out. The exact conditions —
+        // and why a length-only copy of DSpark's check would be wrong (the DF2 ring is MODULO,
+        // DSpark's is LINEAR) — are documented on `df2_carry_ok` and unit-tested in `mod df2_carry`.
+        // Capture the ring state BEFORE any invalidation below: the log must report the guard's
+        // INPUTS, not the state it leaves behind (reading it after made a refused carry print as
+        // if the ring had never been bound).
+        let (ring_slot_in, ring_len_in) = self.df2.as_ref()
+            .map(|d| (d.ring_slot(), d.ring_len())).unwrap_or((None, 0));
+        let df2_carry = self.df2.is_some() && df2_carry_ok(
+            self.df2_carry_enabled, is_df2_src(src), reuse, plen, phys,
+            ring_slot_in, ring_len_in, std::env::var("GB10_DF2_CARRY_LEN_ONLY").is_ok());
+        // Does the ring's claim on THIS slot survive this admit?
+        //
+        // The claim is "rows [N-RING, N) hold the k/v of tokens [0, N) of this slot's cached
+        // sequence". This admit replaces that cached sequence with the new prompt, so the claim
+        // holds afterwards exactly when the new prompt still agrees with the sequence the ring was
+        // built from over the whole range the claim covers — [0, min(N, plen)). `live_at_admit` is
+        // the match length against the OLD cached sequence, so the test is `live >= min(N, plen)`.
+        //
+        // Dropping the claim whenever we simply do not carry is WRONG, and measurably so: a
+        // shorter follow-up turn (plen < N — e.g. a retry, or a sub-agent re-sending only the
+        // shared preamble) fails the frontier test for its own legitimate reason, and the blunt
+        // rule then killed the claim for the rest of the session, pinning every later turn to MTP.
+        // The refusal is per-request; the claim is about identity, and identity usually survives.
+        let ring_claim_survives = ring_len_in > 0 && live_at_admit >= ring_len_in.min(plen);
+        if !df2_carry && !ring_claim_survives
+            && self.df2.as_ref().is_some_and(|d| d.ring_slot() == Some(phys)) {
+            if let Some(d) = self.df2.as_mut() { d.invalidate_ring(); }
+        }
+        if reuse > 0 {
+            let kind = match from {
+                Some(From_::Live) => "live",
+                Some(From_::Ckpt) => "ckpt",
+                Some(From_::Ring(j)) => "ring",
+                None => unreachable!(),
+            };
+            // DF2_CARRY telemetry (spec §6.7): print the guard's own INPUTS, so a refusal is
+            // diagnosable rather than inferred. `ring_len` is the frontier N that `N <= plen`
+            // bounds. All four booleans are what `df2_carry_ok` actually evaluated.
+            eprintln!("[req] prefix HIT: reuse={reuse} of plen={plen} ({kind}, dspark_carry={dspark_carry}, blind={dspark_ring_blind}, \
+                       df2_carry={df2_carry} [enabled={} df2_src={} ring_slot={ring_slot_in:?} phys={phys} \
+                       ring_len={ring_len_in} reuse<=len={} len<=plen={} live={live_at_admit} claim_kept={}])",
+                      self.df2_carry_enabled, is_df2_src(src),
+                      ring_len_in >= reuse, ring_len_in <= plen, ring_claim_survives);
+        }
+        // W2: the DFlash2 round is not schema-masked in this release — a schema request keeps the
+        // plain decode path instead of an unmasked draft/verify round.
         let will_use_df2 = will_use_mtp && is_df2_src(src)
-            && self.df2.is_some() && self.df2_prime.is_some() && reuse == 0;
+            && self.df2.is_some() && self.df2_prime.is_some()
+            && (reuse == 0 || df2_carry) && req_schema.is_none();
+        // WI1: the DSpark twin of will_use_df2. A6 softens the prefix carve-out: a prefix-hit
+        // lane whose slot carries a valid DSpark ring for the reused range (dspark_carry) keeps
+        // the DSpark path — the ring rows [0, reuse) are exactly valid and only the suffix gets
+        // primed. Without a carried ring the old rule stands (the ring cannot be rebuilt from
+        // stored trunk state: the drafter consumes trunk tap hiddens, which are not retained).
+        // P14: the v1 lane runs only on a lane whose ctx feature covers the WHOLE prompt (the
+        // drafter conditions on every committed position, and a prefix-cache hit skips the prefill
+        // that fills it) and only for greedy requests (v1 is greedy-only by construction).
+        let will_use_dflash = will_use_mtp && src == SpecSource::DFlash && self.dflash.is_some()
+            && reuse == 0 && greedy && req_schema.is_none();
+        self.dflash_prime_done = false;
+        self.dflash_prime_armed = will_use_dflash;
+        if src == SpecSource::DFlash && self.dflash.is_none() && !self.dflash_fallback_logged {
+            eprintln!("[dflash] SpecSource=dflash but no v1 lane is resident — serving via MTP \
+                       (install the artifact with --draft-dir <dir>, or --spec-source without a drafter to serve MTP)");
+            self.dflash_fallback_logged = true;
+        }
+        if src == SpecSource::DFlash && self.dflash.is_some() && !will_use_dflash
+            && !self.dflash_carry_logged {
+            eprintln!("[dflash] v1 lane NOT primed for this request (prefix reuse {reuse}, greedy \
+                       {greedy}): serving it with MTP — the v1 lane never runs on a partial ctx");
+            self.dflash_carry_logged = true;
+        }
+        let will_use_dspark = will_use_mtp && src == SpecSource::Dspark
+            && self.dspark.is_some() && self.dspark_prime.is_some() && (reuse == 0 || dspark_carry)
+            && req_schema.is_none();
+        if src == SpecSource::Dspark && self.dspark.is_none() && !self.dspark_fallback_logged {
+            eprintln!("[dspark] SpecSource=dspark but the DSpark round is NOT resident — serving via \
+                       MTP per the standing-directive fallback (absent/failed artifact is never a \
+                       hard failure)");
+            self.dspark_fallback_logged = true;
+        }
         if is_df2_src(src) && self.df2.is_none() && !self.df2_fallback_logged {
             eprintln!("[df2] SpecSource=DFlash2 but the DFlash2 round is NOT resident — serving via \
                        MTP per the standing-directive fallback (absent/failed artifact is never a \
@@ -1733,7 +2282,9 @@ impl BatchScheduler {
         let suffix = &prompt[reuse..];
         if reuse > 0 {
             eprintln!("[req] prefix hit ({}): {}/{} tokens cached, prefilling {} ({:.0}% skipped)",
-                      if from == Some(From_::Ckpt) { "prompt checkpoint" } else { "live state" },
+                      match from { Some(From_::Ckpt) => "prompt checkpoint",
+                                   Some(From_::Ring(_)) => "ring grid",
+                                   _ => "live state" },
                       reuse, plen, suffix.len(), 100.0 * reuse as f32 / plen as f32);
         }
 
@@ -1780,137 +2331,337 @@ impl BatchScheduler {
         // re-chunked, which perturbs their prefill hiddens by ulps — outside the batch-invariance
         // contract (prefill feeds decode and verify identically), so greedy MTP stays lossless.
         //
-        // The message-boundary checkpoint (prefix cache) is honoured by forcing a window to END exactly
-        // at `c`, then snapshotting the GDN state there before the next window moves it.
+        // The message-boundary checkpoint (prefix cache) is honoured by snapshotting the GDN state
+        // at `c` when a window ends there. Part-B (load invariance): under grid reuse a window is
+        // NEVER SPLIT at `c` — window ends stay a pure function of absolute position (the next
+        // RING_CKPT_STRIDE multiple, then plen), never of cache state. The snapshot still fires
+        // when `c` coincides with a window end; otherwise slot_ckpt_seq is refreshed at prompt end
+        // (it is diagnostics-only now — Ckpt no longer resumes anything under grid reuse).
         let ckpt_at = req_ckpt_at.filter(|_| self.prefix_cache).filter(|&c| c > reuse && c < plen);
-        let mut first_tok = 0u32;
         let mut first_sent = false;
         let mut w0 = reuse;
-        // S5F: per-lane DFlash2 prime state. The round is reset + the prompt's taps are injected
         // window by window (the prefill captures them into the wide prime sink; the round consumes
-        // each window at large M). A failed prime degrades the lane to MTP/batched (never a hard
         // failure).
-        let mut df2_primed_ok = true;
         if will_use_df2 {
             if let Some(df2) = self.df2.as_mut() {
-                df2.reset();
+                // DF2_CARRY: on a carry, move the frontier to the reuse point and KEEP the ring
+                // rows [0, reuse) — the suffix prime below only writes [reuse, plen), and its
+                // ring rows are the complementary residues of the draft's read band, so the two
+                // halves tile the band exactly. Cold start: full reset (which also drops the
+                // identity claim). The window loop below already starts at w0 = reuse, and
+                // prime_window sets nprev absolutely, so nothing else needs to change.
+                if df2_carry { df2.rewind(reuse); } else { df2.reset(); }
             }
             if let Some(ps) = self.df2_prime.as_ref() {
                 self.gpu.set_df2_prime_sink(ps.clone());
             }
         }
-        // V3 vision: upload the merged image embeddings and arm the prefill splice (state is
-        // cleared after the window loop).
-        if let Some(emb) = req.image_embeds {
-            if !req.image_spans.is_empty() && !emb.is_empty() {
+        if will_use_dspark {
+            if let Some(ds) = self.dspark.as_mut() {
+                // A6 carry: rewind to the reuse point (rows [0, reuse) are this very prefix's
+                // drafter KV); cold start: full reset.
+                if dspark_carry {
+                    ds.rewind(reuse);
+                } else {
+                    ds.reset();
+                }
+            }
+            if let Some(ps) = self.dspark_prime.as_ref() {
+                self.gpu.set_dspark_prime_sink(ps.clone());
+            }
+        }
+        // ---------------------------------------------------------------------------------------
+        // PLAN/SCHEDULER_2LANE_WORKDOC.md §3.1 — hand the WINDOW LOOP to a per-lane cursor.
+        //
+        // Everything above this line is the DECISION half of admission and stays here: capacity,
+        // the context-length reject, the prefix-cache/reuse pick, `will_use_*`/carry, the slot
+        // wipe/zero, the MTP memsets, the DF2/DSpark reset-or-rewind and the prime-sink arming.
+        // Everything below moves into `PfCursor` and is advanced by the step loop, so a long
+        // prompt's prefill no longer runs to completion inside one scheduler iteration.
+        //
+        // ORDERING NOTE (the reason arming stays here): at most ONE cursor exists at a time
+        // (`BatchScheduler::pf`), so admission can never overlap an in-flight prime — the shared
+        // `df2`/`dspark` rounds are reset and armed exactly where they always were relative to
+        // their own lane's windows.
+        // ---------------------------------------------------------------------------------------
+        //
+        // V3 vision: upload the merged image embeddings. The splice is armed per WINDOW (in
+        // `pf_advance`), never for the whole prefill: `state.vision_embeds` is a GLOBAL field, and
+        // a co-resident lane's window or decode step must never see this request's splice (§3.4).
+        let vision = match req.image_embeds {
+            Some(emb) if !req.image_spans.is_empty() && !emb.is_empty() => {
                 let hb: Vec<half::bf16> = emb.iter().map(|&x| half::bf16::from_f32(x)).collect();
                 let buf = self.gpu.dev().htod_sync_copy(&hb).expect("vision htod");
-                self.state.vision_embeds = Some(buf);
-                self.state.vision_spans = req.image_spans.clone();
+                Some((buf, req.image_spans.clone()))
+            }
+            _ => None,
+        };
+        // Seed: use the explicit seed from the request, or derive from prompt hash + counter.
+        // (Kept at admission so the cursor owns the whole lane-install payload.)
+        let seed = req.seed.unwrap_or_else(|| {
+            use std::hash::{Hash, Hasher};
+            let mut sh = std::collections::hash_map::DefaultHasher::new();
+            prompt.hash(&mut sh);
+            sh.finish()
+        });
+        debug_assert!(self.pf.is_none(),
+                      "one prefill cursor at a time — see BatchScheduler::pf (the shared df2/dspark \
+                       rounds are primed window-by-window and cannot be interleaved)");
+        self.pf = Some(Box::new(PfCursor {
+            phys, plen, reuse, w0: reuse, ckpt_at, grid_reuse, req_imgs,
+            schema: req_schema.clone(),
+            will_use_mtp, will_use_df2, will_use_dspark, df2_carry, dspark_carry,
+            first_tok: 0, first_sent: false, pf_hash_str: String::new(),
+            df2_primed_ok: true, dspark_primed_ok: true,
+            tx, greedy, domain, temperature, top_p, top_k, max_new, min_new, ignore_eos,
+            rep_penalty, presence_penalty, frequency_penalty, seed, received_at,
+            trace_pf, admit_t0, t_memsets, t_prefill, t_prime, vision,
+            prompt,
+        }));
+        // P11 W5a (--prefill-sched inline, owner-blessed escape): drain the whole prefill inside
+        // this admission — the pre-P10 schedule. Decode lanes wait the FULL prompt (max gap = the
+        // entire prefill, the posture the cursor replaced). A/B + emergency use; the cursor stays
+        // the default. The window formula/order is untouched — schedule-only.
+        if self.pf_inline {
+            while self.pf.is_some() { self.pf_advance(); }
+        }
+    }
+
+    /// Advance the in-flight prefill cursor by ONE window (SCHEDULER_2LANE §3.1/§3.3).
+    ///
+    /// This is the `while w0 < plen` body of `admit()` moved VERBATIM (§3.2 — the window formula is
+    /// a NUMERIC contract, not a schedule: the pf8 padding family fails only when the pool's
+    /// power-of-two capacity lands in a width gap, so "same windows, different order" is the whole
+    /// safety argument and a re-derived formula would silently re-open the §0.2 counter-case #2
+    /// class). No-op when nothing is prefilling.
+    ///
+    /// Budget policy (§3.3 option 1): ONE window per loop iteration, no knob. Deterministic — a
+    /// pure function of scheduler state — which is what `run_tp_mirror`'s replay-by-wire contract
+    /// requires (a wall-clock or memory-pressure budget would desync the ranks).
+    fn pf_advance(&mut self) {
+        let Some(mut c) = self.pf.take() else { return };
+        let phys = c.phys;
+        let (plen, w0) = (c.plen, c.w0);
+        let h = self.gpu.cfg().hidden_size;
+        if w0 >= plen {
+            // reuse == plen (a full prefix hit): today's inline loop never ran either, so the
+            // post-loop tail must still execute (it streams the first token and installs the lane).
+            self.pf_finish(*c);
+            return;
+        }
+        let mut w1 = (w0 + PREFILL_CHUNK).min(plen);
+        if !c.grid_reuse {
+            // Token-exact reuse (diagnostics): resume points are arbitrary, so honour the
+            // message boundary by splitting a window at `c` (the pre-grid-reuse behavior).
+            if let Some(ck) = c.ckpt_at { if w0 < ck && ck < w1 { w1 = ck; } }   // stop at the boundary
+        }
+        // A6: stop at the next ring-checkpoint boundary so the GDN state passes exactly
+        // through it and can be snapshotted below (prefix-cache re-chunking is the
+        // documented caveat; the ring slack is bounded by RING_CKPT_STRIDE).
+        if self.prefix_cache {
+            let rb = ((w0 / RING_CKPT_STRIDE) + 1) * RING_CKPT_STRIDE;
+            if w0 < rb && rb < w1 { w1 = rb; }
+        }
+        // PLAN/TRIPWIRE_SPEC.md §3.2 + SCHEDULER_2LANE §5 gate 4: the WINDOW CENSUS. `--pool-census`
+        // only, and NEVER on for a timing run. This is the artifact the scheduler's P4 gate diffs:
+        // the multiset of `n = w1 - w0` values `prefill_batch` is presented for a fixed prompt mix,
+        // plus the pf8 pad arithmetic each one implies (the pool-luck class of §0.2 counter-case #2).
+        crate::gpu::pf_census_window(w0, w1, h);
+
+        // V3 vision: arm the splice for THIS window only. `state.vision_embeds` is global (the
+        // splice is consumed host-side inside `prefill_batch`), so it is armed immediately before
+        // and disarmed immediately after — a co-resident lane's window must never inherit it.
+        match c.vision.as_ref() {
+            Some((buf, spans)) => {
+                self.state.vision_embeds = Some(buf.clone());
+                self.state.vision_spans = spans.clone();
+            }
+            None => { self.state.vision_embeds = None; self.state.vision_spans.clear(); }
+        }
+
+        let mut pf_mark = std::time::Instant::now();
+        // P14: the v1 lane's ctx feature is filled by the trunk's own tap capture during the REAL
+        // prefill (a position-addressed D2D per tapped layer per window, inside
+        // `prefill_batch_range`) — no token-by-token prefill anywhere. NOTE: that capture site was
+        // MISSING until the P14 repair; this comment described the design while the code primed the
+        // lane from a surface no forward had written (see the capture site's comment in gpu.rs).
+        if self.dflash_prime_armed { self.gpu.set_dflash_wide_pos(w0); }
+        let (tok, hw) = self.gpu.prefill_batch(
+            &mut self.pool, &c.prompt[w0..w1], &mut self.state, phys, self.kv_stride, w0);
+        self.state.vision_embeds = None;
+        self.state.vision_spans.clear();
+        if c.trace_pf { c.t_prefill += pf_mark.elapsed().as_secs_f64(); }
+        c.first_tok = tok;   // only the LAST window's token (at plen-1) is the prompt's next token
+        if w1 == plen && self.dflash_prime_armed {
+            // The prompt's columns [0, plen) are captured: hand them to the drafter (its KV append
+            // happens lazily in the first draft step) and mark the lane primed.
+            self.dflash_prime(w1);
+            // The lane struct is created later in the admit path, so record the prime on the
+            // scheduler and let the dispatch accept either flag (the v1 lane is b == 1 only).
+            if let Some(l) = self.lanes[0].as_mut() { l.df2_primed = true; }
+            self.dflash_prime_done = true;
+            self.dflash_prime_armed = false;
+        }
+        if w1 == plen && std::env::var("GB10_DUMP_PFHASH").is_ok() {
+            // Phase-8 [pfhash]: warm-vs-cold prefill equality probe (diagnostics).
+            c.pf_hash_str = self.gpu.pf_hash(&self.state, phys, Some((&hw, h, w1 - w0)));
+        }
+
+        // TTFT (b2, EXPERT_TTFT_PREFILL_RESPONSE): stream the first token the moment the last
+        // window's prefill produced it — BEFORE the MTP prime + cursor copy below. The prime
+        // only gates DRAFTING, which runs in decode_step after admission completes, so ordering
+        // is preserved and semantics are unchanged; the client just sees its first chunk
+        // ~6-9 ms earlier on MTP-on servers (P10 removed from the TTFT window).
+        if w1 == plen && !c.first_sent {
+            // W2 (Phase 13): a schema-constrained lane does NOT emit the prefill's own first
+            // token. The prefill selection has no schema mask (it is a different code path), so
+            // that token is unconstrained — observed as a leading '```' in the first W2 boot.
+            // It becomes the FEED token of the first masked decode step instead, which means
+            // every token the client sees came from a masked selection.
+            if c.schema.is_some() {
+                c.first_sent = true;
+            } else {
+                let _ = c.tx.send(TokEvent::Tok(c.first_tok));
+                c.first_sent = true;
+            }
+            // The mirror replays the same admit and prints its own line to the node log;
+            // the head's line is the measurement's signal. (tp_serving is true on BOTH ranks
+            // in TP serving mode, so it cannot gate this — only rank selection could, and
+            // the two lines are harmless in separate logs.)
+            eprintln!("[req] ttft={:.1}ms plen={}",
+                      c.received_at.elapsed().as_secs_f64() * 1000.0, plen);
+        }
+
+        if c.will_use_mtp {
+            // MTP prime pairs hidden[t] with token[t+1] for t in [w0, min(w1, plen-1)); position
+            // plen-1 is never primed (no token plen to pair). hw's columns 0.. map to positions w0..
+            let tok_end = w1.min(plen - 1);
+            if tok_end > w0 {
+                let mtp_kc_ptr = *self.mtp_kc[phys].device_ptr();
+                let mtp_vc_ptr = *self.mtp_vc[phys].device_ptr();
+                if c.trace_pf { pf_mark = std::time::Instant::now(); }
+                self.gpu.mtp_prime_prompt(&mut self.pool, &hw, &c.prompt[w0 + 1..tok_end + 1],
+                                          mtp_kc_ptr, mtp_vc_ptr, self.kv_stride, w0);
+                if c.trace_pf { c.t_prime += pf_mark.elapsed().as_secs_f64(); }
+            }
+            // Cursor hidden = pre-norm h at the LAST prompt position, i.e. last column of the
+            // final window.
+            if w1 == plen {
+                self.gpu.copy_hidden_col(*self.mtp_h_prev[phys].device_ptr(), &hw, (w1 - w0) - 1);
             }
         }
-        while w0 < plen {
-            let mut w1 = (w0 + PREFILL_CHUNK).min(plen);
-            if let Some(c) = ckpt_at { if w0 < c && c < w1 { w1 = c; } }   // stop at the boundary
-
-            if trace_pf { pf_mark = std::time::Instant::now(); }
-            let (tok, hw) = self.gpu.prefill_batch(
-                &mut self.pool, &prompt[w0..w1], &mut self.state, phys, self.kv_stride, w0);
-            if trace_pf { t_prefill += pf_mark.elapsed().as_secs_f64(); }
-            first_tok = tok;   // only the LAST window's token (at plen-1) is the prompt's next token
-
-            // TTFT (b2, EXPERT_TTFT_PREFILL_RESPONSE): stream the first token the moment the last
-            // window's prefill produced it — BEFORE the MTP prime + cursor copy below. The prime
-            // only gates DRAFTING, which runs in decode_step after admission completes, so ordering
-            // is preserved and semantics are unchanged; the client just sees its first chunk
-            // ~6-9 ms earlier on MTP-on servers (P10 removed from the TTFT window).
-            if w1 == plen && !first_sent {
-                let _ = tx.send(TokEvent::Tok(first_tok));
-                first_sent = true;
-                // The mirror replays the same admit and prints its own line to the node log;
-                // the head's line is the measurement's signal. (tp_serving is true on BOTH ranks
-                // in TP serving mode, so it cannot gate this — only rank selection could, and
-                // the two lines are harmless in separate logs.)
-                eprintln!("[req] ttft={:.1}ms plen={}",
-                          received_at.elapsed().as_secs_f64() * 1000.0, plen);
-            }
-
-            if will_use_mtp {
-                // MTP prime pairs hidden[t] with token[t+1] for t in [w0, min(w1, plen-1)); position
-                // plen-1 is never primed (no token plen to pair). hw's columns 0.. map to positions w0..
-                let tok_end = w1.min(plen - 1);
-                if tok_end > w0 {
-                    if trace_pf { pf_mark = std::time::Instant::now(); }
-                    self.gpu.mtp_prime_prompt(&mut self.pool, &hw, &prompt[w0 + 1..tok_end + 1],
-                                              mtp_kc_ptr, mtp_vc_ptr, self.kv_stride, w0);
-                    if trace_pf { t_prime += pf_mark.elapsed().as_secs_f64(); }
-                }
-                // Cursor hidden = pre-norm h at the LAST prompt position, i.e. last column of the
-                // final window.
-                if w1 == plen {
-                    self.gpu.copy_hidden_col(*self.mtp_h_prev[phys].device_ptr(), &hw, (w1 - w0) - 1);
+        if c.will_use_dspark {
+            // WI1: the DSpark prime twin — same window taps (dspark::TAP_LAYERS captures),
+            // same large-M gemm_tiled path, same fail-soft contract.
+            if let (Some(ds), Some(ps)) = (self.dspark.as_mut(), self.dspark_prime.as_ref()) {
+                if let Err(e) = ds.prime_window(&ps.taps, w1 - w0, w0) {
+                    eprintln!("[dspark] prompt prime window {w0}..{w1} FAILED ({e:#}) — this lane \
+                               will NOT take the DSpark path (falls back to MTP/batched)");
+                    c.dspark_primed_ok = false;
                 }
             }
-            if will_use_df2 {
-                // S5F: prime the DFlash2 ring with THIS window's taps. prefill_batch synced at its
-                // tail, so the window's capture D2Ds are complete before the round reads them.
-                if let (Some(df2), Some(ps)) = (self.df2.as_mut(), self.df2_prime.as_ref()) {
-                    if let Err(e) = df2.prime_window(&ps.taps, w1 - w0, w0) {
-                        eprintln!("[df2] prompt prime window {w0}..{w1} FAILED ({e:#}) — this lane \
-                                   will NOT take the DFlash2 path (falls back to MTP/batched)");
-                        df2_primed_ok = false;
-                    }
-                }
-            }
-            self.pool.release_bf16(hw, h * (w1 - w0));
-
-            // Snapshot the GDN state at the message boundary (prefix cache), before the next window.
-            if Some(w1) == ckpt_at {
-                self.gpu.copy_gdn_slot(&self.state, phys, self.prompt_ckpt_slot + phys);
-                self.slot_ckpt_seq[phys] = prompt[..w1].to_vec();
-                self.slot_ckpt_images[phys] = req_imgs.iter()
-                    .filter(|x| x.start < w1).copied().collect();
-            }
-            w0 = w1;
         }
+        if c.will_use_df2 {
+            // S5F: prime the DFlash2 ring with THIS window's taps. prefill_batch synced at its
+            // tail, so the window's capture D2Ds are complete before the round reads them.
+            if let (Some(df2), Some(ps)) = (self.df2.as_mut(), self.df2_prime.as_ref()) {
+                if let Err(e) = df2.prime_window(&ps.taps, w1 - w0, w0) {
+                    eprintln!("[df2] prompt prime window {w0}..{w1} FAILED ({e:#}) — this lane \
+                               will NOT take the DFlash2 path (falls back to MTP/batched)");
+                    c.df2_primed_ok = false;
+                    // DF2_CARRY: a failed prime can leave the ring half-overwritten, so the
+                    // identity claim is no longer true — drop it rather than let a later
+                    // request carry a partially primed ring.
+                    df2.invalidate_ring();
+                }
+            }
+        }
+        self.pool.release_bf16(hw, h * (w1 - w0));
 
+        // Snapshot the GDN state at the message boundary (prefix cache), before the next window.
+        if Some(w1) == c.ckpt_at {
+            self.gpu.copy_gdn_slot(&self.state, phys, self.prompt_ckpt_slot + phys);
+            self.slot_ckpt_seq[phys] = c.prompt[..w1].to_vec();
+            self.slot_ckpt_images[phys] = c.req_imgs.iter()
+                .filter(|x| x.start < w1).copied().collect();
+        }
+        // A6: ring checkpoint at the boundary — round-robin over the K most-recent entries.
+        // w1 < plen keeps the prompt-end state in the live/ckpt slots (it must stay the
+        // generation-resume state, not a ring candidate).
+        if self.prefix_cache && w1 < plen && w1 % RING_CKPT_STRIDE == 0 {
+            let j = self.ring_cursor[phys];
+            self.ring_cursor[phys] = (j + 1) % RING_CKPT_K;
+            self.gpu.copy_gdn_slot(&self.state, phys,
+                self.ring_ckpt_slot + phys * RING_CKPT_K + j);
+            self.slot_ring_len[phys][j] = w1;
+            if std::env::var("GB10_DUMP_PFHASH").is_ok() && (w1 % 1024 == 0 || w1 >= plen - 512) {
+                // Phase-8 [pfhash]: what the ring entry ACTUALLY holds at snapshot time, plus
+                // the live slot state it was copied from — both hashed after the copy lands.
+                eprintln!("[ring-hash] w1={} j={} src{} ring{}",
+                          w1, j, self.gpu.pf_hash(&self.state, phys, None),
+                          self.gpu.pf_hash(&self.state, self.ring_ckpt_slot + phys * RING_CKPT_K + j, None));
+            }
+        }
+        c.w0 = w1;
+        if c.w0 >= plen {   // the last window completed: the lane becomes visible NOW (§3.4)
+            self.pf_finish(*c);
+        } else {
+            self.pf = Some(c);
+        }
+    }
+
+    /// Complete an admission whose last window has run: `admit()`'s post-loop tail, moved verbatim.
+    ///
+    /// This is the ONLY place a partially-prefilled request becomes visible to the rest of the
+    /// scheduler (§3.4): the prefix-cache entry (`slot_cache`/`slot_ckpt_seq`) is written here, not
+    /// per window, so the matcher can never see a half-prefilled length; and the lane itself is
+    /// installed here, so `num_active()`/`b`, the speculation gates and the cancel sweep all treat
+    /// a mid-prefill request as if it did not exist.
+    fn pf_finish(&mut self, mut c: PfCursor) {
+        let phys = c.phys;
         self.state.vision_embeds = None;
         self.state.vision_spans.clear();
 
-        if self.prefix_cache && ckpt_at.is_none() {
-            // No boundary inside the suffix (a raw/non-chat request, or one whose whole prompt was
-            // already cached). Snapshot where we ended; it is still the prompt boundary for THIS prompt.
+        if !c.pf_hash_str.is_empty() {
+            eprintln!("[pfhash] plen={} reuse={} phys={} a0={}{}",
+                      c.plen, c.reuse, phys, c.first_tok, c.pf_hash_str);
+        }
+
+        if self.prefix_cache && (c.ckpt_at.is_none() || c.grid_reuse) {
+            // No boundary snapshot fired inside the suffix (a raw/non-chat request, one whose whole
+            // prompt was already cached, or — grid reuse — a boundary that is not a window end
+            // anymore). Snapshot where we ended; it is still the prompt boundary for THIS prompt.
             self.gpu.copy_gdn_slot(&self.state, phys, self.prompt_ckpt_slot + phys);
-            self.slot_ckpt_seq[phys] = prompt.clone();
-            self.slot_ckpt_images[phys] = req_imgs.clone();
+            self.slot_ckpt_seq[phys] = c.prompt.clone();
+            self.slot_ckpt_images[phys] = c.req_imgs.clone();
         }
 
         // The slot's state now reflects the whole prompt. Decode extends this as tokens commit.
-        self.slot_cache[phys] = prompt.clone();
-        self.slot_cache_images[phys] = req_imgs.clone();
+        self.slot_cache[phys] = c.prompt.clone();
+        self.slot_cache_images[phys] = c.req_imgs.clone();
         // S5F: the DFlash2 prime is done — the prefill capture must not run for later lanes or
         // requests (it is a per-admit arm, disarmed here regardless of success).
-        if will_use_df2 { self.gpu.set_df2_prime_off(); }
+        if c.will_use_df2 { self.gpu.set_df2_prime_off(); }
 
         let slot = self.num_active();
-        if !first_sent {
+        if !c.first_sent {
             // No window ran (reuse == plen full-hit edge) — the loop never produced a token.
-            let _ = tx.send(TokEvent::Tok(first_tok));
+            if c.schema.is_some() {
+                // W2: same rule as the w1 == plen site — the token stays internal (feed), the
+                // client's first token comes from the masked decode path.
+                c.first_sent = true;
+            } else {
+                let _ = c.tx.send(TokEvent::Tok(c.first_tok));
+            }
             eprintln!("[req] ttft={:.1}ms plen={}",
-                      received_at.elapsed().as_secs_f64() * 1000.0, plen);
+                      c.received_at.elapsed().as_secs_f64() * 1000.0, c.plen);
         }
-        if trace_pf {
-            let other = admit_t0.elapsed().as_secs_f64() - t_memsets - t_prefill - t_prime;
-            eprintln!("[pf-admit] plen={plen} memsets={:.2}ms prefill={:.2}ms prime={:.2}ms other={:.2}ms",
-                      t_memsets * 1000.0, t_prefill * 1000.0, t_prime * 1000.0, other * 1000.0);
+        if c.trace_pf {
+            let other = c.admit_t0.elapsed().as_secs_f64() - c.t_memsets - c.t_prefill - c.t_prime;
+            eprintln!("[pf-admit] plen={} memsets={:.2}ms prefill={:.2}ms prime={:.2}ms other={:.2}ms",
+                      c.plen, c.t_memsets * 1000.0, c.t_prefill * 1000.0, c.t_prime * 1000.0,
+                      other * 1000.0);
         }
-        // Seed: use the explicit seed from the request, or derive from prompt hash + counter.
-        let seed = req.seed.unwrap_or_else(|| {
-            use std::hash::{Hash, Hasher};
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            prompt.hash(&mut h);
-            h.finish()
-        });
 
         // PLAN/25 Phase 0: serving-side job marker. Only opens when no job is open (the bench
         // harness emits its own markers; a job left open by a mid-admit reject self-heals at the
@@ -1919,25 +2670,75 @@ impl BatchScheduler {
             if !d.job_open() {
                 self.cov_req_n += 1;
                 let tag = format!("req{:04}", self.cov_req_n);
-                d.job_start(&tag, &prompt, self.gpu.dev());
+                d.job_start(&tag, &c.prompt, self.gpu.dev());
             }
         }
         self.lanes[slot] = Some(Lane {
-            phys, pos: plen, last_tok: first_tok, max_new,
-            generated: 1, greedy, domain, temperature, top_p, top_k,
-            rep_penalty, presence_penalty, frequency_penalty,
-            history: vec![first_tok], tx,
-            mtp_pos: plen.saturating_sub(1),
-            mtp_primed: will_use_mtp,
+            phys, pos: c.plen, last_tok: c.first_tok, max_new: c.max_new,
+            // W2: a schema lane emitted nothing yet (its prefill token is internal) — count from 0.
+            generated: if c.schema.is_some() { 0 } else { 1 },
+            greedy: c.greedy, domain: c.domain, temperature: c.temperature,
+            top_p: c.top_p, top_k: c.top_k,
+            rep_penalty: c.rep_penalty, presence_penalty: c.presence_penalty,
+            frequency_penalty: c.frequency_penalty, min_new: c.min_new, ignore_eos: c.ignore_eos,
+            history: vec![c.first_tok], tx: c.tx,
+            schema_state: c.schema.as_ref().map(|sm| sm.start_state()).unwrap_or(0),
+            schema: c.schema.clone(),
+            mtp_pos: c.plen.saturating_sub(1),
+            mtp_primed: c.will_use_mtp,
             mtp_stale: false,
-            df2_primed: will_use_df2 && df2_primed_ok,
+            df2_primed: (c.will_use_df2 && c.df2_primed_ok) || (c.will_use_dspark && c.dspark_primed_ok),
             df2_stale: false,
-            seed,
+            seed: c.seed,
             tp_cancelled: false,
         });
         // Device-resident loop: the lane composition changed — the next batched step must
         // re-upload the full buffer set (tokens/pos/slot_ids/ring/keys).
         self.resident_dirty = true;
+    }
+
+
+    /// W2 (Phase 13): per-lane vocabulary masks for the CURRENT FSM state of every lane in
+    /// `batch_idx`, in device (batch) order. Returns (words, flags, any) for
+    /// `GpuModel::upload_decode_masks`; `any == false` means "no schema lane present" and the
+    /// caller uploads nothing (so the normal path is untouched).
+    fn schema_decode_masks(&self, batch_idx: &[usize]) -> (Vec<u32>, Vec<i32>, bool) {
+        let words = crate::gpu::mask_words_for(self.gpu.cfg().vocab_size);
+        let any = batch_idx.iter()
+            .any(|&i| self.lanes[i].as_ref().map_or(false, |l| l.schema.is_some()));
+        if !any { return (Vec::new(), Vec::new(), false); }
+        let mut w = vec![0u32; words * batch_idx.len()];
+        let mut f = vec![0i32; batch_idx.len()];
+        for (k, &i) in batch_idx.iter().enumerate() {
+            if let Some(l) = self.lanes[i].as_ref() {
+                if let Some(sm) = &l.schema {
+                    let bits = sm.allowed(l.schema_state);
+                    let len = bits.len().min(words);
+                    w[k * words..k * words + len].copy_from_slice(&bits[..len]);
+                    f[k] = 1;
+                }
+            }
+        }
+        (w, f, true)
+    }
+
+    /// W2: advance a lane's schema FSM by the tokens it just COMMITTED. Returns true when the
+    /// document is complete (the turn is over: the JSON is finished) or the machine hit a state
+    /// that can never be completed.
+    fn schema_advance(&mut self, i: usize, toks: &[u32]) -> bool {
+        let lane = self.lanes[i].as_mut().unwrap();
+        let sm = match lane.schema.clone() { Some(sm) => sm, None => return false };
+        for &t in toks {
+            lane.schema_state = match sm.step(lane.schema_state, t) {
+                Some(ns) => ns,
+                None => {
+                    eprintln!("[schema] lane {i}: token {t} is invalid in the current schema state \
+                               — finishing the turn (this must not happen with the mask armed)");
+                    return true;
+                }
+            };
+        }
+        sm.is_complete(lane.schema_state)
     }
 
     /// One scheduler decode step over the `b` active (front-packed) lanes. Two phases:
@@ -1983,6 +2784,11 @@ impl BatchScheduler {
         // per-column slot_ids and pos, so the attention supports mixed slots; the GDN recurrent state
         // and the per-lane accept/rollback bookkeeping are what make it a project rather than a patch.
         // That would give both: N lanes AND ~2.5 tokens per lane per step.)
+        //
+        // (P11 note: the "real prize" above EXISTS — the FOREST path behind --mtp-lanes packs
+        //  concurrent greedy lanes' chains into ONE verify (take ≤ 5, per-lane depth =
+        //  MAX_VERIFY/p − 1), default OFF pending the promote-or-kill measurement. The b==1
+        //  split stands only for the ROUND-based drafters (df2/dspark own one shared ring).)
         let policy_active = self.mtp.active();
         // S5F: which speculation source is live THIS step. DFlash2 (S4F's integrated round) runs
         // ONLY at b==1 (AGENTS §4 — same as the MTP chain), for a lane that primed the round and
@@ -1990,7 +2796,14 @@ impl BatchScheduler {
         // fallback (unprimed lane, failed prime, or a lane that went stale). Plain never speculates.
         let src = self.mtp.spec_source();
         let df2_live = policy_active && is_df2_src(src) && self.df2.is_some() && b == 1;
-        let mtp_live = policy_active && !df2_live && src != SpecSource::Plain;
+        // WI1: the DSpark lane owns the step exactly like df2_live (b==1, primed, not stale).
+        let dspark_live = policy_active && !df2_live && src == SpecSource::Dspark
+            && self.dspark.is_some() && b == 1;
+        // P14: the DFlash v1 lane is a single-sequence block drafter — b == 1 only, exactly like
+        // the other round-based lanes (AGENTS §4: above one lane, batching beats speculation).
+        let dflash_live = policy_active && !df2_live && !dspark_live && src == SpecSource::DFlash
+            && self.dflash.is_some() && b == 1;
+        let mtp_live = policy_active && !df2_live && !dspark_live && !dflash_live && src != SpecSource::Plain;
         // `served[i]` = lane i was served by Phase A (speculation) this step — Phase B decodes
         // exactly the lanes Phase A did NOT serve (a lane is never double-served, never stranded).
         let mut served = vec![false; b];
@@ -2023,6 +2836,42 @@ impl BatchScheduler {
                 let done = if is_greedy { self.mtp_lane_step(0) } else { self.mtp_lane_step_sample(0) };
                 if done { finished[0] = true; }
             }
+        } else if dflash_live {
+            let lane = self.lanes[0].as_ref().unwrap();
+            // `df2_primed` is the generic "this lane's drafter state was primed at admit" flag
+            // (the v1 prime is a ctx-feature copy, the DF2 prime a ring walk — same contract).
+            if lane.greedy && (lane.df2_primed || self.dflash_prime_done) && !lane.df2_stale {
+                served[0] = true;
+                let done = self.dflash_lane_step(0);
+                if done { finished[0] = true; }
+            } else if lane.use_mtp(true) {
+                // Unprimed (prefix-cache reuse) or stale: the standing MTP fallback — never silent,
+                // the admit path logs the reason once.
+                served[0] = true;
+                let was_primed = lane.df2_primed;
+                let is_greedy = lane.greedy;
+                if was_primed { self.lanes[0].as_mut().unwrap().df2_stale = true; }
+                let done = if is_greedy { self.mtp_lane_step(0) } else { self.mtp_lane_step_sample(0) };
+                if done { finished[0] = true; }
+            }
+        } else if dspark_live {
+            let lane = self.lanes[0].as_ref().unwrap();
+            if lane.df2_primed && !lane.df2_stale {
+                served[0] = true;
+                // WI1 v1: the greedy drafts on greedy lanes, the q=1 rejection-sampling verify on
+                // sampled lanes (the DF2 lane pair's shape; DSpark has no tree/selector variants).
+                let done = if lane.greedy { self.dspark_lane_step(0) } else { self.dspark_lane_step_sample(0) };
+                if done { finished[0] = true; }
+            } else if lane.use_mtp(true) {
+                // The DSpark lane degraded (never primed / prime failed / went stale): the MTP
+                // fallback — the standing directive, never a hard failure.
+                served[0] = true;
+                let was_primed = lane.df2_primed;
+                let is_greedy = lane.greedy;
+                if was_primed { self.lanes[0].as_mut().unwrap().df2_stale = true; }
+                let done = if is_greedy { self.mtp_lane_step(0) } else { self.mtp_lane_step_sample(0) };
+                if done { finished[0] = true; }
+            }
         } else if mtp_live {
             if self.mtp_lanes {
                 // FOREST: pack the greedy, primed, non-stale lanes (penalty carried per-column) into ONE
@@ -2033,7 +2882,7 @@ impl BatchScheduler {
                     l.greedy && l.use_mtp(true)
                 }).collect();
                 for &i in &forest { served[i] = true; }
-                let take = forest.len().min(5);   // keeps per-lane depth >= 2 under the 16-column budget
+                let take = forest.len().min(5);   // 16-column budget: p=5 ⇒ depth 2; p=6 ⇒ depth 1 (no drafts — useless)
                 if take >= 2 {
                     let packed: Vec<usize> = forest[..take].to_vec();
                     for (i, fin) in self.mtp_forest_step(&packed) { if fin { finished[i] = true; } }
@@ -2109,7 +2958,8 @@ impl BatchScheduler {
                 self.slot_cache[phys].push(fed);
                 debug_assert_eq!(self.slot_cache[phys].len(), lane.pos);
                 if lane.history.len() > 256 { lane.history.drain(0..128); }
-                if self.eos.contains(&t) || lane.generated >= lane.max_new {
+                let eos_hit = self.eos.contains(&t) && !lane.ignore_eos && lane.generated >= lane.min_new;
+                if eos_hit || lane.generated >= lane.max_new {
                     finished[i] = true;
                 }
             }
@@ -2256,6 +3106,10 @@ impl BatchScheduler {
         let generated = self.lanes[i].as_ref().unwrap().generated;
         let max_new = self.lanes[i].as_ref().unwrap().max_new;
         let eos = self.eos.clone();
+        // Phase-8: the stop rule is a property of the REQUEST, not the serving path —
+        // every emit loop must honor ignore_eos/min_new exactly like the batched decode path
+        // (batch.rs' `eos_hit`), or spec-on and spec-off streams stop at different tokens.
+        let (ignore_eos, min_new) = { let l = self.lanes[i].as_ref().unwrap(); (l.ignore_eos, l.min_new) };
         let (rep_pen, presence_pen, freq_pen, has_penalty) = {
             let l = self.lanes[i].as_ref().unwrap();
             (l.rep_penalty, l.presence_penalty, l.frequency_penalty, l.has_penalty())
@@ -2327,11 +3181,11 @@ impl BatchScheduler {
         for k in 0..nacc {
             if generated + new_toks.len() >= max_new { break; }
             new_toks.push(emitted[k]);
-            if eos.contains(&emitted[k]) { hit_eos = true; break; }
+            if eos.contains(&emitted[k]) && !ignore_eos && generated + new_toks.len() >= min_new { hit_eos = true; break; }
         }
         if !hit_eos && generated + new_toks.len() < max_new {
             new_toks.push(emitted[nacc]);   // bonus
-            if eos.contains(&emitted[nacc]) { hit_eos = true; }
+            if eos.contains(&emitted[nacc]) && !ignore_eos && generated + new_toks.len() >= min_new { hit_eos = true; }
         }
         let emit_count = new_toks.len();
         let finished = hit_eos || generated + emit_count >= max_new;
@@ -2391,26 +3245,53 @@ impl BatchScheduler {
         let kv_stride = self.kv_stride;
         let snapshot = self.mtp_snapshot_slot;
         let p = lanes.len();
-        // v1 allocator: uniform per-lane depth so Σ(1+d) = p*(1+d) ≤ MAX_VERIFY, capped by the policy depth.
+        // v1 allocator: uniform per-lane depth so Σ(1+d) = p*(1+d) ≤ MAX_VERIFY, capped by the policy
+        // depth. The floor is the pack cap's derivation: p=5 ⇒ depth 2, p=6 ⇒ depth 1 (no drafts,
+        // useless) — which is why `take` caps at 5 upstream.
         let depth = ((mv / p).saturating_sub(1)).clamp(1, self.mtp.depth());
+        // BATCHED_MTP §5 risk 5: `clamp(1, d)` panics when the policy reports depth 0 (min > max).
+        // A depth-0 policy has nothing to speculate with — serve each packed lane via the
+        // single-lane path (which handles depth 0) instead of panicking.
+        if self.mtp.depth() == 0 {
+            eprintln!("[mtp] forest: policy depth 0 — per-lane MTP steps (no forest pack)");
+            return lanes.iter().map(|&i| (i, self.mtp_lane_step(i))).collect();
+        }
+        // BATCHED_MTP P0 (the confound fix): the forest draft loop previously ignored
+        // --ngram-draft and the coverage trace, so packed lanes drafted with a DIFFERENT
+        // behaviour than the single-lane arms, and coverage studies silently under-sampled
+        // exactly the packed lanes. Both hooks now mirror mtp_lane_step verbatim.
+        let ngram = self.ngram_draft;
+        let cov_on = self.cov_trace;
+        let step_t0 = std::time::Instant::now();
 
         // Per-lane locals + draft chains (drafting is sequential; the shared MTP scratch is reused, and
         // each lane's head KV is its own mtp_kc/mtp_vc slot). Each lane's chain = [committed, drafts...].
         struct L { i: usize, phys: usize, committed: u32, main_pos: usize, mtp_pos: usize,
                    generated: usize, max_new: usize, drafts: Vec<u32>, start: usize, n: usize,
-                   rep: f32, pres: f32, freq: f32, history: Vec<u32> }
+                   rep: f32, pres: f32, freq: f32, history: Vec<u32>, ignore_eos: bool, min_new: usize,
+                   cov: Vec<Vec<(u32, f32)>> }
         let cur_ptr = *self.mtp_cur_hidden.as_ref().unwrap().device_ptr();
         let mut ls: Vec<L> = Vec::with_capacity(p);
         let mut global = 0usize;
         for &i in lanes {
-            let (phys, committed, main_pos, mtp_pos, generated, max_new, rep, pres, freq, history) = {
+            let (phys, committed, main_pos, mtp_pos, generated, max_new, rep, pres, freq, history, ignore_eos, min_new) = {
                 let l = self.lanes[i].as_ref().unwrap();
                 (l.phys, l.last_tok, l.pos, l.mtp_pos, l.generated, l.max_new,
-                 l.rep_penalty, l.presence_penalty, l.frequency_penalty, l.history.clone())
+                 l.rep_penalty, l.presence_penalty, l.frequency_penalty, l.history.clone(),
+                 l.ignore_eos, l.min_new)
             };
             let mtp_kc_ptr = *self.mtp_kc[phys].device_ptr();
             let mtp_vc_ptr = *self.mtp_vc[phys].device_ptr();
             self.gpu.copy_hidden_col(cur_ptr, &self.mtp_h_prev[phys], 0);
+            // Prompt-lookup context for n-gram drafting (mtp_lane_step's twin): the lane's full
+            // realized sequence from slot_cache plus this step's committed token.
+            let mut work: Vec<u32> = Vec::new();
+            if ngram > 0 {
+                work.reserve(self.slot_cache[phys].len() + depth);
+                work.extend_from_slice(&self.slot_cache[phys]);
+                work.push(committed);
+            }
+            let mut cov: Vec<Vec<(u32, f32)>> = Vec::new();
             let mut drafts: Vec<u32> = Vec::with_capacity(depth - 1);
             let mut cur_tok = committed as i32;
             let mut dpos = mtp_pos;
@@ -2420,12 +3301,28 @@ impl BatchScheduler {
                 self.gpu.copy_hidden_col(cur_ptr, &m, 0);
                 self.pool.release_bf16(m, h);
                 cur_tok = self.gpu.argmax_hidden(&mut self.pool, self.mtp_cur_hidden.as_ref().unwrap()) as i32;
+                if cov_on {
+                    cov.push(self.gpu.topk_hidden_kv(&mut self.pool, self.mtp_cur_hidden.as_ref().unwrap(), 8));
+                }
+                // PROMPT-LOOKUP OVERRIDE (mtp_lane_step's twin): if the last `ngram` tokens recur
+                // earlier in this lane's context, propose the token that followed the most recent
+                // earlier occurrence — lossless, the packed verify checks every draft.
+                if ngram > 0 && work.len() >= ngram {
+                    let tail_start = work.len() - ngram;
+                    for j in (0..tail_start).rev() {
+                        if work[j..j + ngram] == work[tail_start..] {
+                            if j + ngram < work.len() { cur_tok = work[j + ngram] as i32; }
+                            break;
+                        }
+                    }
+                    work.push(cur_tok as u32);
+                }
                 drafts.push(cur_tok as u32);
                 dpos += 1;
             }
             let n = 1 + drafts.len();
-            ls.push(L { i, phys, committed, main_pos, mtp_pos, generated, max_new, drafts, start: global, n,
-                        rep, pres, freq, history });
+            ls.push(L { i, phys, committed, main_pos, mtp_pos, generated, max_new, drafts, start: global, n, ignore_eos, min_new,
+                        rep, pres, freq, history, cov });
             global += n;
         }
         let ntot = global;
@@ -2473,6 +3370,8 @@ impl BatchScheduler {
 
         let eos = self.eos.clone();
         let mut results: Vec<(usize, bool)> = Vec::with_capacity(p);
+        // Per-lane (main_pos, nacc, emitted), index-aligned with ls, for the step-dump records.
+        let mut lane_stats: Vec<(usize, usize, usize)> = Vec::with_capacity(p);
         for l in &ls {
             let draft_count = l.drafts.len();
             let mut nacc = 0usize;
@@ -2509,11 +3408,11 @@ impl BatchScheduler {
             for &d in l.drafts.iter().take(nacc) {
                 if l.generated + new_toks.len() >= l.max_new { break; }
                 new_toks.push(d);
-                if eos.contains(&d) { hit_eos = true; break; }
+                if eos.contains(&d) && !l.ignore_eos && l.generated + new_toks.len() >= l.min_new { hit_eos = true; break; }
             }
             if !hit_eos && l.generated + new_toks.len() < l.max_new {
                 new_toks.push(bonus);
-                if eos.contains(&bonus) { hit_eos = true; }
+                if eos.contains(&bonus) && !l.ignore_eos && l.generated + new_toks.len() >= l.min_new { hit_eos = true; }
             }
             let emit_count = new_toks.len();
             let finished = hit_eos || l.generated + emit_count >= l.max_new;
@@ -2539,14 +3438,64 @@ impl BatchScheduler {
                     lane.pos = l.main_pos + emit_count;
                 }
             }
+            // Telemetry parity with the chain path: the forest lane's step record reaches the
+            // same spec-steps ring (acceptance curves must count forest-served lanes too).
+            self.rec_step(SpecStepRec {
+                greedy: true, pos: l.main_pos as u32, drafts: draft_count as u32, nacc: nacc as u32,
+                emitted: emit_count as u32, round_ms: 0.0, verify_ms: 0.0,
+                step_ms: step_t0.elapsed().as_secs_f32() * 1e3,
+            });
             self.mtp_stat_drafts += draft_count as u64;
             self.mtp_stat_accepted += nacc as u64;
             self.mtp_stat_emitted += emit_count as u64;
+            lane_stats.push((l.main_pos, nacc, emit_count));
             results.push((l.i, finished));
         }
         self.pool.release_bf16(vout, h * ntot);
         self.mtp_stat_steps += p as u64;     // p lane-steps served by...
         self.mtp_stat_verify_fwds += 1;      // ...ONE main-model forward — the batching win
+
+        // BATCHED_MTP §0.4 (the telemetry gap): the forest previously ended with the two counters
+        // and NO [mtp] line, so a run where every step took the forest branch never showed its
+        // accept@k / tok-per-forward — exactly where a collapse would hide. Same cadence and
+        // counters as the chain path, labeled with the pack geometry.
+        if self.mtp_stat_steps % 50 == 0 {
+            let acc = if self.mtp_stat_drafts > 0 {
+                self.mtp_stat_accepted as f64 / self.mtp_stat_drafts as f64 * 100.0
+            } else { 0.0 };
+            let eff = self.mtp_stat_emitted as f64 / self.mtp_stat_verify_fwds as f64;
+            eprintln!("[mtp] steps={} drafts={} accepted={:.1}% emitted={} tok/verify_fwd={:.3} (forest p={} d={}) accept@k [{}]",
+                      self.mtp_stat_steps, self.mtp_stat_drafts, acc,
+                      self.mtp_stat_emitted, eff, p, depth, fmt_accept_by_depth(&self.mtp));
+            crate::tel::publish_mtp(self.mtp_stat_steps, self.mtp_stat_drafts,
+                                    self.mtp_stat_accepted, self.mtp_stat_emitted,
+                                    self.mtp_stat_verify_fwds, depth, &self.mtp.hazard_counts());
+            self.dump_accept_curve();
+        }
+        // Coverage parity (§0.4 divergence 2): with the step dump on, each packed lane's draft
+        // top-k reaches the dump — a forest run no longer under-samples its own lanes. Target
+        // coverage fields stay empty (the packed verify exposes no per-lane target top-k).
+        if self.step_dump.is_some() {
+            for (l, &(main_pos, nacc, emit_count)) in ls.iter().zip(lane_stats.iter()) {
+                let bonus = preds.get(l.start + nacc).copied().unwrap_or(l.committed);
+                let mut dk_ids = Vec::with_capacity(l.cov.len() * 8);
+                let mut dk_logit = Vec::with_capacity(l.cov.len() * 8);
+                for tk in &l.cov {
+                    for (t, v) in tk { dk_ids.push(*t); dk_logit.push(*v); }
+                }
+                if let Some(d) = self.step_dump.as_mut() {
+                    let rec = crate::dflash2::stepdump::MtpStepRec {
+                        step: self.mtp_stat_steps, pos: main_pos, committed: l.committed, depth,
+                        drafts: l.drafts.clone(), p_draft: Vec::new(), resid: Vec::new(),
+                        bonus, nacc, emitted: emit_count,
+                        tgt_ids: Vec::new(), tgt_logit: Vec::new(), tgt_p1: Vec::new(), tgt_margin: Vec::new(),
+                        draft_topk_ids: dk_ids, draft_topk_logit: dk_logit,
+                        tgt_top20: Vec::new(),
+                    };
+                    d.record_mtp(&rec);
+                }
+            }
+        }
         results
     }
 
@@ -2594,6 +3543,7 @@ impl BatchScheduler {
     }
 
     fn mtp_lane_step(&mut self, i: usize) -> bool {
+        crate::tel::note_step();   // A.2: per-step interval for the status route (lock-free)
         // Fork-then-chain tree path (opt-in): rescues the chain-killing first-token miss.
         if self.tree_draft && self.mtp.depth() >= 3 {
             return self.mtp_tree_step(i);
@@ -2615,12 +3565,19 @@ impl BatchScheduler {
         let generated = self.lanes[i].as_ref().unwrap().generated;
         let max_new = self.lanes[i].as_ref().unwrap().max_new;
         let eos = self.eos.clone();
+        // Phase-8: the stop rule is a property of the REQUEST, not the serving path —
+        // every emit loop must honor ignore_eos/min_new exactly like the batched decode path
+        // (batch.rs' `eos_hit`), or spec-on and spec-off streams stop at different tokens.
+        let (ignore_eos, min_new) = { let l = self.lanes[i].as_ref().unwrap(); (l.ignore_eos, l.min_new) };
         // Penalty config + history (so the MTP verify keeps the lane's rep/presence/freq penalty).
         let (rep_pen, presence_pen, freq_pen, has_penalty) = {
             let l = self.lanes[i].as_ref().unwrap();
             (l.rep_penalty, l.presence_penalty, l.frequency_penalty, l.has_penalty())
         };
         let history: Vec<u32> = self.lanes[i].as_ref().unwrap().history.clone();
+        // W2: the lane's compiled schema + its current FSM state (None/0 = unconstrained).
+        let lane_schema = self.lanes[i].as_ref().unwrap().schema.clone();
+        let lane_schema_state = self.lanes[i].as_ref().unwrap().schema_state;
 
         // h_save = h_prev (hidden at main_pos-1); saved for the post-accept re-prime step k=0.
         self.gpu.copy_hidden_col(h_save_ptr, &self.mtp_h_prev[phys], 0);
@@ -2696,6 +3653,36 @@ impl BatchScheduler {
         // Penalty-aware stand-down: a penalized request's preds must come from the penalized
         // verify, so the coverage capture quietly skips that step (empty tgt fields in its
         // record). `has_penalty` is a per-request property, identical on both ranks — SPMD-safe.
+        // ---- W2 (Phase 13): JSON-schema mask chain over the verify columns ----
+        // The mask is the decode path's per-state vocabulary mask, extended along the draft chain:
+        // position 0 carries the lane's CURRENT FSM state, position j+1 the state reached by the
+        // drafts the earlier positions would have to accept. `schema_valid` is the length of that
+        // valid draft prefix — the host clamps the accepted prefix to it, so a draft that breaks
+        // the chain can never be committed, and the bonus column always comes from a masked,
+        // correct state.
+        let schema_valid: Option<usize> = match lane_schema.clone() {
+            Some(sm) => {
+                let words = crate::gpu::mask_words_for(self.gpu.cfg().vocab_size);
+                let npos = verify_input.len();
+                let mut masks: Vec<Option<std::sync::Arc<Vec<u32>>>> = Vec::with_capacity(npos);
+                let mut st = lane_schema_state;
+                let mut valid = 0usize;
+                let dead = std::sync::Arc::new(vec![0u32; words]);
+                for j in 0..npos {
+                    if valid == j {
+                        masks.push(Some(sm.allowed(st)));
+                        if j < drafts.len() {
+                            if let Some(ns) = sm.step(st, drafts[j]) { st = ns; valid = j + 1; }
+                        }
+                    } else {
+                        masks.push(Some(dead.clone()));   // past the break: never emitted (nacc clamped)
+                    }
+                }
+                self.gpu.set_verify_mask(&masks);
+                Some(valid)
+            }
+            None => None,
+        };
         let (preds, vout, cov_tgt) = if cov_on {
             let (logits, vout) = self.gpu.verify_forward_keep_logits(
                 &mut self.pool, &verify_input, &mut self.state, phys, kv_stride, main_pos,
@@ -2736,6 +3723,12 @@ impl BatchScheduler {
         // ---- Accept longest prefix (greedy: drafts[i] accepted iff preds[i]==drafts[i]). ----
         let mut nacc = 0usize;
         while nacc < drafts.len() && preds[nacc] == drafts[nacc] { nacc += 1; }
+        if let Some(v) = schema_valid {
+            // A draft beyond the schema-valid prefix is never committed (its verify column had no
+            // legal continuation), and the mask is disarmed for the next (unmasked) caller.
+            nacc = nacc.min(v);
+            self.gpu.clear_verify_mask();
+        }
         let bonus = preds[nacc];
 
         // ---- GDN rollback on partial reject: restore S1 (the checkpoint — no second forward). ----
@@ -2783,16 +3776,19 @@ impl BatchScheduler {
         for &d in drafts.iter().take(nacc) {
             if generated + new_toks.len() >= max_new { break; }
             new_toks.push(d);
-            if eos.contains(&d) { hit_eos = true; break; }
+            if eos.contains(&d) && !ignore_eos && generated + new_toks.len() >= min_new { hit_eos = true; break; }
         }
         // Bonus (the greedy next token after the last accepted position) — always progress.
         if !hit_eos && generated + new_toks.len() < max_new {
             new_toks.push(bonus);
-            if eos.contains(&bonus) { hit_eos = true; }
+            if eos.contains(&bonus) && !ignore_eos && generated + new_toks.len() >= min_new { hit_eos = true; }
         }
 
         let emit_count = new_toks.len();
-        let finished = hit_eos || generated + emit_count >= max_new;
+        // W2: advance the JSON-schema FSM over the tokens ACTUALLY emitted (accepted drafts +
+        // bonus). A completed document ends the turn - generation must not run past the value.
+        let schema_done = self.schema_advance(i, &new_toks);
+        let finished = hit_eos || generated + emit_count >= max_new || schema_done;
 
         // The verify FED [committed_tok] ++ drafts[..nacc] through the model, and the GDN state was
         // rolled back to exactly the last accepted column — so that, and only that, is what the slot's
@@ -2877,6 +3873,10 @@ impl BatchScheduler {
             eprintln!("[mtp] steps={} drafts={} accepted={:.1}% emitted={} tok/verify_fwd={:.3} (depth {}) accept@k [{}]",
                       self.mtp_stat_steps, self.mtp_stat_drafts, acc,
                       self.mtp_stat_emitted, eff, depth, fmt_accept_by_depth(&self.mtp));
+            // A.2: same numbers to the status route (published where the log line prints).
+            crate::tel::publish_mtp(self.mtp_stat_steps, self.mtp_stat_drafts,
+                                    self.mtp_stat_accepted, self.mtp_stat_emitted,
+                                    self.mtp_stat_verify_fwds, depth, &self.mtp.hazard_counts());
             self.dump_accept_curve();
         }
         finished
@@ -2893,6 +3893,7 @@ impl BatchScheduler {
     /// Emits the accepted drafts + replacement/bonus token, advancing the lane.
     /// Returns true if the lane finished (EOS or max_new reached).
     fn mtp_lane_step_sample(&mut self, i: usize) -> bool {
+        crate::tel::note_step();   // A.2: per-step interval for the status route (lock-free)
         let h = self.gpu.cfg().hidden_size;
         let depth = self.mtp.depth();
         let phys = self.lanes[i].as_ref().unwrap().phys;
@@ -2910,6 +3911,10 @@ impl BatchScheduler {
         let generated = self.lanes[i].as_ref().unwrap().generated;
         let max_new = self.lanes[i].as_ref().unwrap().max_new;
         let eos = self.eos.clone();
+        // Phase-8: the stop rule is a property of the REQUEST, not the serving path —
+        // every emit loop must honor ignore_eos/min_new exactly like the batched decode path
+        // (batch.rs' `eos_hit`), or spec-on and spec-off streams stop at different tokens.
+        let (ignore_eos, min_new) = { let l = self.lanes[i].as_ref().unwrap(); (l.ignore_eos, l.min_new) };
         let temperature = self.lanes[i].as_ref().unwrap().temperature;
         let top_k = self.lanes[i].as_ref().unwrap().top_k;
         let top_p = self.lanes[i].as_ref().unwrap().top_p;
@@ -3038,7 +4043,7 @@ impl BatchScheduler {
         let mut to_emit: Vec<u32> = Vec::with_capacity(emitted.len());
         for &t in &emitted {
             to_emit.push(t);
-            if eos.contains(&t) { hit_eos = true; break; }
+            if eos.contains(&t) && !ignore_eos && generated + to_emit.len() >= min_new { hit_eos = true; break; }
             if generated + to_emit.len() >= max_new { break; }
         }
         let emit_count = to_emit.len();
@@ -3118,6 +4123,10 @@ impl BatchScheduler {
             eprintln!("[mtp] steps={} drafts={} accepted={:.1}% emitted={} tok/verify_fwd={:.3} (depth {}) accept@k [{}]",
                       self.mtp_stat_steps, self.mtp_stat_drafts, acc,
                       self.mtp_stat_emitted, eff, depth, fmt_accept_by_depth(&self.mtp));
+            // A.2: same numbers to the status route (published where the log line prints).
+            crate::tel::publish_mtp(self.mtp_stat_steps, self.mtp_stat_drafts,
+                                    self.mtp_stat_accepted, self.mtp_stat_emitted,
+                                    self.mtp_stat_verify_fwds, depth, &self.mtp.hazard_counts());
             self.dump_accept_curve();
         }
         finished
@@ -3151,9 +4160,24 @@ impl BatchScheduler {
     /// standing `inject_dev`. The chain lane (`df2_lane_step`) is untouched when this mode is off.
     fn df2_tree_step(&mut self, i: usize) -> bool {
         const LEVELS: usize = 7;
+        // DF2 block-16 x tree is REFUSED, loudly: the tree verifies `1 + LEVELS + nb` nodes with
+        // nb <= LEVELS, i.e. up to 15 columns at block 8. At block 16 the same shape is
+        // `1 + 15 + 15 = 31` columns, which exceeds `gpu::MAX_VERIFY = 16` — the verify would fall
+        // to the prefill dequant path (silently wrong work) or overrun the checkpoint region.
+        // Never truncate branch B silently to make it fit; the combination is unsupported until
+        // the checkpoint/verify width is raised deliberately.
+        assert_eq!(crate::dflash2::block(), 8,
+            "df2 block-16 x dflash2-tree is unsupported: the tree needs up to 31 verify columns              (1 + 15 + 15) but MAX_VERIFY is 16. Refusing rather than truncating branch B. \
+             Serve block 16 with --spec-source dflash2 (chain) or use the tree at --df2-block 8.");
+        assert_eq!(LEVELS, crate::dflash2::levels(),
+            "df2 tree LEVELS {} != live levels {}", LEVELS, crate::dflash2::levels());
         let h = self.gpu.cfg().hidden_size;
         let phys = self.lanes[i].as_ref().unwrap().phys;
         let ckpt = self.mtp_snapshot_slot;   // per-column GDN checkpoint base (MAX_VERIFY slots)
+        // /health (the tree rider): the tree step is otherwise invisible to the step ring (the
+        // chain lanes' note_step sites do not cover this path), so a tree-served turn showed
+        // `mode: none` with zero samples while the NEXT turn's MTP window mislabelled the mode.
+        crate::tel::note_step();
         // Lazy arm: schedulers not built through `with_df2` (the lossless probe) still get the
         // WIDE tap sink on the first tree step — it must be on the trunk BEFORE the verify's
         // capture D2Ds run. One Option test per step.
@@ -3170,6 +4194,10 @@ impl BatchScheduler {
         let generated = self.lanes[i].as_ref().unwrap().generated;
         let max_new = self.lanes[i].as_ref().unwrap().max_new;
         let eos = self.eos.clone();
+        // Phase-8: the stop rule is a property of the REQUEST, not the serving path —
+        // every emit loop must honor ignore_eos/min_new exactly like the batched decode path
+        // (batch.rs' `eos_hit`), or spec-on and spec-off streams stop at different tokens.
+        let (ignore_eos, min_new) = { let l = self.lanes[i].as_ref().unwrap(); (l.ignore_eos, l.min_new) };
         let (rep_pen, presence_pen, freq_pen, has_penalty) = {
             let l = self.lanes[i].as_ref().unwrap();
             (l.rep_penalty, l.presence_penalty, l.frequency_penalty, l.has_penalty())
@@ -3283,6 +4311,10 @@ impl BatchScheduler {
             let width = self.df2_tree_stat_nodes as f64 / self.df2_tree_stat_steps.max(1) as f64;
             eprintln!("[df2-tree] steps={} b_rescue={:.1}% avg_nodes={:.1} (chain equivalent {})",
                       self.df2_tree_stat_steps, resc, width, LEVELS + 1);
+            // /health: publish the tree window too, so the status route can be asserted on
+            // (mode == "dflash2-tree") instead of inferred from the MTP window.
+            crate::tel::publish_df2_tree(self.df2_tree_stat_steps, self.df2_tree_stat_nodes,
+                                         self.df2_tree_stat_rescues);
         }
 
         // ---- Commit: compact the accepted path's KV into sequential slots [main_pos..). The topo
@@ -3314,11 +4346,11 @@ impl BatchScheduler {
         for k in 0..nacc {
             if generated + new_toks.len() >= max_new { break; }
             new_toks.push(emitted[k]);
-            if eos.contains(&emitted[k]) { hit_eos = true; break; }
+            if eos.contains(&emitted[k]) && !ignore_eos && generated + new_toks.len() >= min_new { hit_eos = true; break; }
         }
         if !hit_eos && generated + new_toks.len() < max_new {
             new_toks.push(emitted[nacc]);
-            if eos.contains(&emitted[nacc]) { hit_eos = true; }
+            if eos.contains(&emitted[nacc]) && !ignore_eos && generated + new_toks.len() >= min_new { hit_eos = true; }
         }
         let emit_count = new_toks.len();
         let finished = hit_eos || generated + emit_count >= max_new;
@@ -3353,7 +4385,220 @@ impl BatchScheduler {
         finished
     }
 
+    /// P14 — install the DFlash v1 lane. Loads the artifact, allocates the lane's ctx feature and
+    /// arms the trunk's wide capture surface (the tap sink reads the same geometry from the
+    /// artifact's config.json — no geometry is assumed here).
+    pub fn install_dflash_lane(&mut self, dir: &str) -> anyhow::Result<()> {
+        use crate::dflash::{DflashDrafter, DflashKv};
+        let h = self.gpu.cfg().hidden_size;
+        let stride = self.kv_stride;
+        let draf = DflashDrafter::load_from_dir(std::path::Path::new(dir), stride + 16)?;
+        let (nctx, block, mask) = (draf.nctx, draf.block, draf.mask_token_id);
+        let kv = DflashKv::new(&draf, stride + crate::dflash::MAX_BLOCK);
+        let pool = crate::gpu::Pool::new(draf.dev.clone());
+        let feat = self.gpu.dev().alloc_zeros::<half::bf16>(nctx * h * stride)?;
+        self.gpu.arm_dflash_wide(dir, stride)?;
+        eprintln!("[dflash] v1 lane installed: {} layers, block {block}, {nctx} taps, mask {mask}, \
+                   ctx stride {stride}", draf.layers.len());
+        self.dflash = Some(DflashLane { draf, kv, pool, feat, nctx, block, mask, row0: 0, ncols: 0 });
+        Ok(())
+    }
+
+    /// P14 — prime the v1 lane's ctx feature from the prompt prefill (the trunk's wide capture wrote
+    /// every prompt position at its absolute column). The drafter's KV cache is appended lazily by
+    /// the first draft step, so priming is a D2D plus the frontier bookkeeping.
+    fn dflash_prime(&mut self, plen: usize) {
+        if let Some(d) = self.dflash.as_mut() {
+            let (feat, nctx) = (&d.feat, d.nctx);
+            self.gpu.dflash_feat_copy_at(feat, 0, 0, plen);
+            drop(nctx);
+            d.row0 = 0;
+            d.ncols = plen;
+        }
+    }
+
+    /// P14 — one DFlash v1 lane step: draft a `block` from the target's hidden states, verify
+    /// `[committed, drafts...]` with the trunk, accept the longest agreeing prefix plus the trunk's
+    /// own bonus, then hand the verified span's taps to the next step's ctx append.
+    ///
+    /// Every emitted token is a trunk argmax (`verify_forward`'s preds are the plain-decode argmax
+    /// per column — invariant 4), so the emitted chain is plain greedy BY CONSTRUCTION: the MTP
+    /// chain's losslessness argument, with a block-wide verify instead of a chain.
+    fn dflash_lane_step(&mut self, i: usize) -> bool {
+        crate::tel::note_step();
+        let h = self.gpu.cfg().hidden_size;
+        let phys = self.lanes[i].as_ref().unwrap().phys;
+        let snapshot = self.mtp_snapshot_slot;
+        let kv_stride = self.kv_stride;
+        let committed_tok = self.lanes[i].as_ref().unwrap().last_tok;
+        let main_pos = self.lanes[i].as_ref().unwrap().pos;
+        let generated = self.lanes[i].as_ref().unwrap().generated;
+        let max_new = self.lanes[i].as_ref().unwrap().max_new;
+        let eos = self.eos.clone();
+        let (ignore_eos, min_new) = { let l = self.lanes[i].as_ref().unwrap(); (l.ignore_eos, l.min_new) };
+        let (rep_pen, presence_pen, freq_pen, has_penalty) = {
+            let l = self.lanes[i].as_ref().unwrap();
+            (l.rep_penalty, l.presence_penalty, l.frequency_penalty, l.has_penalty())
+        };
+        let history: Vec<u32> = self.lanes[i].as_ref().unwrap().history.clone();
+
+        let step_t0 = std::time::Instant::now();
+        let block = self.dflash.as_ref().unwrap().block;
+        // ---- 1. draft: append the pending ctx span, block forward, then the TARGET's own head over
+        // the block and argmax per column (the lane is greedy-only). ----
+        let drafts: Vec<u32> = {
+            let d = self.dflash.as_mut().unwrap();
+            assert_eq!(d.row0 + d.ncols, main_pos,
+                "dflash ctx frontier {} != lane pos {main_pos} (unprimed or stale lane)",
+                d.row0 + d.ncols);
+            let mut bt = Vec::with_capacity(block);
+            bt.push(committed_tok);
+            bt.extend(std::iter::repeat(d.mask).take(block - 1));
+            self.gpu.sync_stream();   // the tap D2Ds run on the engine stream
+            let DflashLane { draf, kv, pool, feat, nctx, row0, ncols, .. } = d;
+            self.gpu.dflash_draft(draf, kv, pool, feat, *nctx, h, *row0, *ncols, *row0, &bt)
+        };
+        let round_ms = step_t0.elapsed().as_secs_f32() * 1e3;
+        // ---- 2. verify [committed, drafts...] at [main_pos, main_pos + block) ----
+        let mut verify_input = Vec::with_capacity(block);
+        verify_input.push(committed_tok);
+        verify_input.extend(drafts.iter().copied());
+        // The lane's verify width is the artifact's whole block (`dflash_draft` drops the block's
+        // anchor row, so 1 + (block-1) columns), which must stay inside MAX_VERIFY: past it the
+        // verify stops being batch-invariant AND walks a per-layer GDN checkpoint band sized
+        // MAX_VERIFY (`verify_forward_core_topo` asserts both — this one names the lane).
+        assert_eq!(verify_input.len(), block, "dflash verify width != block");
+        assert!(block <= crate::gpu::MAX_VERIFY,
+                "dflash block {block} exceeds MAX_VERIFY {}: the verify would fall to the prefill \
+                 dequant path and the GDN checkpoint band would overflow", crate::gpu::MAX_VERIFY);
+        let penalty = self.make_penalty(&history, rep_pen, presence_pen, freq_pen, has_penalty);
+        let verify_t0 = std::time::Instant::now();
+        let (preds, vout) = self.gpu.verify_forward(&mut self.pool, &verify_input, &mut self.state,
+                                                    phys, kv_stride, main_pos, Some(snapshot), penalty);
+        let verify_ms = verify_t0.elapsed().as_secs_f32() * 1e3;
+        // ---- 3. accept the longest agreeing prefix; the bonus is the trunk's own argmax ----
+        let mut nacc = 0usize;
+        while nacc < drafts.len() && preds[nacc] == drafts[nacc] { nacc += 1; }
+        let bonus = preds[nacc];
+        if nacc + 1 != block { self.gpu.copy_gdn_slot(&self.state, snapshot + nacc, phys); }
+        // ---- 4. the verified span's taps are the next ctx append ----
+        // The verify captured them into the POSITION-INDEPENDENT ring staging — its D2D lives inside
+        // a captured CUDA graph, so it cannot address an absolute column (see the tap site in
+        // `verify_forward_core_topo`). This host-issued D2D moves the ACCEPTED span
+        // `[0, nacc+1)` to its absolute ctx column. It is the P14 twin of S5F3's
+        // `sync_staging_from_sink` before `inject_dev`: without it the drafter conditioned every
+        // generated position on ctx columns no forward had written, which is exactly how the DF2
+        // lane's τ collapsed 4.06 → 1.27 with every gate still green (PLAN/B8_S5F3_REPORT §R3).
+        {
+            let d = self.dflash.as_ref().unwrap();
+            self.gpu.dflash_tap_to_feature(&d.feat, main_pos, nacc + 1);
+        }
+        {
+            let d = self.dflash.as_mut().unwrap();
+            d.row0 = main_pos;
+            d.ncols = nacc + 1;
+        }
+        // ---- 5. emit (the mtp/df2 rule: EOS + max_new on the drafts too) ----
+        let mut new_toks: Vec<u32> = Vec::with_capacity(nacc + 1);
+        let mut hit_eos = false;
+        for &d in drafts.iter().take(nacc) {
+            if generated + new_toks.len() >= max_new { break; }
+            new_toks.push(d);
+            if eos.contains(&d) && !ignore_eos && generated + new_toks.len() >= min_new { hit_eos = true; break; }
+        }
+        if !hit_eos && generated + new_toks.len() < max_new {
+            new_toks.push(bonus);
+            if eos.contains(&bonus) && !ignore_eos && generated + new_toks.len() >= min_new { hit_eos = true; }
+        }
+        let emit_count = new_toks.len();
+        let finished = hit_eos || generated + emit_count >= max_new;
+        {
+            let cache = &mut self.slot_cache[phys];
+            cache.push(committed_tok);
+            cache.extend_from_slice(&drafts[..nacc]);
+        }
+        {
+            let lane = self.lanes[i].as_mut().unwrap();
+            for &t in &new_toks {
+                let _ = lane.tx.send(TokEvent::Tok(t));
+                lane.history.push(t);
+                if lane.history.len() > 256 { lane.history.drain(0..128); }
+            }
+            lane.generated += emit_count;
+            if !finished {
+                lane.last_tok = bonus;
+                lane.pos = main_pos + nacc + 1;
+            } else {
+                lane.last_tok = *new_toks.last().unwrap_or(&committed_tok);
+                lane.pos = main_pos + emit_count;
+            }
+        }
+        self.pool.release_bf16(vout, h * block);
+        self.rec_step(SpecStepRec {
+            greedy: true, pos: main_pos as u32, drafts: drafts.len() as u32, nacc: nacc as u32,
+            emitted: emit_count as u32, round_ms, verify_ms,
+            step_ms: step_t0.elapsed().as_secs_f32() * 1e3,
+        });
+        if std::env::var("GB10_DFLASH_STEP_LOG").is_ok() {
+            // Field layout mirrors the DF2 line so `accept_gate.py dflash` can reuse its parser:
+            // pos / nacc / emitted / committed / round / verify / step. `preds` rides along for the
+            // same reason the DF2 line carries it — the FIRST thing to check when acceptance
+            // disappoints is the drafts-vs-preds pattern (an off-by-one indexing error shows up as
+            // `drafts[j] == preds[j-1]` and looks exactly like "the drafter is weak").
+            eprintln!("[dflash-step] pos={main_pos} nacc={nacc} emitted={emit_count} \
+                       committed={committed_tok} drafts={:?} preds={:?} round={round_ms:.1}ms \
+                       verify={verify_ms:.1}ms step={:.1}ms",
+                      &drafts[..drafts.len().min(6)], &preds[..preds.len().min(6)],
+                      step_t0.elapsed().as_secs_f32() * 1e3);
+        }
+        // ---- P14 telemetry: the block lane was INVISIBLE at /health (HANDOFF 2026-09-12 made
+        // per-window decode telemetry a standing requirement, and `accept_gate.py` a mandatory gate
+        // for any draft-path diff). Cumulative since boot, exactly like the `[mtp]`/`[df2]` meters.
+        // accept@k here is COLUMN-indexed: n[k] counts the steps that reached column k, a[k] the
+        // steps where column k matched the trunk's argmax (k = 0..block-2 = the 15 proposals).
+        self.dflash_stat_steps += 1;
+        self.dflash_stat_drafts += drafts.len() as u64;
+        self.dflash_stat_accepted += nacc as u64;
+        self.dflash_stat_emitted += emit_count as u64;
+        for k in 0..drafts.len().min(crate::dflash::MAX_BLOCK) {
+            if nacc >= k { self.dflash_acc_n[k] += 1; }
+            if nacc > k { self.dflash_acc_a[k] += 1; }
+        }
+        // Published EVERY step (not every 50 like MTP/DF2): the block lane commits up to 16
+        // tokens per step, so a short probe request is ~6-16 steps — a 50-step window would leave
+        // /health mute exactly when an operator looks at it. The log meter below prints at a
+        // 10-step cadence, which for a 16-token block is the same lines-per-token as MTP's 50.
+        // Stack array, not a Vec: this is a decode-step hot path and tel.rs's contract is
+        // "zero hot-path structure change, no lock, no allocation".
+        let mut acc_pairs = [(0u64, 0u64); crate::dflash::MAX_BLOCK];
+        for k in 0..drafts.len().min(crate::dflash::MAX_BLOCK) {
+            acc_pairs[k] = (self.dflash_acc_a[k], self.dflash_acc_n[k]);
+        }
+        crate::tel::publish_dflash(
+            self.dflash_stat_steps, self.dflash_stat_drafts, self.dflash_stat_accepted,
+            self.dflash_stat_emitted, block, &acc_pairs[..drafts.len()]);
+        if self.dflash_stat_steps % 10 == 0 {
+            let acc = if self.dflash_stat_drafts > 0 {
+                self.dflash_stat_accepted as f64 / self.dflash_stat_drafts as f64 * 100.0
+            } else { 0.0 };
+            let yield_tok = self.dflash_stat_emitted as f64 / self.dflash_stat_steps as f64;
+            let mut ak = String::new();
+            for k in 0..drafts.len() {
+                let n = self.dflash_acc_n[k];
+                if n > 0 {
+                    ak.push_str(&format!(" @{}:{:.0}%", k + 1,
+                        self.dflash_acc_a[k] as f64 / n as f64 * 100.0));
+                }
+            }
+            eprintln!("[dflash] steps={} block={block} drafts={} accepted={acc:.1}% emitted={} \
+                       yield={yield_tok:.2} tok/step accept@k[{ak} ]",
+                      self.dflash_stat_steps, self.dflash_stat_drafts, self.dflash_stat_emitted);
+        }
+        finished
+    }
+
     fn df2_lane_step(&mut self, i: usize) -> bool {
+        crate::tel::note_step();   // A.2: per-step interval for the status route (lock-free)
         let h = self.gpu.cfg().hidden_size;
         let phys = self.lanes[i].as_ref().unwrap().phys;
         let snapshot = self.mtp_snapshot_slot;
@@ -3365,6 +4610,10 @@ impl BatchScheduler {
         let generated = self.lanes[i].as_ref().unwrap().generated;
         let max_new = self.lanes[i].as_ref().unwrap().max_new;
         let eos = self.eos.clone();
+        // Phase-8: the stop rule is a property of the REQUEST, not the serving path —
+        // every emit loop must honor ignore_eos/min_new exactly like the batched decode path
+        // (batch.rs' `eos_hit`), or spec-on and spec-off streams stop at different tokens.
+        let (ignore_eos, min_new) = { let l = self.lanes[i].as_ref().unwrap(); (l.ignore_eos, l.min_new) };
         let (rep_pen, presence_pen, freq_pen, has_penalty) = {
             let l = self.lanes[i].as_ref().unwrap();
             (l.rep_penalty, l.presence_penalty, l.frequency_penalty, l.has_penalty())
@@ -3451,7 +4700,7 @@ impl BatchScheduler {
         let bonus = preds[nacc];
 
         // ---- GDN rollback on partial reject (restore the state as of the last accepted column). --
-        if nacc + 1 != 8 {
+        if nacc + 1 != crate::dflash2::block() {
             self.gpu.copy_gdn_slot(&self.state, snapshot + nacc, phys);
         }
 
@@ -3523,11 +4772,11 @@ impl BatchScheduler {
         for &d in drafts.iter().take(nacc) {
             if generated + new_toks.len() >= max_new { break; }
             new_toks.push(d);
-            if eos.contains(&d) { hit_eos = true; break; }
+            if eos.contains(&d) && !ignore_eos && generated + new_toks.len() >= min_new { hit_eos = true; break; }
         }
         if !hit_eos && generated + new_toks.len() < max_new {
             new_toks.push(bonus);
-            if eos.contains(&bonus) { hit_eos = true; }
+            if eos.contains(&bonus) && !ignore_eos && generated + new_toks.len() >= min_new { hit_eos = true; }
         }
         let emit_count = new_toks.len();
         let finished = hit_eos || generated + emit_count >= max_new;
@@ -3581,7 +4830,7 @@ impl BatchScheduler {
                 step: self.df2_stat_steps, pos: main_pos, committed: committed_tok, greedy: true, realq: false,
                 drafts: drafts.clone(), p_draft: Vec::new(),
                 resid: preds[..7.min(preds.len())].to_vec(), bonus,
-                nacc, emitted: emit_count, q_rows: vec![1.0; 7],
+                nacc, emitted: emit_count, q_rows: vec![1.0; crate::dflash2::levels()],
                 candidates: full_out.as_ref().map(|o| o.candidates.clone()).unwrap_or_default(),
                 cand_q: Vec::new(),
                 unary: full_out.as_ref().map(|o| o.unary.clone()).unwrap_or_default(),
@@ -3627,6 +4876,11 @@ impl BatchScheduler {
                        drafts={:?} preds={:?} round={round_ms:.1}ms verify={verify_ms:.1}ms step={step_ms:.1}ms",
                       &drafts[..drafts.len().min(4)], &preds[..preds.len().min(4)]);
         }
+        // DF2_CARRY: the ring now reflects THIS slot's committed prefix up to the lane's frontier
+        // (`nprev` = the whole committed sequence: prompt + emitted). Record it so the next request
+        // that reuses this slot's prefix can carry the ring. Twin of the DSpark
+        // `slot_dspark_len` write in `dspark_lane_step`.
+        if let Some(d) = self.df2.as_mut() { d.note_ring(phys); }
         self.df2_stat_steps += 1;
         self.df2_stat_drafts += drafts.len() as u64;
         self.df2_stat_accepted += nacc as u64;
@@ -3639,7 +4893,345 @@ impl BatchScheduler {
                       self.df2_stat_steps, self.df2_stat_drafts, acc,
                       self.df2_stat_emitted,
                       self.df2_stat_emitted as f64 / self.df2_stat_steps as f64);
+            // A.2: same numbers to the status route (published exactly where the log line prints).
+            crate::tel::publish_df2(self.df2_stat_steps, self.df2_stat_drafts,
+                                    self.df2_stat_accepted, self.df2_stat_emitted);
         }
+        finished
+    }
+
+    /// WI1: one DSpark speculative step for a GREEDY lane — the df2_lane_step shape with the
+    /// DSpark round in the draft seat. Draft (7 tokens), verify width 8 on the trunk, longest
+    /// prefix accept + bonus, GDN rollback on partial reject, tap inject of the accepted span.
+    /// The DF2 dump/coverage instruments are DF2-only (this lane keeps the plain path + the
+    /// shared SpecStepRec telemetry); the confidence head is diagnostics-only in v1 (adaptive
+    /// k_verify OFF — the recipe default).
+    fn dspark_lane_step(&mut self, i: usize) -> bool {
+        let h = self.gpu.cfg().hidden_size;
+        let phys = self.lanes[i].as_ref().unwrap().phys;
+        let snapshot = self.mtp_snapshot_slot;
+        let kv_stride = self.kv_stride;
+
+        let committed_tok = self.lanes[i].as_ref().unwrap().last_tok;
+        let main_pos = self.lanes[i].as_ref().unwrap().pos;
+        let generated = self.lanes[i].as_ref().unwrap().generated;
+        let max_new = self.lanes[i].as_ref().unwrap().max_new;
+        let eos = self.eos.clone();
+        // Phase-8: the stop rule is a property of the REQUEST, not the serving path —
+        // every emit loop must honor ignore_eos/min_new exactly like the batched decode path
+        // (batch.rs' `eos_hit`), or spec-on and spec-off streams stop at different tokens.
+        let (ignore_eos, min_new) = { let l = self.lanes[i].as_ref().unwrap(); (l.ignore_eos, l.min_new) };
+        let (rep_pen, presence_pen, freq_pen, has_penalty) = {
+            let l = self.lanes[i].as_ref().unwrap();
+            (l.rep_penalty, l.presence_penalty, l.frequency_penalty, l.has_penalty())
+        };
+        let history: Vec<u32> = self.lanes[i].as_ref().unwrap().history.clone();
+
+        // ---- Draft: the DSpark round (eager; graphs follow the DF2 pattern once oracle-proven).
+        let step_t0 = std::time::Instant::now();
+        static DUMP_REQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dump_steps: u64 = std::env::var("GB10_DSPARK_DUMP_STEPS").ok()
+            .and_then(|v| v.parse().ok()).unwrap_or(6);
+        if self.dspark_stat_steps < dump_steps {
+            if let Ok(dir) = std::env::var("GB10_DSPARK_DUMP_STEP0") {
+                let rseq = if self.dspark_stat_steps == 0 {
+                    DUMP_REQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                } else { DUMP_REQ.load(std::sync::atomic::Ordering::Relaxed).saturating_sub(1) };
+                let sdir = format!("{dir}/r{rseq}/step{}", self.dspark_stat_steps);
+                let _ = std::fs::create_dir_all(&sdir);
+                // step0 only: the DRAFT's own inputs — the wide prime sink's taps + plen
+                if self.dspark_stat_steps == 0 {
+                    let rdir = format!("{dir}/r{rseq}");
+                    // the exact prompt token ids (for the offline ground-truth prefill compare)
+                    let ids: Vec<u32> = self.slot_cache[phys].iter().take(main_pos).copied().collect();
+                    let mut ib = Vec::with_capacity(ids.len() * 4);
+                    for t in &ids { ib.extend_from_slice(&t.to_le_bytes()); }
+                    let _ = std::fs::write(format!("{rdir}/prompt.bin"), &ib);
+                    eprintln!("[dspark] step0 dump: prime sink present={}", self.dspark_prime.is_some());
+                    if let Some(ps) = &self.dspark_prime {
+                        let _ = std::fs::create_dir_all(&dir);
+                        let taps: Vec<half::bf16> = self.gpu.dev().dtoh_sync_copy(&ps.taps).unwrap_or_default();
+                        let cols = taps.len() / crate::dspark::TAP_CONCAT_DIM;
+                        eprintln!("[dspark] step0: taps readback {} elems ({} cols)", taps.len(), cols);
+                        // only the LIVE columns [0..main_pos) — the rest is stale/zero padding
+                        let live = main_pos.min(cols);
+                        let mut tb = Vec::with_capacity(live * crate::dspark::TAP_CONCAT_DIM * 2);
+                        for t in &taps[..live * crate::dspark::TAP_CONCAT_DIM] {
+                            tb.extend_from_slice(&t.to_le_bytes());
+                        }
+                        let _ = std::fs::write(format!("{dir}/r{rseq}/taps_wide.bin"), &tb);
+                        let _ = std::fs::write(format!("{dir}/r{rseq}/plen.txt"),
+                                               format!("{} {}", main_pos, live));
+                    }
+                }
+                // every dumped step: nothing pre-draft (the logits buffer is only valid AFTER
+                // the draft; the post-verify block below dumps it with the staging)
+            }
+        }
+        let drafts: Vec<u32> = {
+            let ds = self.dspark.as_mut().unwrap();
+            assert_eq!(ds.nprev(), main_pos,
+                "dspark ring nprev {} != lane pos {} (ring stale or unprimed)", ds.nprev(), main_pos);
+            ds.draft_round_dev(committed_tok).expect("dspark draft_round")
+        };
+        let round_ms = step_t0.elapsed().as_secs_f32() * 1e3;
+
+        // ---- Verify [committed_tok, drafts...] (M=8 buckets) on the trunk at main_pos.. ----
+        let mut verify_input = vec![committed_tok];
+        verify_input.extend(drafts.iter().copied());
+        let penalty = self.make_penalty(&history, rep_pen, presence_pen, freq_pen, has_penalty);
+        let verify_t0 = std::time::Instant::now();
+        let (preds, vout) = self.gpu.verify_forward(
+            &mut self.pool, &verify_input, &mut self.state, phys, kv_stride, main_pos,
+            Some(snapshot), penalty);
+        let verify_ms = verify_t0.elapsed().as_secs_f32() * 1e3;
+
+        // ---- Accept longest prefix (greedy) + bonus. ----
+        let mut nacc = 0usize;
+        while nacc < drafts.len() && preds[nacc] == drafts[nacc] { nacc += 1; }
+        let bonus = preds[nacc];
+
+        // ---- GDN rollback on partial reject. ----
+        if nacc + 1 != 8 {
+            self.gpu.copy_gdn_slot(&self.state, snapshot + nacc, phys);
+        }
+
+        // ---- Inject the accepted span's taps into the DSpark ring (the S5F3 live-staging copy
+        // ---- then the inject; nprev = main_pos+nacc+1). ----
+        {
+            let ds = self.dspark.as_mut().unwrap();
+            ds.sync_staging_from_sink().expect("dspark sync staging");
+            ds.inject_dev(nacc + 1).expect("dspark inject_dev");
+        }
+        self.pool.release_bf16(vout, h * 8);
+
+        // ---- Emit accepted drafts + bonus (the mtp/df2 lane rule: budget check on drafts too). --
+        let mut new_toks: Vec<u32> = Vec::with_capacity(nacc + 1);
+        let mut hit_eos = false;
+        for &d in drafts.iter().take(nacc) {
+            if generated + new_toks.len() >= max_new { break; }
+            new_toks.push(d);
+            if eos.contains(&d) && !ignore_eos && generated + new_toks.len() >= min_new { hit_eos = true; break; }
+        }
+        if !hit_eos && generated + new_toks.len() < max_new {
+            new_toks.push(bonus);
+            if eos.contains(&bonus) && !ignore_eos && generated + new_toks.len() >= min_new { hit_eos = true; }
+        }
+        let emit_count = new_toks.len();
+        let finished = hit_eos || generated + emit_count >= max_new;
+
+        {
+            let cache = &mut self.slot_cache[phys];
+            cache.push(committed_tok);
+            cache.extend_from_slice(&drafts[..nacc]);
+        }
+        {
+            let lane = self.lanes[i].as_mut().unwrap();
+            for &t in &new_toks {
+                let _ = lane.tx.send(TokEvent::Tok(t));
+                lane.history.push(t);
+                if lane.history.len() > 256 { lane.history.drain(0..128); }
+            }
+            lane.generated += emit_count;
+            if !finished {
+                lane.last_tok = bonus;
+                lane.pos = main_pos + nacc + 1;
+            } else {
+                lane.last_tok = *new_toks.last().unwrap_or(&committed_tok);
+                lane.pos = main_pos + emit_count;
+            }
+        }
+
+        // ---- Telemetry (the df2 shape; own counters so the [dspark] step log stands alone). ----
+        self.rec_step(SpecStepRec {
+            greedy: true, pos: main_pos as u32, drafts: drafts.len() as u32, nacc: nacc as u32,
+            emitted: emit_count as u32, round_ms, verify_ms,
+            step_ms: step_t0.elapsed().as_secs_f32() * 1e3,
+        });
+        if std::env::var("GB10_DSPARK_STEP_LOG").is_ok() {
+            let step_ms = step_t0.elapsed().as_secs_f32() * 1e3;
+            eprintln!("[dspark-step] pos={main_pos} nacc={nacc} emitted={emit_count} committed={committed_tok} \
+                       drafts={:?} preds={:?} round={round_ms:.1}ms verify={verify_ms:.1}ms step={step_ms:.1}ms",
+                      &drafts[..drafts.len().min(4)], &preds[..preds.len().min(4)]);
+        }
+        // GB10_DSPARK_DUMP_STEP0: for the FIRST N dspark steps (GB10_DSPARK_DUMP_STEPS, default
+        // 6), dump the staging taps (the round's own [8, 25600] bf16 staging = the ctx-extension
+        // the next draft saw), the anchor, the drafts and the trunk preds — the offline
+        // oracle-vs-trunk comparison's raw material, and the per-step reconstruction basis.
+        if self.dspark_stat_steps < dump_steps {
+            if let Ok(dir) = std::env::var("GB10_DSPARK_DUMP_STEP0") {
+                let rseq = DUMP_REQ.load(std::sync::atomic::Ordering::Relaxed).saturating_sub(1);
+                let sdir = format!("{dir}/r{rseq}/step{}", self.dspark_stat_steps);
+                let ds = self.dspark.as_mut().unwrap();
+                let _ = std::fs::create_dir_all(&sdir);
+                let taps: Vec<half::bf16> = ds.dump_staging().unwrap_or_default();
+                let mut tb = Vec::with_capacity(taps.len() * 2);
+                for t in &taps { tb.extend_from_slice(&t.to_le_bytes()); }
+                let _ = std::fs::write(format!("{sdir}/staging.bin"), &tb);
+                let mut meta = String::new();
+                meta.push_str(&format!("anchor {committed_tok}\n"));
+                meta.push_str(&format!("drafts {drafts:?}\n"));
+                meta.push_str(&format!("preds {preds:?}\n"));
+                meta.push_str(&format!("nacc {nacc}\n"));
+                meta.push_str(&format!("nprev {}\n", ds.nprev()));
+                let _ = std::fs::write(format!("{sdir}/meta.txt"), &meta);
+                // THIS step's draft logits ([7, VOCAB] f32, token-major) — the chain-formula
+                // analysis runs on them offline (variants vs the trunk's preds).
+                if let Ok(lg) = ds.dump_logits() {
+                    let mut lb = Vec::with_capacity(lg.len() * 4);
+                    for v in &lg { lb.extend_from_slice(&v.to_le_bytes()); }
+                    let _ = std::fs::write(format!("{sdir}/logits.bin"), &lb);
+                }
+                eprintln!("[dspark] step{} dump written (anchor {committed_tok})", self.dspark_stat_steps);
+            }
+        }
+        self.dspark_stat_steps += 1;
+        self.dspark_stat_drafts += drafts.len() as u64;
+        self.dspark_stat_accepted += nacc as u64;
+        self.dspark_stat_emitted += emit_count as u64;
+        // A6: the round's ring rows are valid through the lane's whole committed sequence —
+        // record it so a follow-up request reusing this slot's prefix can carry the ring.
+        // The identity claim is bound HERE (after the round ran for `phys`), which is what makes
+        // it true; `slot_dspark_len` alone is only the length half of the guard
+        // (PLAN/DSPARK_RING_IDENTITY_SPEC.md §3.2).
+        self.slot_dspark_len[phys] = self.slot_cache[phys].len();
+        if let Some(d) = self.dspark.as_mut() { d.note_ring(phys); }
+        if self.dspark_stat_steps % 50 == 0 {
+            let acc = if self.dspark_stat_drafts > 0 {
+                self.dspark_stat_accepted as f64 / self.dspark_stat_drafts as f64 * 100.0
+            } else { 0.0 };
+            eprintln!("[dspark] steps={} drafts={} accepted={:.1}% emitted={} tok/step={:.3}",
+                      self.dspark_stat_steps, self.dspark_stat_drafts, acc,
+                      self.dspark_stat_emitted,
+                      self.dspark_stat_emitted as f64 / self.dspark_stat_steps as f64);
+        }
+        finished
+    }
+
+    /// WI1: one DSpark speculative step for a SAMPLING lane — the same 7 greedy drafts,
+    /// verified with `verify_forward_sample` under qprobs = 1.0 (the df2_lane_step_sample
+    /// pattern; greedy drafts = a point-mass proposal, so rejection sampling reduces to the
+    /// greedy accept + the residual replacement, distribution-exact by construction).
+    fn dspark_lane_step_sample(&mut self, i: usize) -> bool {
+        let h = self.gpu.cfg().hidden_size;
+        let phys = self.lanes[i].as_ref().unwrap().phys;
+        let snapshot = self.mtp_snapshot_slot;
+        let kv_stride = self.kv_stride;
+
+        let committed_tok = self.lanes[i].as_ref().unwrap().last_tok;
+        let main_pos = self.lanes[i].as_ref().unwrap().pos;
+        let generated = self.lanes[i].as_ref().unwrap().generated;
+        let max_new = self.lanes[i].as_ref().unwrap().max_new;
+        let eos = self.eos.clone();
+        // Phase-8: the stop rule is a property of the REQUEST, not the serving path —
+        // every emit loop must honor ignore_eos/min_new exactly like the batched decode path
+        // (batch.rs' `eos_hit`), or spec-on and spec-off streams stop at different tokens.
+        let (ignore_eos, min_new) = { let l = self.lanes[i].as_ref().unwrap(); (l.ignore_eos, l.min_new) };
+        let temperature = self.lanes[i].as_ref().unwrap().temperature;
+        let top_k = self.lanes[i].as_ref().unwrap().top_k;
+        let top_p = self.lanes[i].as_ref().unwrap().top_p;
+        let (rep_pen, presence_pen, freq_pen, has_penalty) = {
+            let l = self.lanes[i].as_ref().unwrap();
+            (l.rep_penalty, l.presence_penalty, l.frequency_penalty, l.has_penalty())
+        };
+        let history: Vec<u32> = self.lanes[i].as_ref().unwrap().history.clone();
+        let step_key = self.lanes[i].as_ref().unwrap().seed;
+
+        // ---- Draft (same as the greedy lane). ----
+        let step_t0 = std::time::Instant::now();
+        let drafts: Vec<u32> = {
+            let ds = self.dspark.as_mut().unwrap();
+            assert_eq!(ds.nprev(), main_pos,
+                "dspark ring nprev {} != lane pos {} (ring stale or unprimed)", ds.nprev(), main_pos);
+            ds.draft_round_dev(committed_tok).expect("dspark draft_round")
+        };
+        let round_ms = step_t0.elapsed().as_secs_f32() * 1e3;
+
+        // ---- Verify with stochastic output. ----
+        let mut verify_input = vec![committed_tok];
+        verify_input.extend(drafts.iter().copied());
+        let verify_seeds: Vec<u32> =
+            (0..crate::dflash2::block()).map(|j| rng_u32(step_key, RNG_DOM_VERIFY, j)).collect();
+        let qprobs: Vec<f32> = vec![1.0; crate::dflash2::levels()];
+        let penalty = self.make_penalty(&history, rep_pen, presence_pen, freq_pen, has_penalty);
+        let verify_t0 = std::time::Instant::now();
+        let (vsample, vout) = self.gpu.verify_forward_sample(
+            &mut self.pool, &verify_input, &mut self.state, phys, kv_stride, main_pos,
+            Some(snapshot), penalty,
+            &drafts, &qprobs, temperature, top_k, top_p, &verify_seeds, None);
+        let verify_ms = verify_t0.elapsed().as_secs_f32() * 1e3;
+
+        // ---- Rejection-sampling accept loop (q = 1). ----
+        let mut nacc = 0usize;
+        let mut emitted: Vec<u32> = Vec::with_capacity(8);
+        let mut rejected = false;
+        for j in 0..drafts.len() {
+            let ru = rng_uniform(step_key, RNG_DOM_ACCEPT, j);
+            if ru < vsample.p_of_draft[j] {
+                emitted.push(drafts[j]);
+                nacc += 1;
+            } else {
+                emitted.push(vsample.resid_tok[j]);
+                rejected = true;
+                break;
+            }
+        }
+        if !rejected { emitted.push(vsample.bonus_tok); }
+
+        // ---- GDN rollback + tap inject. ----
+        if nacc + 1 != 8 {
+            self.gpu.copy_gdn_slot(&self.state, snapshot + nacc, phys);
+        }
+        {
+            let ds = self.dspark.as_mut().unwrap();
+            ds.sync_staging_from_sink().expect("dspark sync staging");
+            ds.inject_dev(nacc + 1).expect("dspark inject_dev");
+        }
+        self.pool.release_bf16(vout, h * 8);
+
+        // ---- Emit. ----
+        let mut hit_eos = false;
+        let mut to_emit: Vec<u32> = Vec::with_capacity(emitted.len());
+        for &t in &emitted {
+            to_emit.push(t);
+            if eos.contains(&t) && !ignore_eos && generated + to_emit.len() >= min_new { hit_eos = true; break; }
+            if generated + to_emit.len() >= max_new { break; }
+        }
+        let emit_count = to_emit.len();
+        let finished = hit_eos || generated + emit_count >= max_new;
+
+        {
+            let cache = &mut self.slot_cache[phys];
+            cache.push(committed_tok);
+            cache.extend_from_slice(&drafts[..nacc]);
+        }
+        {
+            let lane = self.lanes[i].as_mut().unwrap();
+            for &t in &to_emit {
+                let _ = lane.tx.send(TokEvent::Tok(t));
+                lane.history.push(t);
+                if lane.history.len() > 256 { lane.history.drain(0..128); }
+            }
+            lane.generated += emit_count;
+            if !finished {
+                let last = *to_emit.last().unwrap_or(&committed_tok);
+                lane.last_tok = last;
+                lane.pos = main_pos + nacc + 1;
+            } else {
+                lane.last_tok = *to_emit.last().unwrap_or(&committed_tok);
+                lane.pos = main_pos + emit_count;
+            }
+        }
+
+        self.rec_step(SpecStepRec {
+            greedy: false, pos: main_pos as u32, drafts: drafts.len() as u32, nacc: nacc as u32,
+            emitted: emit_count as u32, round_ms, verify_ms,
+            step_ms: step_t0.elapsed().as_secs_f32() * 1e3,
+        });
+        self.dspark_stat_steps += 1;
+        self.dspark_stat_drafts += drafts.len() as u64;
+        self.dspark_stat_accepted += nacc as u64;
+        self.dspark_stat_emitted += emit_count as u64;
         finished
     }
 
@@ -3660,6 +5252,10 @@ impl BatchScheduler {
         let generated = self.lanes[i].as_ref().unwrap().generated;
         let max_new = self.lanes[i].as_ref().unwrap().max_new;
         let eos = self.eos.clone();
+        // Phase-8: the stop rule is a property of the REQUEST, not the serving path —
+        // every emit loop must honor ignore_eos/min_new exactly like the batched decode path
+        // (batch.rs' `eos_hit`), or spec-on and spec-off streams stop at different tokens.
+        let (ignore_eos, min_new) = { let l = self.lanes[i].as_ref().unwrap(); (l.ignore_eos, l.min_new) };
         let temperature = self.lanes[i].as_ref().unwrap().temperature;
         let top_k = self.lanes[i].as_ref().unwrap().top_k;
         let top_p = self.lanes[i].as_ref().unwrap().top_p;
@@ -3696,8 +5292,8 @@ impl BatchScheduler {
         let mut verify_input = vec![committed_tok];
         verify_input.extend(drafts.iter().copied());
         let verify_seeds: Vec<u32> =
-            (0..8).map(|j| rng_u32(step_key, RNG_DOM_VERIFY, j)).collect();
-        let qprobs: Vec<f32> = vec![1.0; 7];   // greedy draft = point mass (S3T2 b1)
+            (0..crate::dflash2::block()).map(|j| rng_u32(step_key, RNG_DOM_VERIFY, j)).collect();
+        let qprobs: Vec<f32> = vec![1.0; crate::dflash2::levels()];   // greedy draft = point mass (S3T2 b1)
 
         // ---- Verify with stochastic output (the eager spec_verify_b path). ----
         let penalty = self.make_penalty(&history, rep_pen, presence_pen, freq_pen, has_penalty);
@@ -3728,7 +5324,7 @@ impl BatchScheduler {
         if !rejected { emitted.push(vsample.bonus_tok); }
 
         // ---- GDN rollback on partial reject. ----
-        if nacc + 1 != 8 {
+        if nacc + 1 != crate::dflash2::block() {
             self.gpu.copy_gdn_slot(&self.state, snapshot + nacc, phys);
         }
         // ---- Inject the accepted span's taps (same as the greedy lane). ----
@@ -3748,7 +5344,7 @@ impl BatchScheduler {
         let mut to_emit: Vec<u32> = Vec::with_capacity(emitted.len());
         for &t in &emitted {
             to_emit.push(t);
-            if eos.contains(&t) { hit_eos = true; break; }
+            if eos.contains(&t) && !ignore_eos && generated + to_emit.len() >= min_new { hit_eos = true; break; }
             if generated + to_emit.len() >= max_new { break; }
         }
         let emit_count = to_emit.len();
@@ -3798,7 +5394,7 @@ impl BatchScheduler {
                 step: self.df2_stat_steps, pos: main_pos, committed: committed_tok, greedy: false, realq: false,
                 drafts: drafts.clone(), p_draft: vsample.p_of_draft.clone(),
                 resid: vsample.resid_tok.clone(), bonus: vsample.bonus_tok,
-                nacc, emitted: emit_count, q_rows: vec![1.0; 7],
+                nacc, emitted: emit_count, q_rows: vec![1.0; crate::dflash2::levels()],
                 candidates: full_out.as_ref().map(|o| o.candidates.clone()).unwrap_or_default(),
                 cand_q: Vec::new(),
                 unary: full_out.as_ref().map(|o| o.unary.clone()).unwrap_or_default(),
@@ -3834,6 +5430,8 @@ impl BatchScheduler {
             emitted: emit_count as u32, round_ms, verify_ms,
             step_ms: step_t0.elapsed().as_secs_f32() * 1e3,
         });
+        // DF2_CARRY: bind the ring to this slot's frontier (twin of the greedy lane's write).
+        if let Some(d) = self.df2.as_mut() { d.note_ring(phys); }
         self.df2_stat_steps += 1;
         self.df2_stat_drafts += drafts.len() as u64;
         self.df2_stat_accepted += nacc as u64;
@@ -3867,6 +5465,10 @@ impl BatchScheduler {
         let generated = self.lanes[i].as_ref().unwrap().generated;
         let max_new = self.lanes[i].as_ref().unwrap().max_new;
         let eos = self.eos.clone();
+        // Phase-8: the stop rule is a property of the REQUEST, not the serving path —
+        // every emit loop must honor ignore_eos/min_new exactly like the batched decode path
+        // (batch.rs' `eos_hit`), or spec-on and spec-off streams stop at different tokens.
+        let (ignore_eos, min_new) = { let l = self.lanes[i].as_ref().unwrap(); (l.ignore_eos, l.min_new) };
         let temperature = self.lanes[i].as_ref().unwrap().temperature;
         let top_k = self.lanes[i].as_ref().unwrap().top_k;
         let top_p = self.lanes[i].as_ref().unwrap().top_p;
@@ -3880,7 +5482,7 @@ impl BatchScheduler {
         // ---- Draft: the SAMPLED selector path (eager round; per-position selector seeds). ----
         let step_t0 = std::time::Instant::now();
         let dump_on = self.cov_trace;   // op-sequence gate: must match across TP ranks
-        let sel_seeds: Vec<u32> = (0..7).map(|j| rng_u32(step_key, RNG_DOM_DF2_SEL, j)).collect();
+        let sel_seeds: Vec<u32> = (0..crate::dflash2::levels()).map(|j| rng_u32(step_key, RNG_DOM_DF2_SEL, j)).collect();
         let (drafts, q_rows, cand_tok, cand_q) = {
             let df2 = self.df2.as_mut().unwrap();
             assert_eq!(df2.nprev(), main_pos,
@@ -3904,7 +5506,7 @@ impl BatchScheduler {
         let mut verify_input = vec![committed_tok];
         verify_input.extend(drafts.iter().copied());
         let verify_seeds: Vec<u32> =
-            (0..8).map(|j| rng_u32(step_key, RNG_DOM_VERIFY, j)).collect();
+            (0..crate::dflash2::block()).map(|j| rng_u32(step_key, RNG_DOM_VERIFY, j)).collect();
 
         // ---- Verify with the real-q kernel (exact relu(p-q) residual). ----
         let penalty = self.make_penalty(&history, rep_pen, presence_pen, freq_pen, has_penalty);
@@ -3938,7 +5540,7 @@ impl BatchScheduler {
         if !rejected { emitted.push(vsample.bonus_tok); }
 
         // ---- GDN rollback on partial reject. ----
-        if nacc + 1 != 8 {
+        if nacc + 1 != crate::dflash2::block() {
             self.gpu.copy_gdn_slot(&self.state, snapshot + nacc, phys);
         }
         // ---- Inject the accepted span's taps (same as the other lanes). ----
@@ -3958,7 +5560,7 @@ impl BatchScheduler {
         let mut to_emit: Vec<u32> = Vec::with_capacity(emitted.len());
         for &t in &emitted {
             to_emit.push(t);
-            if eos.contains(&t) { hit_eos = true; break; }
+            if eos.contains(&t) && !ignore_eos && generated + to_emit.len() >= min_new { hit_eos = true; break; }
             if generated + to_emit.len() >= max_new { break; }
         }
         let emit_count = to_emit.len();
@@ -4023,6 +5625,8 @@ impl BatchScheduler {
             emitted: emit_count as u32, round_ms, verify_ms,
             step_ms: step_t0.elapsed().as_secs_f32() * 1e3,
         });
+        // DF2_CARRY: bind the ring to this slot's frontier (twin of the greedy lane's write).
+        if let Some(d) = self.df2.as_mut() { d.note_ring(phys); }
         self.df2_stat_steps += 1;
         self.df2_stat_drafts += drafts.len() as u64;
         self.df2_stat_accepted += nacc as u64;
@@ -4043,9 +5647,13 @@ impl BatchScheduler {
         let s = batch_idx.len();
         let mb = self.max_batch;
         let mp = crate::gpu::MAX_PEN_TOKENS;
-        let resident = crate::gpu::GpuModel::device_loop_on();
+        // W2: a schema lane in this batch disables the resident loop AND the captured graphs —
+        // both bake their kernel sequence (and the mask kernel's operands) at capture/admission
+        // time, while the mask content changes every step. Schema batches take the eager core.
+        let any_schema = batch_idx.iter().any(|&i| self.lanes[i].as_ref().unwrap().schema.is_some());
+        let resident = crate::gpu::GpuModel::device_loop_on() && !any_schema;
         let any_sampling = batch_idx.iter().any(|&i| !self.lanes[i].as_ref().unwrap().greedy);
-        let can_graph = !any_sampling && self.graphs.contains_key(&s);
+        let can_graph = !any_sampling && !any_schema && self.graphs.contains_key(&s);
         let max_pc = batch_idx.iter()
             .map(|&i| self.lanes[i].as_ref().unwrap().pos + 1).max().unwrap_or(1);
 
@@ -4485,5 +6093,81 @@ mod vision_image_cache_tests {
         let (_, spans_suffix) = (emb_c.clone(), vec![span(70, 4), span(80, 5)]);
         let img_sfx = request_image_identities(Some(&emb_c), &spans_suffix);
         assert!(images_compatible(&img_old, &img_sfx, 60), "image wholly in the suffix imposes no constraint");
+    }
+}
+
+/// DF2_CARRY guard tests (PLAN/DF2_CARRY_SPEC.md §5/§7). These are GPU-free: they pin the
+/// decision arithmetic, including the two failure modes that would otherwise be invisible
+/// (a stale ring from another slot, and a frontier past the new prompt — both of which keep
+/// every losslessness gate green while tau silently falls).
+#[cfg(test)]
+mod df2_carry {
+    use super::df2_carry_ok;
+
+    const ON: bool = true;
+    const DF2: bool = true;
+    const SLOT_A: usize = 0;
+    const SLOT_B: usize = 1;
+    /// The real guard (frontier term active). `len_only` is the diagnostics instrument.
+    const FULL: bool = false;
+
+    /// The natural multi-turn flow: turn 1 ran to frontier N = 2240; turn 2's prompt is that
+    /// whole sequence plus the client's next message (plen = 2440).
+    #[test]
+    fn multi_turn_carries() {
+        assert!(df2_carry_ok(ON, DF2, 2048, 2440, SLOT_A, Some(SLOT_A), 2240, FULL));
+    }
+
+    /// Turn 2's prompt is SHORTER than turn 1's frontier: the rows the draft needs are exactly
+    /// the ones the generation has already overwritten. Must refuse. THIS is the case the
+    /// frontier term exists for -- and the case `len_only` wrongly allows.
+    #[test]
+    fn frontier_past_prompt_refused() {
+        assert!(!df2_carry_ok(ON, DF2, 2048, 2200, SLOT_A, Some(SLOT_A), 2240, FULL));
+    }
+
+    /// Negative-control instrument check (SPEC §7 gate 7): with the frontier term dropped the
+    /// SAME state is accepted, which is what lets the gate force a known-bad carry.
+    #[test]
+    fn len_only_instrument_admits_the_bad_carry() {
+        assert!(df2_carry_ok(ON, DF2, 2048, 2200, SLOT_A, Some(SLOT_A), 2240, true));
+    }
+
+    /// §5 hazard: slot A once ran the drafter at 3000, then slot B clobbered the ring. The
+    /// per-slot length for A still says 3000, so a LENGTH-ONLY check (DSpark's shape) would carry
+    /// here and feed the draft slot B's rows. The identity guard refuses.
+    #[test]
+    fn stale_ring_from_another_slot_refused() {
+        assert!(!df2_carry_ok(ON, DF2, 2048, 2600, SLOT_A, Some(SLOT_B), 3000, FULL));
+    }
+
+    /// Cold start: `reuse == 0` never carries (the lane primes from 0).
+    #[test]
+    fn cold_never_carries() {
+        assert!(!df2_carry_ok(ON, DF2, 0, 2600, SLOT_A, Some(SLOT_A), 3000, FULL));
+    }
+
+    /// Unproven ring identity (reset / failed prime) refuses even when the length looks right.
+    #[test]
+    fn unproven_identity_refused() {
+        assert!(!df2_carry_ok(ON, DF2, 2048, 2600, SLOT_A, None, 3000, FULL));
+    }
+
+    /// The ring must have covered the reused prefix.
+    #[test]
+    fn reuse_past_frontier_refused() {
+        assert!(!df2_carry_ok(ON, DF2, 2500, 2600, SLOT_A, Some(SLOT_A), 2400, FULL));
+    }
+
+    /// Flag OFF is today's behaviour exactly: never carry, whatever the state says.
+    #[test]
+    fn flag_off_never_carries() {
+        assert!(!df2_carry_ok(false, DF2, 2048, 2440, SLOT_A, Some(SLOT_A), 2240, FULL));
+    }
+
+    /// Non-DFlash2 source never carries.
+    #[test]
+    fn non_df2_source_never_carries() {
+        assert!(!df2_carry_ok(ON, false, 2048, 2440, SLOT_A, Some(SLOT_A), 2240, FULL));
     }
 }

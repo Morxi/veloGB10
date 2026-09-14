@@ -791,9 +791,16 @@ pub fn run_head_session(model_dir: &Path, explicit: Option<Vec<SocketAddr>>, dis
     // addressed) so every node loads it from its blob cache instead of a hand-copied local dir.
     // A manifest failure is loud but not fatal here — the head's own round load fails the same
     // way and CalibTable's df2_round=false keeps all ranks consistently on MTP.
+    // WI1: the DSpark source ships its artifact through the same content-addressed sync.
+    let src_parsed = crate::batch::SpecSource::from_cli(&cfg.spec_source)
+        .unwrap_or(crate::batch::SpecSource::Mtp);
+    // P14: `dflash` (the v1 BLOCK drafter) ships through the same content-addressed slot: its lane
+    // is part of the mirrored `decode_step`, so every rank needs the artifact, and the node must
+    // never read the head's filesystem path.
     let draft: Option<(String, Vec<Artifact>)> = if cfg.mode_serve
-        && crate::batch::is_df2_src(
-            crate::batch::SpecSource::from_cli(&cfg.spec_source).unwrap_or(crate::batch::SpecSource::Mtp))
+        && (crate::batch::is_df2_src(src_parsed)
+            || matches!(src_parsed, crate::batch::SpecSource::Dspark)
+            || matches!(src_parsed, crate::batch::SpecSource::DFlash))
         && !cfg.df2_draft_dir.is_empty()
     {
         match draft_manifest(Path::new(&cfg.df2_draft_dir)) {

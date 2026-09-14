@@ -2488,6 +2488,32 @@ extern "C" __global__ void write_kv_b_k8v4(unsigned char* k_cache, unsigned char
     kvq16_pack(tmp, v_cache + vcoff);
 }
 
+extern "C" __global__ void write_kv_b_k8v8(unsigned char* k_cache, unsigned char* v_cache,
+        const __nv_bfloat16* k_new, const __nv_bfloat16* v_new,
+        const int* pos, int stride, int nkv, int hd, int B, const int* slot_ids) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int nb = hd / KVQ_BLK;
+    const int total = B * nkv * nb;
+    if (idx >= total) return;
+    const int b = idx / (nkv * nb);
+    const int rem = idx % (nkv * nb);
+    const int h = rem / nb;
+    const int blk = rem % nb;
+    const int slot = slot_ids[b];
+    const long long crow = ((long long)slot * nkv + h) * (long long)stride + pos[b];
+    const long long kcoff = crow * (long long)KV8_ROW_BYTES(hd) + blk * 20;
+    const long long vcoff = crow * (long long)KV8_ROW_BYTES(hd) + blk * 20;
+    __nv_bfloat16 tmp[KVQ_BLK];
+    #pragma unroll
+    for (int i = 0; i < KVQ_BLK; i++)
+        tmp[i] = k_new[((long long)b * nkv * hd + h * hd) + blk * KVQ_BLK + i];
+    kv8_pack16(tmp, k_cache + kcoff);
+    #pragma unroll
+    for (int i = 0; i < KVQ_BLK; i++)
+        tmp[i] = v_new[((long long)b * nkv * hd + h * hd) + blk * KVQ_BLK + i];
+    kv8_pack16(tmp, v_cache + vcoff);
+}
+
 // write_kv_prefill_k8v4 — quantize + append N tokens' K/V for one slot at pos_start..pos_start+N-1.
 extern "C" __global__ void write_kv_prefill_k8v4(unsigned char* k_cache, unsigned char* v_cache,
         const __nv_bfloat16* k_new, const __nv_bfloat16* v_new,
@@ -2521,6 +2547,71 @@ extern "C" __global__ void write_kv_prefill_k8v4(unsigned char* k_cache, unsigne
 // k_rb bytes of a (k, h) row's scratch are the K row, the remaining v_rb the V row. The host
 // sizes the two scratch buffers separately (len*nkv*k_rb and len*nkv*v_rb bytes).
 extern "C" __global__ void compact_kv_k8v4(unsigned char* k_cache, unsigned char* v_cache,
+    unsigned char* ks, unsigned char* vs, const int* src_pos, int len, int pos_start,
+    int slot, int nkv, int stride, int hd, int dir) {
+    const int k_rb = KV8_ROW_BYTES(hd);
+    const int v_rb = KVQ_ROW_BYTES(hd);
+    const int row_b = k_rb + v_rb;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = len * nkv * row_b;
+    if (idx >= total) return;
+    const int k = idx / (nkv * row_b);
+    const int rem = idx % (nkv * row_b);
+    const int h = rem / row_b;
+    const int dv = rem % row_b;
+    const long long cache_pos = (dir == 0) ? (pos_start + src_pos[k]) : (pos_start + k);
+    const long long cbase = (((long long)slot * nkv + h) * stride + cache_pos);
+    const long long sbase = ((long long)k * nkv + h);
+    if (dv < k_rb) {
+        const long long coff = cbase * k_rb + dv;
+        const long long soff = sbase * k_rb + dv;
+        if (dir == 0) { ks[soff] = k_cache[coff]; } else { k_cache[coff] = ks[soff]; }
+    } else {
+        const int vdv = dv - k_rb;
+        const long long coff = cbase * v_rb + vdv;
+        const long long soff = sbase * v_rb + vdv;
+        if (dir == 0) { vs[soff] = v_cache[coff]; } else { v_cache[coff] = vs[soff]; }
+    }
+}
+
+
+// k8v8 KV cache — int8 K + int8 V, per-16 affine blocks on BOTH sides (the k8v4 K layout
+// applied to V: 16 B codes + 2 B fp16 scale, 20 B/16 stride). ~2.2x KV capacity vs bf16 AND the
+// direct-read path for the p8-class verify kernel (block scales tile-align with 16-key tiles).
+// Determinism contract identical to k8v4 (packed form depends only on (kvh, p)) — lossless MTP
+// preserved by construction. The p8b verify kernel dequantizes in-register at stage time.
+extern "C" __global__ void write_kv_prefill_k8v8(unsigned char* k_cache, unsigned char* v_cache,
+        const __nv_bfloat16* k_new, const __nv_bfloat16* v_new,
+        int stride, int nkv, int hd, int N, int pos_start) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int nb = hd / KVQ_BLK;
+    const int total = N * nkv * nb;
+    if (idx >= total) return;
+    const int t = idx / (nkv * nb);
+    const int rem = idx % (nkv * nb);
+    const int h = rem / nb;
+    const int blk = rem % nb;
+    const long long crow = ((long long)h * (long long)stride) + (pos_start + t);
+    const long long kcoff = crow * (long long)KV8_ROW_BYTES(hd) + blk * 20;
+    const long long vcoff = crow * (long long)KV8_ROW_BYTES(hd) + blk * 20;
+    __nv_bfloat16 tmp[KVQ_BLK];
+    #pragma unroll
+    for (int i = 0; i < KVQ_BLK; i++)
+        tmp[i] = k_new[((long long)t * nkv * hd + h * hd) + blk * KVQ_BLK + i];
+    kv8_pack16(tmp, k_cache + kcoff);
+    #pragma unroll
+    for (int i = 0; i < KVQ_BLK; i++)
+        tmp[i] = v_new[((long long)t * nkv * hd + h * hd) + blk * KVQ_BLK + i];
+    kv8_pack16(tmp, v_cache + vcoff);
+}
+
+// compact_kv_k8v8 — verbatim copy of packed rows between the cache and a snapshot buffer
+// (rollback / prefix-cache paths; the packed form is position-local, so a byte copy suffices).
+// The K and V caches diverge in row size for the first time: K rows are (hd/16)*20 B, V rows
+// stay (hd/16)*12 B. Each byte of the combined grid belongs to exactly one cache: the first
+// k_rb bytes of a (k, h) row's scratch are the K row, the remaining v_rb the V row. The host
+// sizes the two scratch buffers separately (len*nkv*k_rb and len*nkv*v_rb bytes).
+extern "C" __global__ void compact_kv_k8v8(unsigned char* k_cache, unsigned char* v_cache,
     unsigned char* ks, unsigned char* vs, const int* src_pos, int len, int pos_start,
     int slot, int nkv, int stride, int hd, int dir) {
     const int k_rb = KV8_ROW_BYTES(hd);
@@ -3113,6 +3204,55 @@ extern "C" __global__ void rep_penalty_f32_b(float* logits, const int* pen_token
         v -= presence;
         v -= frequency * (float)count;
         col[tok] = v;
+    }
+}
+
+// ---- JSON-schema logit mask (constrained decoding) ----------------------------------
+// Bitset mask over the vocabulary: every entry whose bit is CLEAR is written to -inf.
+// Entries whose bit is SET are never touched — the mask leaves allowed logits
+// BIT-IDENTICAL, so the fixed-order reductions in sample_*/argmax_* (and therefore
+// batch-invariance, §2.4) are preserved by construction. No mask ⇒ no launch ⇒ the
+// greedy-lossless path is untouched (§2.7).
+//   mask_words: [B][ceil(vocab/32)] u32, little-endian bit t = token t allowed.
+//   flags:      [B] i32; 0 = lane unconstrained (the kernel returns immediately).
+extern "C" __global__ void logit_mask_b(__nv_bfloat16* logits, const unsigned int* mask_words,
+    const int* flags, int vocab, int B) {
+    int b = blockIdx.x;
+    if (b >= B) return;
+    if (flags != 0 && flags[b] == 0) return;
+    int nw = (vocab + 31) >> 5;
+    const unsigned int* w = mask_words + (long long)b * nw;
+    __nv_bfloat16* col = logits + (long long)b * vocab;
+    const __nv_bfloat16 neg_inf = __ushort_as_bfloat16((unsigned short)0xff80u);
+    for (int wi = threadIdx.x + blockIdx.y * blockDim.x; wi < nw; wi += gridDim.y * blockDim.x) {
+        unsigned int word = w[wi];
+        if (word == 0xFFFFFFFFu) continue;          // whole 32-token bucket allowed: skip it
+        int base = wi << 5;
+        int end = min(32, vocab - base);
+        for (int j = 0; j < end; ++j) {
+            if (!((word >> j) & 1u)) col[base + j] = neg_inf;
+        }
+    }
+}
+
+// Same for hy_v3's fp32 logits arm.
+extern "C" __global__ void logit_mask_f32_b(float* logits, const unsigned int* mask_words,
+    const int* flags, int vocab, int B) {
+    int b = blockIdx.x;
+    if (b >= B) return;
+    if (flags != 0 && flags[b] == 0) return;
+    int nw = (vocab + 31) >> 5;
+    const unsigned int* w = mask_words + (long long)b * nw;
+    float* col = logits + (long long)b * vocab;
+    const float neg_inf = __int_as_float(0xff800000);
+    for (int wi = threadIdx.x + blockIdx.y * blockDim.x; wi < nw; wi += gridDim.y * blockDim.x) {
+        unsigned int word = w[wi];
+        if (word == 0xFFFFFFFFu) continue;
+        int base = wi << 5;
+        int end = min(32, vocab - base);
+        for (int j = 0; j < end; ++j) {
+            if (!((word >> j) & 1u)) col[base + j] = neg_inf;
+        }
     }
 }
 
@@ -5623,6 +5763,747 @@ extern "C" __global__ void gqa_attn_splitk_gq(
                               pos, bs_packed, nh_packed, slot_ids, path, col_pos_start);
     }
     // other hd: never launched — attn_dispatch falls back to the per-head kernel.
+}
+
+// ================== gqa_attn_verify_e (F8/C: trunk GQA verify attention on tensor cores) =====
+// F9: keep in sync with gpu.rs MAX_VERIFY (attn_dispatch debug_asserts the match).
+#define GVE_MAX_VERIFY 16
+//
+// The bf16 splitk (gqa_attn_splitk_gq) computes q·k and p·v on SCALAR cores: at 30K ctx it ran
+// 2x over the KV roofline (17.6 ms/step TP2; ~580 ms at 290K), ALU-bound on the per-lane dot.
+// This port of the dspark ring_e pattern runs BOTH matmuls on
+// mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32: one block per (kvh, SEG-slice) covers
+// ALL B<=8 verify columns as query rows (B*QG <= 48 = 6 warps x 8 real rows; each mma m16
+// tile carries 8 REAL rows + 8 parked — the row-half is masked to zero and its C-frag never
+// emitted, trading half the tensor-core row throughput for half the register file, which is
+// the right trade on a bandwidth-bound kernel). Q row-fragments load ONCE from global (the
+// operand is ~24 KB, L2-resident; no smem staging), softmax folds ONCE per 32-key tile (raw
+// scores parked in registers; per-group folds park P in stale bases), P round-trips a per-warp
+// bf16 smem tile, V is staged TRANSPOSED for the PV B-fragments.
+//
+// CONTRACT (host-gated; falls back to splitk otherwise):
+//   * hd == 128 or 256, B <= 8, B*QG <= 48, ONE slot for all columns (single-lane decode or
+//     chain verify), KV path remap IDENTITY (tree paths cannot share K tiles across columns).
+//   * Partials land in the SPLITK layout so the same reduce shape merges them: m/l at
+//     [(b*nh + qh)*ns_grid + seg], acc fp32 at [same * hd + d]; ns_grid == SEG == gridDim.y.
+//   * Columns whose pc <= jbegin write the empty-split zeros (-1e30 / 0 / 0) the merge expects.
+// The 0*NaN fix from ring_e applies: masked keys park P=0 but the PV mma still multiplies
+// stale smem V, so invalid key COLUMNS of the V tile are zeroed (K needs none: masked scores
+// are REPLACED by -1e30, not multiplied away).
+#define GVE_PT_PITCH 40            // 32 keys + 8 pad (bank-conflict free)
+
+__device__ __forceinline__ unsigned gve_bf162_b32(__nv_bfloat162 v) {
+    return *reinterpret_cast<const unsigned*>(&v);
+}
+__device__ __forceinline__ void gve_mma(float* d, const unsigned* a, const unsigned* b) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+template <int HDT>                                   // hd = 128 | 256
+__device__ __forceinline__ void gve_impl(
+    float* __restrict__ out_m, float* __restrict__ out_l, float* __restrict__ out_acc,
+    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k_cache,
+    const __nv_bfloat16* __restrict__ v_cache, const int* __restrict__ pos,
+    long long bs_packed, int nh_packed, const int* __restrict__ slot_ids) {
+    const int nh  = nh_packed >> 20;
+    const int nkv = nh_packed & 0x3FF;
+    const int stride  = (int)(bs_packed & 0x7FFFF);
+    const int ns_grid = (int)((bs_packed >> 19) & 0x3F);
+    const int B       = (int)((bs_packed >> 25) & 0x3F);
+    const long long q_pitch = (bs_packed >> 31) & 0x7FFFF;
+    const float scale = 1.0f / sqrtf((float)HDT);
+    const int QG = nh / nkv, NQ = B * QG;           // row groups: gridDim.z = ceil(NQ/48)
+    const int KSTEPS = HDT / 16;                    // 8 | 16
+    const int NTILES = HDT / 8;                     // 16 | 32
+    const int kvh = blockIdx.x, seg = blockIdx.y, SEG = gridDim.y;
+
+    int max_pc = 0;
+    for (int b = 0; b < B; ++b) max_pc = max(max_pc, pos[b] + 1);
+    // F9 (batch invariance): the key-range partition must be a function of the REQUEST, never of
+    // the batch width. Partitioning from this batch's max_pc gave a decode (pc=p+1) and a verify
+    // (pc=p+N) different seg_size -> different softmax fold boundaries for column 0 -> ulp drift
+    // -> argmax flips at near-ties (the F9 ladder: 10/16 clean). The bound is pos[0] +
+    // GVE_MAX_VERIFY: pos[0] is the first column's position (identical for a decode and a verify
+    // at the same position, and >= this batch's max_pc for every width <= GVE_MAX_VERIFY). It is
+    // read from pos[] (rewritten per call AND per graph replay), never from a baked launch arg.
+    // `jend` still stops at this batch's max_pc: tiles wholly beyond a column's own rbnd are exact
+    // no-ops (scores -1e30 -> P=0; the fold's rescale is exp(0)=1).
+    // `max(max_pc, ...)` is belt-and-braces: the _e lane is host-gated to single-request
+    // forwards (decode b=1 / chain verify), where pos[] is contiguous and max_pc <=
+    // pos[0]+16, so the max is exactly pos[0]+16; if a multi-request batch ever reaches
+    // this lane, the bound degrades to the old max_pc (correct, just not width-invariant).
+    // F9 (phase-8, the depth-2 residue): pos[0]+GVE_MAX_VERIFY aligns a verify col 0 with its
+    // decode, but a verify col j>=1 is compared against a decode at pos[0]+j — whose pos[0]
+    // differs, whose pc_bound differs, whose seg_size differs => different softmax fold
+    // boundaries => 1-ulp drift on EVERY col>=1 (argmax flips at near-ties ~1/512 tokens;
+    // single-proc repro: bench-mtp d2 512tok, MISMATCH at 442). The partition must key on a
+    // per-REQUEST constant so decode and verify at ANY width resolve identical boundaries:
+    // `stride` (the KV row stride) is exactly that — identical launch-to-launch for the whole
+    // life of the request, and the segments beyond max_pc exit as exact no-ops via jend.
+    const int pc_bound = (int)stride;
+    const int seg_size = (pc_bound + SEG - 1) / SEG;
+    const int jbegin = seg * seg_size;
+    const int jend = min(max_pc, jbegin + seg_size);
+
+    __shared__ __nv_bfloat16 kt[32 * HDT];
+    __shared__ __nv_bfloat16 vt2[HDT * GVE_PT_PITCH];
+    __shared__ __nv_bfloat16 pt[6 * 16 * GVE_PT_PITCH];   // 6 warps x 16 rows (8 real + 8 parked)
+
+    const int lane = threadIdx.x & 31;
+    const int w    = threadIdx.x >> 5;              // 0..5 — owns REAL rows w*8..w*8+7
+    const int g    = lane >> 2, tq = lane & 3;      // mma frag coords
+    const int qrow0 = w * 8 + blockIdx.z * 48;      // this lane's real row; grid.z = row group
+
+    // This row's causal bound (pos[b]+1); rows >= NQ park everything.
+    const int rbnd = (qrow0 + g < NQ) ? pos[(qrow0 + g) / QG] + 1 : 0;
+
+    // Q row-fragments from GLOBAL (once; ~24 KB total, L2-resident): row (qrow0+g) of this
+    // kvh's group, k-chunk ks16. A-frag layout: a[0],a[2] = row g cols 4tq..4tq+3; a[1],a[3]
+    // = row g+8 (PARKED rows: zero — their scores stay -1e30, never emitted).
+    unsigned qa[KSTEPS][4];
+    #pragma unroll
+    for (int ks = 0; ks < KSTEPS; ++ks) {
+        qa[ks][0] = qa[ks][2] = 0u;
+        qa[ks][1] = qa[ks][3] = 0u;
+        if (qrow0 + g < NQ) {
+            const __nv_bfloat16* q0 = q + (long long)((qrow0 + g) / QG) * q_pitch
+                                     + (long long)(kvh * QG + ((qrow0 + g) % QG)) * HDT
+                                     + ks * 16 + 4 * tq;
+            qa[ks][0] = *(const unsigned*)q0;
+            qa[ks][2] = *(const unsigned*)(q0 + 2);
+        }
+    }
+    float m = -1e30f, l = 0.f;
+    float o[NTILES][2];                             // real row g only (cols 2tq, 2tq+1)
+    #pragma unroll
+    for (int nt = 0; nt < NTILES; ++nt) { o[nt][0] = 0.f; o[nt][1] = 0.f; }
+
+    const long long kvbase = ((long long)slot_ids[0] * nkv + kvh) * (long long)stride;
+    const __nv_bfloat16* kbase = k_cache + kvbase * HDT;
+    const __nv_bfloat16* vbase = v_cache + kvbase * HDT;
+
+    for (int t0 = jbegin; t0 < jend; t0 += 32) {
+        const int tv = min(32, jend - t0);
+        for (int i = threadIdx.x * 8; i < tv * HDT; i += blockDim.x * 8) {
+            const int row = i / HDT, col = i % HDT;
+            *(uint4*)&kt[row * HDT + col] = *(const uint4*)&kbase[(long long)(t0 + row) * HDT + col];
+            const __nv_bfloat16* v8 = &vbase[(long long)(t0 + row) * HDT + col];
+            #pragma unroll
+            for (int k = 0; k < 8; ++k) vt2[(col + k) * GVE_PT_PITCH + row] = v8[k];
+        }
+        if (tv < 32) {                              // 0*NaN guard (see header)
+            for (int i = threadIdx.x; i < (32 - tv) * HDT; i += blockDim.x) {
+                const int key = tv + i / HDT, col = i % HDT;
+                vt2[col * GVE_PT_PITCH + key] = __float2bfloat16(0.f);
+            }
+        }
+        __syncthreads();
+        __nv_bfloat16* mypt = pt + w * 16 * GVE_PT_PITCH;
+        // ---- scores + single-fold-per-tile softmax (4 key-groups of 8) ----
+        float sraw[4][2];
+        float rmx = m;
+        #pragma unroll
+        for (int jg = 0; jg < 4; ++jg) {
+            float s[4] = { 0.f, 0.f, 0.f, 0.f };
+            #pragma unroll
+            for (int ks = 0; ks < KSTEPS; ++ks) {
+                const __nv_bfloat16* krow = kt + (jg * 8 + g) * HDT + ks * 16 + 4 * tq;
+                unsigned bK[2] = {
+                    gve_bf162_b32(*(const __nv_bfloat162*)krow),
+                    gve_bf162_b32(*(const __nv_bfloat162*)(krow + 2)) };
+                gve_mma(s, qa[ks], bK);
+            }
+            #pragma unroll
+            for (int e = 0; e < 2; ++e) {
+                const int key = jg * 8 + 2 * tq + e;
+                sraw[jg][e] = (key < tv && (t0 + key) < rbnd) ? s[e] * scale : -1e30f;
+            }
+            float rh = fmaxf(sraw[jg][0], sraw[jg][1]);
+            rh = fmaxf(rh, __shfl_xor_sync(0xffffffffu, rh, 1));
+            rh = fmaxf(rh, __shfl_xor_sync(0xffffffffu, rh, 2));
+            rmx = fmaxf(rmx, rh);
+        }
+        {                                           // one rescale to the tile-final basis
+            const float rs = __expf(m - rmx);       // m=-1e30 first -> 0, no NaN
+            l *= rs; m = rmx;
+            #pragma unroll
+            for (int nt = 0; nt < NTILES; ++nt) { o[nt][0] *= rs; o[nt][1] *= rs; }
+        }
+        float pacc = 0.f;
+        #pragma unroll
+        for (int jg = 0; jg < 4; ++jg) {
+            const float p0 = __expf(sraw[jg][0] - rmx);
+            const float p1 = __expf(sraw[jg][1] - rmx);
+            pacc += p0 + p1;
+            mypt[g * GVE_PT_PITCH + jg * 8 + 2 * tq]     = __float2bfloat16(p0);
+            mypt[g * GVE_PT_PITCH + jg * 8 + 2 * tq + 1] = __float2bfloat16(p1);
+        }
+        pacc += __shfl_xor_sync(0xffffffffu, pacc, 1);
+        pacc += __shfl_xor_sync(0xffffffffu, pacc, 2);
+        l += pacc;
+        // NOTE: rows 8..15 of this warp's P tile are never written — the PV A-frag's second
+        // row-half reads that stale garbage, but its products land ONLY in the C-frag halves
+        // this kernel discards (o keeps row g's columns); a NaN there cannot cross rows.
+        #pragma unroll
+        for (int kp = 0; kp < 32; kp += 16) {
+            const __nv_bfloat16* prow = mypt + g * GVE_PT_PITCH + kp + 4 * tq;
+            unsigned aP[4] = {
+                *(const unsigned*)prow,
+                *(const unsigned*)(prow + 8 * GVE_PT_PITCH),
+                *(const unsigned*)(prow + 2),
+                *(const unsigned*)(prow + 8 * GVE_PT_PITCH + 2) };
+            #pragma unroll
+            for (int nt = 0; nt < NTILES; ++nt) {
+                const __nv_bfloat16* vrow = vt2 + (nt * 8 + g) * GVE_PT_PITCH + kp + 4 * tq;
+                unsigned bV[2] = {
+                    gve_bf162_b32(*(const __nv_bfloat162*)vrow),
+                    gve_bf162_b32(*(const __nv_bfloat162*)(vrow + 2)) };
+                float dd[4] = { 0.f, 0.f, 0.f, 0.f };
+                gve_mma(dd, aP, bV);
+                o[nt][0] += dd[0]; o[nt][1] += dd[1];   // keep row g's cols only
+            }
+        }
+        __syncwarp();
+        __syncthreads();
+    }
+    // Emit partials in the SPLITK layout for gqa_attn_reduce_e.
+    const int qi = qrow0 + g;
+    if (qi < NQ) {
+        const int b = qi / QG, qh = kvh * QG + (qi % QG);
+        const long long base = ((long long)b * nh + qh) * ns_grid + seg;
+        if (tq == 0) { out_m[base] = m; out_l[base] = l; }
+        #pragma unroll
+        for (int nt = 0; nt < NTILES; ++nt) {
+            out_acc[base * HDT + nt * 8 + 2 * tq]     = o[nt][0];
+            out_acc[base * HDT + nt * 8 + 2 * tq + 1] = o[nt][1];
+        }
+    }
+}
+
+// gve_k8v8_impl — p3 core on the k8v8 packed cache: 16-key tiles, register-staged pipeline;
+// stage phase dequantizes inline int8+fp16-block rows to the same bf16 kt/vt2 the p3 mma path
+// consumes (deterministic per position — same values every reader sees). Block mapping: each
+// thread owns ONE 16-dim block (20 B) of ONE key per pipeline slot; a 16-key tile has
+// 16*(HDT/16) blocks (256 @ hd256) over 192 threads => r in {0,1}.
+template <int HDT>
+__device__ __forceinline__ void gve_k8v8_impl(
+    float* __restrict__ out_m, float* __restrict__ out_l, float* __restrict__ out_acc,
+    const __nv_bfloat16* __restrict__ q, const uint8_t* __restrict__ k_cache,
+    const uint8_t* __restrict__ v_cache, const int* __restrict__ pos,
+    long long bs_packed, int nh_packed, const int* __restrict__ slot_ids) {
+    const int nh  = nh_packed >> 20;
+    const int nkv = nh_packed & 0x3FF;
+    const int stride  = (int)(bs_packed & 0x7FFFF);
+    const int ns_grid = (int)((bs_packed >> 19) & 0x3F);
+    const int B       = (int)((bs_packed >> 25) & 0x3F);
+    const long long q_pitch = (bs_packed >> 31) & 0x7FFFF;
+    const float scale = 1.0f / sqrtf((float)HDT);
+    const int QG = nh / nkv, NQ = B * QG;           // row groups: gridDim.z = ceil(NQ/48)
+    const int KSTEPS = HDT / 16;                    // 8 | 16
+    const int NTILES = HDT / 8;                     // 16 | 32
+    const int kvh = blockIdx.x, seg = blockIdx.y, SEG = gridDim.y;
+
+    int max_pc = 0;
+    for (int b = 0; b < B; ++b) max_pc = max(max_pc, pos[b] + 1);
+    // F9 (batch invariance): the key-range partition must be a function of the REQUEST, never of
+    // the batch width. Partitioning from this batch's max_pc gave a decode (pc=p+1) and a verify
+    // (pc=p+N) different seg_size -> different softmax fold boundaries for column 0 -> ulp drift
+    // -> argmax flips at near-ties (the F9 ladder: 10/16 clean). The bound is pos[0] +
+    // GVE_MAX_VERIFY: pos[0] is the first column's position (identical for a decode and a verify
+    // at the same position, and >= this batch's max_pc for every width <= GVE_MAX_VERIFY). It is
+    // read from pos[] (rewritten per call AND per graph replay), never from a baked launch arg.
+    // `jend` still stops at this batch's max_pc: tiles wholly beyond a column's own rbnd are exact
+    // no-ops (scores -1e30 -> P=0; the fold's rescale is exp(0)=1).
+    // `max(max_pc, ...)` is belt-and-braces: the _e lane is host-gated to single-request
+    // forwards (decode b=1 / chain verify), where pos[] is contiguous and max_pc <=
+    // pos[0]+16, so the max is exactly pos[0]+16; if a multi-request batch ever reaches
+    // this lane, the bound degrades to the old max_pc (correct, just not width-invariant).
+    // F9 (phase-8, the depth-2 residue): pos[0]+GVE_MAX_VERIFY aligns a verify col 0 with its
+    // decode, but a verify col j>=1 is compared against a decode at pos[0]+j — whose pos[0]
+    // differs, whose pc_bound differs, whose seg_size differs => different softmax fold
+    // boundaries => 1-ulp drift on EVERY col>=1 (argmax flips at near-ties ~1/512 tokens;
+    // single-proc repro: bench-mtp d2 512tok, MISMATCH at 442). The partition must key on a
+    // per-REQUEST constant so decode and verify at ANY width resolve identical boundaries:
+    // `stride` (the KV row stride) is exactly that — identical launch-to-launch for the whole
+    // life of the request, and the segments beyond max_pc exit as exact no-ops via jend.
+    const int pc_bound = (int)stride;
+    const int seg_size = (pc_bound + SEG - 1) / SEG;
+    const int jbegin = seg * seg_size;
+    const int jend = min(max_pc, jbegin + seg_size);
+
+    __shared__ __nv_bfloat16 kt[16 * HDT];
+    __shared__ __nv_bfloat16 vt2[HDT * 24];
+    __shared__ __nv_bfloat16 pt[6 * 16 * 24];   // p3: 16 key cols + pad
+
+    const int lane = threadIdx.x & 31;
+    const int w    = threadIdx.x >> 5;              // 0..5 — owns REAL rows w*8..w*8+7
+    const int g    = lane >> 2, tq = lane & 3;      // mma frag coords
+    const int qrow0 = w * 8 + blockIdx.z * 48;      // this lane's real row; grid.z = row group
+
+    // This row's causal bound (pos[b]+1); rows >= NQ park everything.
+    const int rbnd = (qrow0 + g < NQ) ? pos[(qrow0 + g) / QG] + 1 : 0;
+
+    // Q row-fragments from GLOBAL (once; ~24 KB total, L2-resident): row (qrow0+g) of this
+    // kvh's group, k-chunk ks16. A-frag layout: a[0],a[2] = row g cols 4tq..4tq+3; a[1],a[3]
+    // = row g+8 (PARKED rows: zero — their scores stay -1e30, never emitted).
+    unsigned qa[KSTEPS][4];
+    #pragma unroll
+    for (int ks = 0; ks < KSTEPS; ++ks) {
+        qa[ks][0] = qa[ks][2] = 0u;
+        qa[ks][1] = qa[ks][3] = 0u;
+        if (qrow0 + g < NQ) {
+            const __nv_bfloat16* q0 = q + (long long)((qrow0 + g) / QG) * q_pitch
+                                     + (long long)(kvh * QG + ((qrow0 + g) % QG)) * HDT
+                                     + ks * 16 + 4 * tq;
+            qa[ks][0] = *(const unsigned*)q0;
+            qa[ks][2] = *(const unsigned*)(q0 + 2);
+        }
+    }
+    float m = -1e30f, l = 0.f;
+    float o[NTILES][2];                             // real row g only (cols 2tq, 2tq+1)
+    #pragma unroll
+    for (int nt = 0; nt < NTILES; ++nt) { o[nt][0] = 0.f; o[nt][1] = 0.f; }
+
+    const long long kvbase = ((long long)slot_ids[0] * nkv + kvh) * (long long)stride;
+    const uint8_t* kbase = k_cache + kvbase * (long long)KV8_ROW_BYTES(HDT);
+    const uint8_t* vbase = v_cache + kvbase * (long long)KV8_ROW_BYTES(HDT);
+
+    uint4 pkc[2], pvc[2]; unsigned short pks[2], pvs[2]; int pkey[2], pblk[2];
+    const int NBLK = HDT / 16;
+    // initial prefetch of tile jbegin (16 keys x NBLK blocks)
+    {
+        const int tv0 = min(16, max(0, jend - jbegin));
+        #pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            const int i = threadIdx.x + r * blockDim.x;
+            pkey[r] = i / NBLK; pblk[r] = i % NBLK;
+            if (i < tv0 * NBLK) {
+                const unsigned char* kr = kbase + (long long)(jbegin + pkey[r]) * KV8_ROW_BYTES(HDT) + pblk[r] * 20;
+                const uint* kru = (const uint*)kr;                 // 4-B loads: blk*20 is NOT 16-B aligned
+                pkc[r] = make_uint4(kru[0], kru[1], kru[2], kru[3]);
+                pks[r] = *(const unsigned short*)(kr + 16);
+                const unsigned char* vr = vbase + (long long)(jbegin + pkey[r]) * KV8_ROW_BYTES(HDT) + pblk[r] * 20;
+                const uint* vru = (const uint*)vr;
+                pvc[r] = make_uint4(vru[0], vru[1], vru[2], vru[3]);
+                pvs[r] = *(const unsigned short*)(vr + 16);
+            }
+        }
+    }
+    for (int t0 = jbegin; t0 < jend; t0 += 16) {
+        const int tv = min(16, jend - t0);
+        __syncthreads();                            // tile t-1 consumed
+        #pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            const int key = pkey[r], blk = pblk[r];
+            if (key < tv) {
+                const float ks = __half2float(__ushort_as_half(pks[r]));
+                const float vs = __half2float(__ushort_as_half(pvs[r]));
+                const signed char* kc = (const signed char*)&pkc[r];
+                const signed char* vc = (const signed char*)&pvc[r];
+                #pragma unroll
+                for (int i = 0; i < 16; i += 2) {
+                    *(__nv_bfloat162*)&kt[key * HDT + blk * 16 + i] =
+                        __floats2bfloat162_rn(kc[i] * ks, kc[i + 1] * ks);
+                    vt2[(blk * 16 + i) * 24 + key]     = __float2bfloat16_rn(vc[i] * vs);
+                    vt2[(blk * 16 + i + 1) * 24 + key] = __float2bfloat16_rn(vc[i + 1] * vs);
+                }
+            }
+        }
+        if (tv < 16) {                               // 0*NaN guard (see header)
+            for (int i = threadIdx.x; i < (16 - tv) * HDT; i += blockDim.x) {
+                const int key = tv + i / HDT, col = i % HDT;
+                vt2[col * 24 + key] = __float2bfloat16(0.f);
+            }
+        }
+        __syncthreads();                             // tile t staged
+        {
+            const int t1 = t0 + 16;
+            const int tv1 = min(16, max(0, jend - t1));
+            #pragma unroll
+            for (int r = 0; r < 2; ++r) {
+                const int i = threadIdx.x + r * blockDim.x;
+                pkey[r] = i / NBLK; pblk[r] = i % NBLK;
+                if (i < tv1 * NBLK) {
+                    const unsigned char* kr = kbase + (long long)(t1 + pkey[r]) * KV8_ROW_BYTES(HDT) + pblk[r] * 20;
+                    const uint* kru = (const uint*)kr;
+                    pkc[r] = make_uint4(kru[0], kru[1], kru[2], kru[3]);
+                    pks[r] = *(const unsigned short*)(kr + 16);
+                    const unsigned char* vr = vbase + (long long)(t1 + pkey[r]) * KV8_ROW_BYTES(HDT) + pblk[r] * 20;
+                    const uint* vru = (const uint*)vr;
+                    pvc[r] = make_uint4(vru[0], vru[1], vru[2], vru[3]);
+                    pvs[r] = *(const unsigned short*)(vr + 16);
+                }
+            }
+        }
+        __nv_bfloat16* mypt = pt + w * 16 * 24;
+        // ---- scores + single-fold-per-tile softmax (4 key-groups of 8) ----
+        float sraw[2][2];
+        float rmx = m;
+        #pragma unroll
+        for (int jg = 0; jg < 2; ++jg) {
+            float s[4] = { 0.f, 0.f, 0.f, 0.f };
+            #pragma unroll
+            for (int ks = 0; ks < KSTEPS; ++ks) {
+                const __nv_bfloat16* krow = kt + (jg * 8 + g) * HDT + ks * 16 + 4 * tq;
+                unsigned bK[2] = {
+                    gve_bf162_b32(*(const __nv_bfloat162*)krow),
+                    gve_bf162_b32(*(const __nv_bfloat162*)(krow + 2)) };
+                gve_mma(s, qa[ks], bK);
+            }
+            #pragma unroll
+            for (int e = 0; e < 2; ++e) {
+                const int key = jg * 8 + 2 * tq + e;
+                sraw[jg][e] = (key < tv && (t0 + key) < rbnd) ? s[e] * scale : -1e30f;
+            }
+            float rh = fmaxf(sraw[jg][0], sraw[jg][1]);
+            rh = fmaxf(rh, __shfl_xor_sync(0xffffffffu, rh, 1));
+            rh = fmaxf(rh, __shfl_xor_sync(0xffffffffu, rh, 2));
+            rmx = fmaxf(rmx, rh);
+        }
+        {                                           // one rescale to the tile-final basis
+            const float rs = __expf(m - rmx);       // m=-1e30 first -> 0, no NaN
+            l *= rs; m = rmx;
+            #pragma unroll
+            for (int nt = 0; nt < NTILES; ++nt) { o[nt][0] *= rs; o[nt][1] *= rs; }
+        }
+        float pacc = 0.f;
+        #pragma unroll
+        for (int jg = 0; jg < 2; ++jg) {
+            const float p0 = __expf(sraw[jg][0] - rmx);
+            const float p1 = __expf(sraw[jg][1] - rmx);
+            pacc += p0 + p1;
+            mypt[g * 24 + jg * 8 + 2 * tq]     = __float2bfloat16(p0);
+            mypt[g * 24 + jg * 8 + 2 * tq + 1] = __float2bfloat16(p1);
+        }
+        pacc += __shfl_xor_sync(0xffffffffu, pacc, 1);
+        pacc += __shfl_xor_sync(0xffffffffu, pacc, 2);
+        l += pacc;
+        // NOTE: rows 8..15 of this warp's P tile are never written — the PV A-frag's second
+        // row-half reads that stale garbage, but its products land ONLY in the C-frag halves
+        // this kernel discards (o keeps row g's columns); a NaN there cannot cross rows.
+        #pragma unroll
+        for (int kp = 0; kp < 16; kp += 16) {
+            const __nv_bfloat16* prow = mypt + g * 24 + kp + 4 * tq;
+            unsigned aP[4] = {
+                *(const unsigned*)prow,
+                *(const unsigned*)(prow + 8 * 24),
+                *(const unsigned*)(prow + 2),
+                *(const unsigned*)(prow + 8 * 24 + 2) };
+            #pragma unroll
+            for (int nt = 0; nt < NTILES; ++nt) {
+                const __nv_bfloat16* vrow = vt2 + (nt * 8 + g) * 24 + kp + 4 * tq;
+                unsigned bV[2] = {
+                    gve_bf162_b32(*(const __nv_bfloat162*)vrow),
+                    gve_bf162_b32(*(const __nv_bfloat162*)(vrow + 2)) };
+                float dd[4] = { 0.f, 0.f, 0.f, 0.f };
+                gve_mma(dd, aP, bV);
+                o[nt][0] += dd[0]; o[nt][1] += dd[1];   // keep row g's cols only
+            }
+        }
+        __syncwarp();
+    }
+    // Emit partials in the SPLITK layout for gqa_attn_reduce_e.
+    const int qi = qrow0 + g;
+    if (qi < NQ) {
+        const int b = qi / QG, qh = kvh * QG + (qi % QG);
+        const long long base = ((long long)b * nh + qh) * ns_grid + seg;
+        if (tq == 0) { out_m[base] = m; out_l[base] = l; }
+        #pragma unroll
+        for (int nt = 0; nt < NTILES; ++nt) {
+            out_acc[base * HDT + nt * 8 + 2 * tq]     = o[nt][0];
+            out_acc[base * HDT + nt * 8 + 2 * tq + 1] = o[nt][1];
+        }
+    }
+}
+
+
+
+
+
+// k8v8 direct-read verify attention (p8b): the p3 mma/softmax/PV core on the packed int8
+// cache. hd 128/256. Not yet dispatched by Rust (write path + arms land with the mode enum).
+extern "C" __global__ void __launch_bounds__(192) gqa_attn_verify_e_k8v8(
+    float* __restrict__ out_m, float* __restrict__ out_l, float* __restrict__ out_acc,
+    const __nv_bfloat16* __restrict__ q, const uint8_t* __restrict__ k_cache,
+    const uint8_t* __restrict__ v_cache,
+    const int* __restrict__ pos, long long bs_packed, int nh_packed,
+    const int* __restrict__ slot_ids, const int* __restrict__ col_pos_start) {
+    (void)col_pos_start;
+    const int hd = (nh_packed >> 10) & 0x3FF;
+    if (hd == 128)      gve_k8v8_impl<128>(out_m, out_l, out_acc, q, k_cache, v_cache, pos, bs_packed, nh_packed, slot_ids);
+    else if (hd == 256) gve_k8v8_impl<256>(out_m, out_l, out_acc, q, k_cache, v_cache, pos, bs_packed, nh_packed, slot_ids);
+}
+
+template <int HDT>                                   // hd = 128 | 256
+__device__ __forceinline__ void gve_p3_impl(
+    float* __restrict__ out_m, float* __restrict__ out_l, float* __restrict__ out_acc,
+    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k_cache,
+    const __nv_bfloat16* __restrict__ v_cache, const int* __restrict__ pos,
+    long long bs_packed, int nh_packed, const int* __restrict__ slot_ids) {
+    const int nh  = nh_packed >> 20;
+    const int nkv = nh_packed & 0x3FF;
+    const int stride  = (int)(bs_packed & 0x7FFFF);
+    const int ns_grid = (int)((bs_packed >> 19) & 0x3F);
+    const int B       = (int)((bs_packed >> 25) & 0x3F);
+    const long long q_pitch = (bs_packed >> 31) & 0x7FFFF;
+    const float scale = 1.0f / sqrtf((float)HDT);
+    const int QG = nh / nkv, NQ = B * QG;           // row groups: gridDim.z = ceil(NQ/48)
+    const int KSTEPS = HDT / 16;                    // 8 | 16
+    const int NTILES = HDT / 8;                     // 16 | 32
+    const int kvh = blockIdx.x, seg = blockIdx.y, SEG = gridDim.y;
+
+    int max_pc = 0;
+    for (int b = 0; b < B; ++b) max_pc = max(max_pc, pos[b] + 1);
+    // F9 (batch invariance): the key-range partition must be a function of the REQUEST, never of
+    // the batch width. Partitioning from this batch's max_pc gave a decode (pc=p+1) and a verify
+    // (pc=p+N) different seg_size -> different softmax fold boundaries for column 0 -> ulp drift
+    // -> argmax flips at near-ties (the F9 ladder: 10/16 clean). The bound is pos[0] +
+    // GVE_MAX_VERIFY: pos[0] is the first column's position (identical for a decode and a verify
+    // at the same position, and >= this batch's max_pc for every width <= GVE_MAX_VERIFY). It is
+    // read from pos[] (rewritten per call AND per graph replay), never from a baked launch arg.
+    // `jend` still stops at this batch's max_pc: tiles wholly beyond a column's own rbnd are exact
+    // no-ops (scores -1e30 -> P=0; the fold's rescale is exp(0)=1).
+    // `max(max_pc, ...)` is belt-and-braces: the _e lane is host-gated to single-request
+    // forwards (decode b=1 / chain verify), where pos[] is contiguous and max_pc <=
+    // pos[0]+16, so the max is exactly pos[0]+16; if a multi-request batch ever reaches
+    // this lane, the bound degrades to the old max_pc (correct, just not width-invariant).
+    // F9 (phase-8, the depth-2 residue): pos[0]+GVE_MAX_VERIFY aligns a verify col 0 with its
+    // decode, but a verify col j>=1 is compared against a decode at pos[0]+j — whose pos[0]
+    // differs, whose pc_bound differs, whose seg_size differs => different softmax fold
+    // boundaries => 1-ulp drift on EVERY col>=1 (argmax flips at near-ties ~1/512 tokens;
+    // single-proc repro: bench-mtp d2 512tok, MISMATCH at 442). The partition must key on a
+    // per-REQUEST constant so decode and verify at ANY width resolve identical boundaries:
+    // `stride` (the KV row stride) is exactly that — identical launch-to-launch for the whole
+    // life of the request, and the segments beyond max_pc exit as exact no-ops via jend.
+    const int pc_bound = (int)stride;
+    const int seg_size = (pc_bound + SEG - 1) / SEG;
+    const int jbegin = seg * seg_size;
+    const int jend = min(max_pc, jbegin + seg_size);
+
+    __shared__ __nv_bfloat16 kt[16 * HDT];
+    __shared__ __nv_bfloat16 vt2[HDT * 24];
+    __shared__ __nv_bfloat16 pt[6 * 16 * 24];   // p3: 16 key cols + pad
+
+    const int lane = threadIdx.x & 31;
+    const int w    = threadIdx.x >> 5;              // 0..5 — owns REAL rows w*8..w*8+7
+    const int g    = lane >> 2, tq = lane & 3;      // mma frag coords
+    const int qrow0 = w * 8 + blockIdx.z * 48;      // this lane's real row; grid.z = row group
+
+    // This row's causal bound (pos[b]+1); rows >= NQ park everything.
+    const int rbnd = (qrow0 + g < NQ) ? pos[(qrow0 + g) / QG] + 1 : 0;
+
+    // Q row-fragments from GLOBAL (once; ~24 KB total, L2-resident): row (qrow0+g) of this
+    // kvh's group, k-chunk ks16. A-frag layout: a[0],a[2] = row g cols 4tq..4tq+3; a[1],a[3]
+    // = row g+8 (PARKED rows: zero — their scores stay -1e30, never emitted).
+    unsigned qa[KSTEPS][4];
+    #pragma unroll
+    for (int ks = 0; ks < KSTEPS; ++ks) {
+        qa[ks][0] = qa[ks][2] = 0u;
+        qa[ks][1] = qa[ks][3] = 0u;
+        if (qrow0 + g < NQ) {
+            const __nv_bfloat16* q0 = q + (long long)((qrow0 + g) / QG) * q_pitch
+                                     + (long long)(kvh * QG + ((qrow0 + g) % QG)) * HDT
+                                     + ks * 16 + 4 * tq;
+            qa[ks][0] = *(const unsigned*)q0;
+            qa[ks][2] = *(const unsigned*)(q0 + 2);
+        }
+    }
+    float m = -1e30f, l = 0.f;
+    float o[NTILES][2];                             // real row g only (cols 2tq, 2tq+1)
+    #pragma unroll
+    for (int nt = 0; nt < NTILES; ++nt) { o[nt][0] = 0.f; o[nt][1] = 0.f; }
+
+    const long long kvbase = ((long long)slot_ids[0] * nkv + kvh) * (long long)stride;
+    const __nv_bfloat16* kbase = k_cache + kvbase * HDT;
+    const __nv_bfloat16* vbase = v_cache + kvbase * HDT;
+
+    uint4 p3_kreg[3]; uint4 p3_vreg[3]; int p3_row[3]; int p3_col[3];
+    {
+        const int tv0 = min(16, max(0, jend - jbegin));
+        #pragma unroll
+        for (int r = 0; r < 3; ++r) {
+            const int i = threadIdx.x * 8 + r * blockDim.x * 8;
+            const int row = i / HDT, col = i % HDT;
+            p3_row[r] = row; p3_col[r] = col;
+            if (row < tv0) {
+                p3_kreg[r] = *(const uint4*)&kbase[(long long)(jbegin + row) * HDT + col];
+                *(uint4*)&p3_vreg[r] = *(const uint4*)&vbase[(long long)(jbegin + row) * HDT + col];
+            }
+        }
+    }
+    for (int t0 = jbegin; t0 < jend; t0 += 16) {
+        const int tv = min(16, jend - t0);
+        __syncthreads();                            // tile t-1 consumed
+        #pragma unroll
+        for (int r = 0; r < 3; ++r) {
+            const int row = p3_row[r], col = p3_col[r];
+            if (row < tv) {
+                *(uint4*)&kt[row * HDT + col] = p3_kreg[r];
+                const __nv_bfloat16* v8 = reinterpret_cast<const __nv_bfloat16*>(&p3_vreg[r]);
+                #pragma unroll
+                for (int k = 0; k < 8; ++k) vt2[(col + k) * 24 + row] = v8[k];
+            }
+        }
+        if (tv < 16) {                              // 0*NaN guard (see header)
+            for (int i = threadIdx.x; i < (16 - tv) * HDT; i += blockDim.x) {
+                const int key = tv + i / HDT, col = i % HDT;
+                vt2[col * 24 + key] = __float2bfloat16(0.f);
+            }
+        }
+        __syncthreads();                            // tile t staged
+        {
+            const int t1 = t0 + 16;
+            const int tv1 = min(16, max(0, jend - t1));
+            #pragma unroll
+            for (int r = 0; r < 3; ++r) {
+                const int i = threadIdx.x * 8 + r * blockDim.x * 8;
+                const int row = i / HDT, col = i % HDT;
+                p3_row[r] = row; p3_col[r] = col;
+                if (row < tv1) {
+                    p3_kreg[r] = *(const uint4*)&kbase[(long long)(t1 + row) * HDT + col];
+                    *(uint4*)&p3_vreg[r] = *(const uint4*)&vbase[(long long)(t1 + row) * HDT + col];
+                }
+            }
+        }
+        __nv_bfloat16* mypt = pt + w * 16 * 24;
+        // ---- scores + single-fold-per-tile softmax (4 key-groups of 8) ----
+        float sraw[2][2];
+        float rmx = m;
+        #pragma unroll
+        for (int jg = 0; jg < 2; ++jg) {
+            float s[4] = { 0.f, 0.f, 0.f, 0.f };
+            #pragma unroll
+            for (int ks = 0; ks < KSTEPS; ++ks) {
+                const __nv_bfloat16* krow = kt + (jg * 8 + g) * HDT + ks * 16 + 4 * tq;
+                unsigned bK[2] = {
+                    gve_bf162_b32(*(const __nv_bfloat162*)krow),
+                    gve_bf162_b32(*(const __nv_bfloat162*)(krow + 2)) };
+                gve_mma(s, qa[ks], bK);
+            }
+            #pragma unroll
+            for (int e = 0; e < 2; ++e) {
+                const int key = jg * 8 + 2 * tq + e;
+                sraw[jg][e] = (key < tv && (t0 + key) < rbnd) ? s[e] * scale : -1e30f;
+            }
+            float rh = fmaxf(sraw[jg][0], sraw[jg][1]);
+            rh = fmaxf(rh, __shfl_xor_sync(0xffffffffu, rh, 1));
+            rh = fmaxf(rh, __shfl_xor_sync(0xffffffffu, rh, 2));
+            rmx = fmaxf(rmx, rh);
+        }
+        {                                           // one rescale to the tile-final basis
+            const float rs = __expf(m - rmx);       // m=-1e30 first -> 0, no NaN
+            l *= rs; m = rmx;
+            #pragma unroll
+            for (int nt = 0; nt < NTILES; ++nt) { o[nt][0] *= rs; o[nt][1] *= rs; }
+        }
+        float pacc = 0.f;
+        #pragma unroll
+        for (int jg = 0; jg < 2; ++jg) {
+            const float p0 = __expf(sraw[jg][0] - rmx);
+            const float p1 = __expf(sraw[jg][1] - rmx);
+            pacc += p0 + p1;
+            mypt[g * 24 + jg * 8 + 2 * tq]     = __float2bfloat16(p0);
+            mypt[g * 24 + jg * 8 + 2 * tq + 1] = __float2bfloat16(p1);
+        }
+        pacc += __shfl_xor_sync(0xffffffffu, pacc, 1);
+        pacc += __shfl_xor_sync(0xffffffffu, pacc, 2);
+        l += pacc;
+        // NOTE: rows 8..15 of this warp's P tile are never written — the PV A-frag's second
+        // row-half reads that stale garbage, but its products land ONLY in the C-frag halves
+        // this kernel discards (o keeps row g's columns); a NaN there cannot cross rows.
+        #pragma unroll
+        for (int kp = 0; kp < 16; kp += 16) {
+            const __nv_bfloat16* prow = mypt + g * 24 + kp + 4 * tq;
+            unsigned aP[4] = {
+                *(const unsigned*)prow,
+                *(const unsigned*)(prow + 8 * 24),
+                *(const unsigned*)(prow + 2),
+                *(const unsigned*)(prow + 8 * 24 + 2) };
+            #pragma unroll
+            for (int nt = 0; nt < NTILES; ++nt) {
+                const __nv_bfloat16* vrow = vt2 + (nt * 8 + g) * 24 + kp + 4 * tq;
+                unsigned bV[2] = {
+                    gve_bf162_b32(*(const __nv_bfloat162*)vrow),
+                    gve_bf162_b32(*(const __nv_bfloat162*)(vrow + 2)) };
+                float dd[4] = { 0.f, 0.f, 0.f, 0.f };
+                gve_mma(dd, aP, bV);
+                o[nt][0] += dd[0]; o[nt][1] += dd[1];   // keep row g's cols only
+            }
+        }
+        __syncwarp();
+    }
+    // Emit partials in the SPLITK layout for gqa_attn_reduce_e.
+    const int qi = qrow0 + g;
+    if (qi < NQ) {
+        const int b = qi / QG, qh = kvh * QG + (qi % QG);
+        const long long base = ((long long)b * nh + qh) * ns_grid + seg;
+        if (tq == 0) { out_m[base] = m; out_l[base] = l; }
+        #pragma unroll
+        for (int nt = 0; nt < NTILES; ++nt) {
+            out_acc[base * HDT + nt * 8 + 2 * tq]     = o[nt][0];
+            out_acc[base * HDT + nt * 8 + 2 * tq + 1] = o[nt][1];
+        }
+    }
+}
+
+
+
+// p3: 16-key tiles + register-staged pipeline (oracle-validated +18% bf16 @30K, SEG 56;
+// numerics parity rel(f32-ref) 2.29e-3 == stock kernel class). See STEP3_PLAN round-20/21.
+extern "C" __global__ void __launch_bounds__(192) gqa_attn_verify_e_p3(
+    float* __restrict__ out_m, float* __restrict__ out_l, float* __restrict__ out_acc,
+    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k_cache,
+    const __nv_bfloat16* __restrict__ v_cache,
+    const int* __restrict__ pos, long long bs_packed, int nh_packed,
+    const int* __restrict__ slot_ids, const int* __restrict__ col_pos_start) {
+    (void)col_pos_start;                             // identity path: logical == physical
+    const int hd = (nh_packed >> 10) & 0x3FF;
+    if (hd == 128)      gve_p3_impl<128>(out_m, out_l, out_acc, q, k_cache, v_cache, pos, bs_packed, nh_packed, slot_ids);
+    else if (hd == 256) gve_p3_impl<256>(out_m, out_l, out_acc, q, k_cache, v_cache, pos, bs_packed, nh_packed, slot_ids);
+}
+
+extern "C" __global__ void __launch_bounds__(192) gqa_attn_verify_e(
+    float* __restrict__ out_m, float* __restrict__ out_l, float* __restrict__ out_acc,
+    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k_cache,
+    const __nv_bfloat16* __restrict__ v_cache,
+    const int* __restrict__ pos, long long bs_packed, int nh_packed,
+    const int* __restrict__ slot_ids, const int* __restrict__ col_pos_start) {
+    (void)col_pos_start;                             // identity path: logical == physical
+    const int hd = (nh_packed >> 10) & 0x3FF;
+    if (hd == 128)      gve_impl<128>(out_m, out_l, out_acc, q, k_cache, v_cache, pos, bs_packed, nh_packed, slot_ids);
+    else if (hd == 256) gve_impl<256>(out_m, out_l, out_acc, q, k_cache, v_cache, pos, bs_packed, nh_packed, slot_ids);
+}
+
+extern "C" __global__ void gqa_attn_reduce_e(
+    __nv_bfloat16* out,
+    const float* in_m, const float* in_l, const float* in_acc,
+    const int* pos, int ns_grid, int B, int nh_packed) {
+    const int nh  = nh_packed >> 20;
+    const int hd  = (nh_packed >> 10) & 0x3FF;
+    const int blk = blockIdx.x;
+    const int b = blk / nh;
+    if (b >= B) return;
+    const int qh = blk % nh;
+    const int d = threadIdx.x;
+    const int ns = ns_grid;                        // _e: SEG is the authority, no recompute
+
+    float m = -1e30f;
+    for (int s = 0; s < ns; s++) {
+        const long long idx = ((long long)b * nh + qh) * ns_grid + s;
+        m = fmaxf(m, in_m[idx]);
+    }
+    float l = 0.0f, acc = 0.0f;
+    for (int s = 0; s < ns; s++) {                 // FIXED order -> deterministic
+        const long long idx = ((long long)b * nh + qh) * ns_grid + s;
+        const float alpha = __expf(in_m[idx] - m);
+        l   += in_l[idx] * alpha;
+        acc += in_acc[idx * hd + d] * alpha;
+    }
+    out[(long long)b * (nh * hd) + (long long)qh * hd + d] = f2b(l > 0.0f ? acc / l : 0.0f);
 }
 
 // Merge a column's partial softmaxes. It recomputes ns from THIS COLUMN's pc, exactly as
@@ -10737,4 +11618,391 @@ extern "C" __global__ void gdn_rollback_b(const unsigned long long* __restrict__
         else     GDN_CPY(unsigned int, s_src + slo, s_dst + slo, sn >> 2);
     }
     #undef GDN_CPY
+}
+
+// ===========================================================================
+// F8 PARITY LANE (2026-09-07): W8A8 FP8 prefill GEMM — e4m3 m16n8k32 tensor
+// cores for the PREFILL regime (the decode regime stays on gemm_mma_fp8_blk_b;
+// measured dead-end note: at M=16 the dequant+bf16 path is at the DRAM
+// roofline, at M=8192 the bf16 path is compute-bound at ~73% of the BF16 TC
+// peak and e4m3 doubles the ceiling — the recipe's ~2x prefill).
+//
+// Pipeline: fp8_repack_e_b (one-time, on-device: k16-frag codes -> k32 e4m3
+// A-frag panels), fp8_blk_scales_b + fp8_pack_b (per GEMM call: X bf16 ->
+// per-(token,128k) f32 scales + B-frag e4m3 panels), gemm_fp8_prefill_e_b
+// (128x64 tile, 8 warps of 32x32, 4-stage cp.async, raw accumulators folded
+// by w_s(block,128x128 band) x x_s(token,128k) every 128-K span).
+// Oracle: e4m3 fragment table validated bit-exact (tool_probe/e4m3_mma_probe.cu).
+// ===========================================================================
+
+__device__ __forceinline__ void mma_e4m3_k32(float* d, const unsigned* a, const unsigned* b) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+__device__ __forceinline__ void cp16_b(void* smem, const void* gmem) {
+    unsigned s = (unsigned)__cvta_generic_to_shared(smem);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(s), "l"(gmem));
+}
+__device__ __forceinline__ void cp8_b(void* smem, const void* gmem) {
+    unsigned s = (unsigned)__cvta_generic_to_shared(smem);
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 8;\n" :: "r"(s), "l"(gmem));
+}
+__device__ __forceinline__ void cp_commit_b() { asm volatile("cp.async.commit_group;\n"); }
+template<int N> __device__ __forceinline__ void cp_wait_b() { asm volatile("cp.async.wait_group %0;\n" :: "n"(N)); }
+
+// One-time weight repack: k16-bf16-frag u64 tiles -> e4m3 k32 A-frag panels.
+// Old tile (mt, kb16), lane l=g*4+t, u64 bytes:
+//   [g:2t][g:2t+1][g+8:2t][g+8:2t+1][g:2t+8][g:2t+9][g+8:2t+8][g+8:2t+9]
+// New panel (mt, kb32), lane l, 4xu32:
+//   a0={g, k4t..+3} a1={g+8, k4t..+3} a2={g, k4t+16..+3} a3={g+8, +16..+3}
+// Byte gather crosses the t-field (target k 4t..4t+3 spans two source lanes);
+// done warp-internally with shfl + prmt. Grid-stride over panels x 32 lanes.
+extern "C" __global__ void fp8_repack_e_b(
+    const unsigned long long* __restrict__ Wt,   // [(M/16)*(K/16)] old tiles
+    unsigned* __restrict__ We,                   // [(M/16)*(K/32)][128] new panels
+    int m, int k)
+{
+    const int nk32 = k >> 5, nk16 = k >> 4;
+    const long long npan = (long long)(m >> 4) * nk32;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < npan * 32;
+         i += (long long)gridDim.x * blockDim.x) {
+        const int lane = (int)(i & 31);
+        const long long pan = i >> 5;
+        const int mt = (int)(pan / nk32), kb32 = (int)(pan % nk32);
+        const int g = lane >> 2, t = lane & 3;
+        const long long base = (long long)mt * nk16;
+        const unsigned long long wa = Wt[(base + 2 * kb32) * 32 + lane];
+        const unsigned long long wb = Wt[(base + 2 * kb32 + 1) * 32 + lane];
+        const unsigned wa_lo = (unsigned)wa, wa_hi = (unsigned)(wa >> 32);
+        const unsigned wb_lo = (unsigned)wb, wb_hi = (unsigned)(wb >> 32);
+        // target k 4t..4t+3 lives in source lanes 2t and 2t+1 (t<2: low bytes
+        // 0,1 / 2,3; t>=2: their k is in the +8 half, bytes 4,5 / 6,7)
+        const int d = (t < 2) ? t : (t - 4);
+        const int L0 = lane + d, L1 = lane + d + 1;
+        const unsigned msk = 0xFFFFFFFFu;
+        unsigned s[8];
+        s[0] = __shfl_sync(msk, wa_lo, L0); s[1] = __shfl_sync(msk, wa_lo, L1);
+        s[2] = __shfl_sync(msk, wa_hi, L0); s[3] = __shfl_sync(msk, wa_hi, L1);
+        s[4] = __shfl_sync(msk, wb_lo, L0); s[5] = __shfl_sync(msk, wb_lo, L1);
+        s[6] = __shfl_sync(msk, wb_hi, L0); s[7] = __shfl_sync(msk, wb_hi, L1);
+        unsigned a[4];
+        if (t < 2) {
+            a[0] = __byte_perm(s[0], s[1], 0x5410);   // g  : bytes 0,1 | 0,1
+            a[1] = __byte_perm(s[0], s[1], 0x7632);   // g+8: bytes 2,3 | 2,3
+            a[2] = __byte_perm(s[4], s[5], 0x5410);
+            a[3] = __byte_perm(s[4], s[5], 0x7632);
+        } else {
+            a[0] = __byte_perm(s[2], s[3], 0x5410);   // +8k half: bytes 4,5 / 6,7
+            a[1] = __byte_perm(s[2], s[3], 0x7632);
+            a[2] = __byte_perm(s[6], s[7], 0x5410);
+            a[3] = __byte_perm(s[6], s[7], 0x7632);
+        }
+        uint4* dst = (uint4*)(We + pan * 128 + (unsigned)lane * 4);
+        *dst = make_uint4(a[0], a[1], a[2], a[3]);
+    }
+}
+
+// Per-(token, 128-K span) amax scale for the activation side: Xs[row][kspan] = amax/448.
+extern "C" __global__ void fp8_blk_scales_b(
+    const __nv_bfloat16* __restrict__ X, float* __restrict__ Xs, int rows, int k, int kspans)
+{
+    // Launched over the PADDED row count (tile multiple): rows >= real tokens write the
+    // identity scale and never touch X (the activation buffer only holds real rows).
+    const int row = blockIdx.x;
+    if (row >= rows) {
+        for (int s = threadIdx.x; s < kspans; s += blockDim.x)
+            Xs[(long long)row * kspans + s] = 1.0f;
+        return;
+    }
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
+    for (int s = warp; s < kspans; s += nw) {
+        const __nv_bfloat16* xr = X + (long long)row * k + s * 128;
+        float am = 0.f;
+        {   // 32 lanes x 4 elems = the full 128-elem span (uint2 = 2 x bf16x2)
+            const uint2 u = *(const uint2*)(xr + lane * 4);
+            const __nv_bfloat162 p0 = *(__nv_bfloat162*)&u.x, p1 = *(__nv_bfloat162*)&u.y;
+            am = fmaxf(am, fmaxf(fabsf(__bfloat162float(p0.x)), fabsf(__bfloat162float(p0.y))));
+            am = fmaxf(am, fmaxf(fabsf(__bfloat162float(p1.x)), fabsf(__bfloat162float(p1.y))));
+        }
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1)
+            am = fmaxf(am, __shfl_xor_sync(0xFFFFFFFFu, am, o));
+        if (lane == 0) Xs[(long long)row * kspans + s] = (am > 0.f) ? am / 448.0f : 1.0f;
+    }
+}
+
+// Activation pack: X bf16 + Xs -> Bq e4m3 B-frag panels [(T8)*nk32][64 u32]
+// (lane l=(g,t): b0 = codes[tok g][k 4t..+3], b1 = codes[tok g][k 4t+16..+3]).
+// One warp per (8-token group, 128-K span) writes its 4 k32 panels.
+extern "C" __global__ void fp8_pack_b(
+    const __nv_bfloat16* __restrict__ X, const float* __restrict__ Xs,
+    unsigned* __restrict__ Bq, int rows, int k, int kspans)
+{
+    const long long job = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const int lane = (int)(job & 31);
+    const long long t8s = job >> 5;                 // (t8 * kspans + kspan)
+    const int t8 = (int)(t8s / kspans), kspan = (int)(t8s % kspans);
+    const int nk32 = k >> 5;
+    const int g = lane >> 2, t = lane & 3;
+    const int row = t8 * 8 + g;
+    // Pad tokens (row >= rows) contribute zero codes: they are never read back by
+    // consumers, and zeros keep the tile arithmetic free of garbage NaN patterns.
+    const float inv = (row < rows) ? 1.0f / Xs[(long long)row * kspans + kspan] : 0.0f;
+    const __nv_bfloat16* xr = X + ((long long)(row < rows ? row : 0)) * k + (long long)kspan * 128;
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {                   // 4 k32 panels per 128-K span
+        // uint2 = 4 bf16 = 4 e4m3 codes: a full 4-k byte group per u32 fragment register.
+        const uint2 lo = *(const uint2*)(xr + j * 32 + 4 * t);
+        const uint2 hi = *(const uint2*)(xr + j * 32 + 16 + 4 * t);
+        unsigned b[2];
+        {
+            const __nv_bfloat162 p0 = *(__nv_bfloat162*)&lo.x;   // k 4t, 4t+1
+            const __nv_bfloat162 p1 = *(__nv_bfloat162*)&lo.y;   // k 4t+2, 4t+3
+            b[0] = (unsigned)f32_to_e4m3(__bfloat162float(p0.x) * inv)
+                 | ((unsigned)f32_to_e4m3(__bfloat162float(p0.y) * inv) << 8)
+                 | ((unsigned)f32_to_e4m3(__bfloat162float(p1.x) * inv) << 16)
+                 | ((unsigned)f32_to_e4m3(__bfloat162float(p1.y) * inv) << 24);
+        }
+        {
+            const __nv_bfloat162 p0 = *(__nv_bfloat162*)&hi.x;   // k 4t+16, 4t+17
+            const __nv_bfloat162 p1 = *(__nv_bfloat162*)&hi.y;   // k 4t+18, 4t+19
+            b[1] = (unsigned)f32_to_e4m3(__bfloat162float(p0.x) * inv)
+                 | ((unsigned)f32_to_e4m3(__bfloat162float(p0.y) * inv) << 8)
+                 | ((unsigned)f32_to_e4m3(__bfloat162float(p1.x) * inv) << 16)
+                 | ((unsigned)f32_to_e4m3(__bfloat162float(p1.y) * inv) << 24);
+        }
+        uint2* dst = (uint2*)(Bq + ((long long)t8 * nk32 + (kspan << 2) + j) * 64 + (unsigned)lane * 2);
+        *dst = make_uint2(b[0], b[1]);
+    }
+}
+
+// The GEMM: Out[tok][row] bf16 = (W[e4m3] x diag(w_s) ) x (diag(x_s) x X[e4m3])
+// with raw per-128-K accumulators folded at span boundaries.
+//   tile 128 rows x 64 tokens, 8 warps (wm 0..3 x wn 0..1), warp tile 32x32
+//   (A 2x16-row frags, B 4x8-token frags, 8 mma/panel), 4-stage cp.async,
+//   stage = {A 8x512B | B 8x256B} = 6144 B, epilogue via smem transpose.
+// Requires: M%128==0, K%128==0, T%64==0 (host pads at pack time).
+// Fused activation quant (2026-09-07, expert-review item): ONE pass over X —
+// stage the 128-elem span in smem, warp-reduce amax, encode e4m3 from smem, write
+// both the scale and the 4 k32 B-frag panels. Pad rows (row >= rows): identity
+// scale + zero codes, never touching X.
+extern "C" __global__ void fp8_quant_pack_b(
+    const __nv_bfloat16* __restrict__ X, unsigned* __restrict__ Bq, float* __restrict__ Xs,
+    int rows, int k, int kspans)
+{
+    // One warp per (8-token group, 128-K span). For each of the 8 rows: every lane loads
+    // that row's [lane*4, lane*4+4) span (all 32 lanes cover the full 128), warp-reduces
+    // amax, encodes 4 codes -> one u32 per lane (k-chunk lane*4..+3). The B-frag for lane
+    // (g,t) needs row g's code-chunks 8j+t (b0) and 8j+t+4 (b1) — exactly one u32 each —
+    // so the (r,j) shuffle broadcasts whole chunks with no byte surgery. Pad rows
+    // (row >= rows): identity scale, zero codes, X never read.
+    const long long job = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const int lane = (int)(job & 31);
+    const long long t8s = job >> 5;                 // (t8 * kspans + kspan)
+    const int t8 = (int)(t8s / kspans), kspan = (int)(t8s % kspans);
+    const int nk32 = k >> 5;
+    const int g = lane >> 2, t = lane & 3;
+
+    unsigned b[4][2];
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) b[j][0] = 0u, b[j][1] = 0u;
+
+    #pragma unroll
+    for (int r = 0; r < 8; ++r) {
+        const int row = t8 * 8 + r;
+        float am = 0.f;
+        uint2 u = make_uint2(0u, 0u);
+        if (row < rows) {
+            const __nv_bfloat16* xr = X + (long long)row * k + (long long)kspan * 128;
+            u = *(const uint2*)(xr + lane * 4);
+            const __nv_bfloat162 p0 = *(__nv_bfloat162*)&u.x, p1 = *(__nv_bfloat162*)&u.y;
+            am = fmaxf(am, fmaxf(fabsf(__bfloat162float(p0.x)), fabsf(__bfloat162float(p0.y))));
+            am = fmaxf(am, fmaxf(fabsf(__bfloat162float(p1.x)), fabsf(__bfloat162float(p1.y))));
+        }
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1)
+            am = fmaxf(am, __shfl_xor_sync(0xFFFFFFFFu, am, o));
+        const float sc = (am > 0.f) ? am / 448.0f : 1.0f;
+        if (lane == 0) Xs[(long long)row * kspans + kspan] = sc;
+        const float inv = 1.0f / sc;
+        unsigned cr = 0;
+        {
+            const __nv_bfloat162 p0 = *(__nv_bfloat162*)&u.x, p1 = *(__nv_bfloat162*)&u.y;
+            cr = (unsigned)f32_to_e4m3(__bfloat162float(p0.x) * inv)
+               | ((unsigned)f32_to_e4m3(__bfloat162float(p0.y) * inv) << 8)
+               | ((unsigned)f32_to_e4m3(__bfloat162float(p1.x) * inv) << 16)
+               | ((unsigned)f32_to_e4m3(__bfloat162float(p1.y) * inv) << 24);
+        }
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const unsigned v0 = __shfl_sync(0xFFFFFFFFu, cr, 8 * j + t);
+            const unsigned v1 = __shfl_sync(0xFFFFFFFFu, cr, 8 * j + t + 4);
+            if (g == r) { b[j][0] = v0; b[j][1] = v1; }
+        }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        uint2* dst = (uint2*)(Bq + ((long long)t8 * nk32 + (kspan << 2) + j) * 64 + (unsigned)lane * 2);
+        *dst = make_uint2(b[j][0], b[j][1]);
+    }
+}
+extern "C" __global__ __launch_bounds__(256, 2) void gemm_fp8_prefill_e_b(
+    const unsigned* __restrict__ We,      // [(M/16)*(K/32)][128]
+    const unsigned* __restrict__ Bq,      // [(T/8)*(K/32)][64]
+    const float* __restrict__ Xs,         // [T][K/128]
+    const float* __restrict__ Ws,         // [(M/128)*(K/128)] block scales
+    __nv_bfloat16* __restrict__ Out,      // [T][M] token-major
+    int M, int T, int K)
+{
+    constexpr int BM = 128, BN = 64, STAGE_A = 4096, STAGE_B = 2048;
+    constexpr int STAGE = STAGE_A + STAGE_B, NSTAGE = 4;
+    const int nk32 = K >> 5, nks = K >> 7;
+    const int tid = threadIdx.x, lane = tid & 31, g = lane >> 2, t = lane & 3;
+    const int warp = tid >> 5, wm = warp >> 1, wn = warp & 1;
+
+    // token-fastest raster, group <= 8: co-resident blocks share the A tile in L2.
+    // gw CLAMPS to tn: with tn < 8 (small tail chunks) the unclamped form mapped blocks
+    // to out-of-range bn tiles and left high-M tiles uncomputed (oracle: M=256/T=64 was
+    // 0.71 rel-L2 with half of Out never written). Clamping keeps every (bm,bn) covered
+    // exactly once for any tn; the L2 grouping just degrades on narrow T.
+    const int tm = M / BM, tn = T / BN;
+    // 2-D locality groups (expert review): 8 token-tiles x 4 out-tiles run as one
+    // wave so BOTH operands' panels stay hot in L2 (token-only grouping streamed the
+    // full 44 MB W per token-group). Group edges clamp to the tile grid.
+    const int gt = (tn < 8) ? tn : 8, go = (tm < 4) ? tm : 4;
+    const int gtm = (tm + go - 1) / go, gtn = (tn + gt - 1) / gt;   // groups along each axis
+    const int per_g = gt * go;
+    const int gid = blockIdx.x / per_g, rem = blockIdx.x % per_g;
+    const int g_o = gid % gtm, g_t = gid / gtm;
+    const int o0 = g_o * go, t0 = g_t * gt;                          // group origin (tiles)
+    const int n_o = ((g_o + 1) * go < tm) ? go : tm - o0;            // clamped group sizes
+    const int n_t = ((g_t + 1) * gt < tn) ? gt : tn - t0;
+    const int li = rem / n_t, lj = rem % n_t;                        // out-fastest inside a group
+    const int bm = (o0 + li) * BM, bn = (t0 + lj) * BN;
+    const int mt0 = bm >> 4, bt0 = bn >> 3;
+
+    extern __shared__ unsigned char psmem[];
+    auto load_stage = [&](int s, int p) {
+        unsigned char* st = psmem + s * STAGE;
+        // A: 8 panels of 512 B (thread i -> panel i>>5, 16 B at lane i&31)
+        {
+            const int pi = tid >> 5, pl = tid & 31;
+            if ((mt0 + pi) * 16 < M) {
+                const unsigned* src = We + (((long long)(mt0 + pi) * nk32) + p) * 128 + (unsigned)pl * 4;
+                cp16_b(st + pi * 512 + pl * 16, src);
+            } else {
+                *(uint4*)(st + pi * 512 + pl * 16) = make_uint4(0u, 0u, 0u, 0u);
+            }
+        }
+        // B: 8 panels of 256 B (thread i -> panel i>>5, 8 B at lane i&31)
+        {
+            const int pi = tid >> 5, pl = tid & 31;
+            if ((bt0 + pi) * 8 < T) {
+                const unsigned* src = Bq + (((long long)(bt0 + pi) * nk32) + p) * 64 + (unsigned)pl * 2;
+                cp8_b(st + STAGE_A + pi * 256 + pl * 8, src);
+            } else {
+                *(uint2*)(st + STAGE_A + pi * 256 + pl * 8) = make_uint2(0u, 0u);
+            }
+        }
+        cp_commit_b();
+    };
+
+    load_stage(0, 0);
+    if (nk32 > 1) load_stage(1, 1);
+    if (nk32 > 2) load_stage(2, 2);
+    if (nk32 > 3) load_stage(3, 3);
+
+    float raw[2][4][4], acc[2][4][4];
+    #pragma unroll
+    for (int i = 0; i < 2; ++i)
+        #pragma unroll
+        for (int j = 0; j < 4; ++j)
+            #pragma unroll
+            for (int c = 0; c < 4; ++c) { raw[i][j][c] = 0.f; acc[i][j][c] = 0.f; }
+
+    for (int p = 0; p < nk32; ++p) {
+        const int s = p & (NSTAGE - 1);
+        const int committed = (p + 3 < nk32) ? (p + 3) : nk32;
+        const int need = committed - p - 1;
+        if (need <= 0) cp_wait_b<0>();
+        else if (need == 1) cp_wait_b<1>();
+        else cp_wait_b<2>();
+        __syncthreads();
+        if (p + 3 < nk32) load_stage((p + 3) & (NSTAGE - 1), p + 3);
+
+        const unsigned char* st = psmem + s * STAGE;
+        unsigned a[2][4]; unsigned b[4][2];
+        #pragma unroll
+        for (int ma = 0; ma < 2; ++ma) {
+            const uint4* q = (const uint4*)(st + ((wm * 2 + ma) * 128 + lane * 4) * 4);
+            a[ma][0] = q->x; a[ma][1] = q->y; a[ma][2] = q->z; a[ma][3] = q->w;
+        }
+        #pragma unroll
+        for (int na = 0; na < 4; ++na) {
+            const uint2* q = (const uint2*)(st + STAGE_A + ((wn * 4 + na) * 32 + lane) * 8);
+            b[na][0] = q->x; b[na][1] = q->y;
+        }
+        #pragma unroll
+        for (int ma = 0; ma < 2; ++ma)
+            #pragma unroll
+            for (int na = 0; na < 4; ++na)
+                mma_e4m3_k32(raw[ma][na], a[ma], b[na]);
+
+        if ((p & 3) == 3) {                       // fold at the 128-K span boundary
+            const int kspan = p >> 2;
+            const float w_s = Ws[(long long)(bm >> 7) * nks + kspan];
+            #pragma unroll
+            for (int na = 0; na < 4; ++na) {
+                const int tk0 = bn + wn * 32 + na * 8 + 2 * t;
+                const float xs0 = Xs[(long long)tk0 * nks + kspan];
+                const float xs1 = Xs[(long long)(tk0 + 1) * nks + kspan];
+                #pragma unroll
+                for (int ma = 0; ma < 2; ++ma)
+                    #pragma unroll
+                    for (int c = 0; c < 4; ++c) {
+                        const float xs = (c & 1) ? xs1 : xs0;
+                        acc[ma][na][c] = fmaf(raw[ma][na][c], w_s * xs, acc[ma][na][c]);
+                        raw[ma][na][c] = 0.f;
+                    }
+            }
+        }
+    }
+
+    // smem-transpose epilogue (token-major Out, 8-row pad): reuse the dead stages.
+    __syncthreads();
+    __nv_bfloat16* tile = (__nv_bfloat16*)psmem;      // [BN=64][BM+8=136]
+    constexpr int TS = 136;
+    #pragma unroll
+    for (int ma = 0; ma < 2; ++ma)
+        #pragma unroll
+        for (int na = 0; na < 4; ++na)
+            #pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                const int row = bm + wm * 32 + ma * 16 + g + 8 * (c >= 2);
+                const int tok = bn + wn * 32 + na * 8 + 2 * t + (c & 1);
+                tile[(tok - bn) * TS + (row - bm)] = f2b(acc[ma][na][c]);
+            }
+    __syncthreads();
+    // [64 tok][128+8 pad] tile -> coalesced 16-B stores: 256 threads x 4 stores cover
+    // (2 row-halves x 2 col-halves) — the ORIGINAL single-store version wrote only 1/4
+    // of the tile (r3 0..31, c8 0..56), leaving 3/4 of Out stale. Caught by the
+    // standalone oracle (tool_probe lineage) after repack/scales/pack all verified exact.
+    const int r3 = tid >> 3, c8 = (tid & 7) * 8;
+    #pragma unroll
+    for (int rr = 0; rr < 2; ++rr)
+        #pragma unroll
+        for (int cc = 0; cc < 2; ++cc) {
+            const int tr = r3 + rr * 32, tc = c8 + cc * 64;
+            const int tok = bn + tr;
+            if (tok < T) {
+                const uint4* src = (const uint4*)(tile + tr * TS + tc);
+                uint4* dst = (uint4*)(Out + (long long)tok * M + bm + tc);
+                *dst = *src;
+            }
+        }
 }
