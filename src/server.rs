@@ -1,6 +1,6 @@
 use axum::{
     extract::{DefaultBodyLimit, Json, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response, Sse},
     response::sse::Event,
     routing::{get, post},
@@ -423,6 +423,37 @@ fn resolve_reasoning_effort(tokenizer: &QwenTokenizer, req_effort: Option<&str>,
     })
 }
 
+/// W2 (Phase 13), 2026-09-14: a `response_format` request this build serves WITHOUT enforcing the
+/// schema must never be silent — but it must also never be REFUSED. `e737d08` refunded such
+/// requests with HTTP 400 to avoid the "F6 class" (accepted-and-quietly-ignored); that intent was
+/// right and the mechanism was wrong: a 400 is a hard failure of a request that used to succeed,
+/// and it cost real measured quality on the public tool-eval-bench (TC-64..TC-69: "not valid JSON"
+/// → 400; 88 → 85). The honest form is to SERVE the request and ADVERTISE that it is
+/// unconstrained: every reply carries `x-json-schema-enforced: none`, and the reason is logged
+/// loudly once per distinct reason. A client that needs the guarantee checks the header.
+fn warn_unenforced_schema_once(why: &str) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    let first = seen.lock().map(|mut g| g.insert(why.to_string())).unwrap_or(true);
+    if first {
+        eprintln!(
+            "[schema] WARNING: response_format is NOT enforced by this build — the reply is \
+             unconstrained and may not match the requested schema (responses carry \
+             'x-json-schema-enforced: none'). Reason: {why}"
+        );
+    }
+}
+
+/// Marks a served response whose `response_format` was not enforced (see above).
+fn attach_schema_unenforced_header(resp: &mut Response, unenforced: bool) {
+    if !unenforced { return; }
+    if let Ok(v) = HeaderValue::from_str("none") {
+        resp.headers_mut().insert("x-json-schema-enforced", v);
+    }
+}
+
 async fn chat_completions(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -462,17 +493,17 @@ async fn chat_completions(
     //
     // REGRESSION FIX (2026-08-30): the 289e1a1 refactor lumped "high" into the no_think arm,
     // so every OpenAI-convention client sending reasoning_effort=high silently LOST thinking.
-    // W2 (Phase 13): `response_format` — compiled HERE, before any work: an unsupported construct
-    // is a 400 naming the keyword (never accepted-and-ignored), a supported schema arms the mask.
-    // Phase-13 W2 STATUS (2026-09-13): the schema compiler, the token-level FSM, the mask kernels
-    // and the scheduler plumbing are all in this build (unit-tested), but end-to-end ENFORCEMENT
-    // could not be verified in the phase's boot budget: the mask is armed and restrictive
-    // ("[schema] verify mask armed: ... allowed_tokens_pos0=2") yet a token outside it still
-    // reached the stream, so this build REFUSES schema requests loudly instead of accepting them
-    // and quietly ignoring the constraint — the F6 class this work exists to delete. Flip
-    // JSON_SCHEMA_ENFORCEMENT_ENABLED to true once the emission path is proven end-to-end.
+    // W2 (Phase 13): `response_format` — compiled HERE, before any work. A supported schema arms
+    // the token-level mask when enforcement is on; when it is off the request is still SERVED and
+    // the response is marked `x-json-schema-enforced: none` (see warn_unenforced_schema_once).
+    // NEVER a 400 for a schema this build can parse: refusing was `e737d08`, and it broke the
+    // public quality benchmark (88 → 85) by hard-failing requests that used to succeed.
+    // Flip JSON_SCHEMA_ENFORCEMENT_ENABLED to true only when the emission path is proven
+    // end-to-end: `cargo test --lib json_schema::tests` green AND the W2 probe 6/6 enforced
+    // across temperature × TP × spec source. Until then, serving + advertising beats refusing.
     const JSON_SCHEMA_ENFORCEMENT_ENABLED: bool = false;
     let mut schema_mask: Option<std::sync::Arc<crate::json_schema::SchemaMask>> = None;
+    let mut schema_unenforced: Option<String> = None;
     if let Some(rf) = req.response_format.as_ref() {
         match crate::json_schema::compile_response_format(rf) {
             Ok(None) => {}
@@ -482,22 +513,15 @@ async fn chat_completions(
                 schema_mask = Some(std::sync::Arc::new(m));
             }
             Ok(Some(m)) => {
-                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": {
-                    "message": format!(
-                        "this build does not enforce json_schema constrained decoding yet \
-                         (Phase 13 W2 partial): every token would be unconstrained, so the \
-                         request is refused instead of accepted-and-ignored. Drop response_format \
-                         or use {{\"type\":\"text\"}}. Parsed schema: {}",
-                        m.summary()),
-                    "type": "invalid_request_error", "code": "json_schema_not_enforced",
-                }}))).into_response();
+                schema_unenforced = Some(format!(
+                    "schema compiled ({}) but this build does not enforce constrained decoding yet",
+                    m.summary()));
             }
             Err(e) => {
-                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": {
-                    "message": e, "type": "invalid_request_error", "code": "unsupported_response_format",
-                }}))).into_response();
+                schema_unenforced = Some(format!("schema not compiled: {e}"));
             }
         }
+        if let Some(why) = schema_unenforced.as_deref() { warn_unenforced_schema_once(why); }
     }
     // W1: `chat_template_kwargs` (arbitrary dict → the model's own template). Validate LOUDLY
     // before any render: a malformed value used to be invisible (serde dropped the field), and
@@ -1006,7 +1030,9 @@ async fn chat_completions(
             let dt = t0.elapsed().as_secs_f32();
             eprintln!("[req] done   tok={} ({:.1} tok/s wall) finish={} stop_hit={}", n, if dt>1e-6 {n as f32/dt} else {0.0}, finish, stop_hit);
         };
-        Sse::new(stream).into_response()
+        let mut resp = Sse::new(stream).into_response();
+        attach_schema_unenforced_header(&mut resp, schema_unenforced.is_some());
+        resp
     } else {
         eprintln!("[req] sync   prompt_tokens={} max_tokens={} stop={:?}", prompt_len, req_max, req.stop);
         let t0 = std::time::Instant::now();
@@ -1107,7 +1133,9 @@ async fn chat_completions(
             timings: make_timings(t0, first_tok, prompt_len, tokens.len()),
             session_id: otel_session,
         };
-        Json(response).into_response()
+        let mut resp = Json(response).into_response();
+        attach_schema_unenforced_header(&mut resp, schema_unenforced.is_some());
+        resp
     }
 }
 /// Diagnostics-only (env `RUST_INFER_DUMP_TOKENS=1`): one line per generation with the EXACT

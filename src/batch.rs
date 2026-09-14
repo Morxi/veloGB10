@@ -2795,14 +2795,25 @@ impl BatchScheduler {
         // never went stale. The MTP path stays live for the Mtp/Dspark sources AND as the DFlash2
         // fallback (unprimed lane, failed prime, or a lane that went stale). Plain never speculates.
         let src = self.mtp.spec_source();
-        let df2_live = policy_active && is_df2_src(src) && self.df2.is_some() && b == 1;
+        let df2_live = policy_active && is_df2_src(src) && self.df2.is_some() && b == 1
+            && !self.lanes.get(0).and_then(|l| l.as_ref())
+                   .map_or(false, |l| l.schema.is_some());
         // WI1: the DSpark lane owns the step exactly like df2_live (b==1, primed, not stale).
         let dspark_live = policy_active && !df2_live && src == SpecSource::Dspark
-            && self.dspark.is_some() && b == 1;
+            && self.dspark.is_some() && b == 1
+            && !self.lanes.get(0).and_then(|l| l.as_ref())
+                   .map_or(false, |l| l.schema.is_some());
         // P14: the DFlash v1 lane is a single-sequence block drafter — b == 1 only, exactly like
         // the other round-based lanes (AGENTS §4: above one lane, batching beats speculation).
+        // W2 (Phase 13): a lane step that does not arm the JSON-schema mask would emit
+        // UNCONSTRAINED tokens for a schema request (`df2/dspark/dflash/tree/forest/sampled` lane
+        // steps are schema-blind today; only the greedy MTP chain step is wired). A schema lane is
+        // therefore kept OFF every schema-blind source: it is served by the MTP chain when that is
+        // live, else by the masked Phase-B decode — never silently by an unmasked lane.
+        let schema_lane = self.lanes.get(0).and_then(|l| l.as_ref())
+            .map_or(false, |l| l.schema.is_some() && b == 1);
         let dflash_live = policy_active && !df2_live && !dspark_live && src == SpecSource::DFlash
-            && self.dflash.is_some() && b == 1;
+            && self.dflash.is_some() && b == 1 && !schema_lane;
         let mtp_live = policy_active && !df2_live && !dspark_live && !dflash_live && src != SpecSource::Plain;
         // `served[i]` = lane i was served by Phase A (speculation) this step — Phase B decodes
         // exactly the lanes Phase A did NOT serve (a lane is never double-served, never stranded).
@@ -2934,7 +2945,25 @@ impl BatchScheduler {
         // single source of truth — a source switch can never strand or double-serve a lane).
         let batch_idx: Vec<usize> = (0..b).filter(|&i| !served[i]).collect();
         if !batch_idx.is_empty() {
+            // W2 (Phase 13): ARM THE DECODE MASK for this batch. `batched_decode` already refuses
+            // the resident loop and the captured graphs for a schema batch, but the mask itself was
+            // never uploaded (`schema_decode_masks` / `upload_decode_masks` had no caller), so a
+            // Phase-B step emitted UNMASKED — the escape that forced the W2 floor. The mask is
+            // per-lane and per-step (the FSM state moves with every committed token).
+            //
+            // While no lane carries a schema this block does NOTHING — not one upload, not one
+            // allocation — so the hot decode path is untouched by it.
+            let armed = if batch_idx.iter().any(|&i| self.lanes[i].as_ref().is_some_and(|l| l.schema.is_some())) {
+                let (words, flags, any) = self.schema_decode_masks(&batch_idx);
+                if any { self.gpu.upload_decode_masks(&mut self.bufs, &words, &flags, true); }
+                any
+            } else {
+                false
+            };
             let next_toks = self.batched_decode(&batch_idx);
+            // The mask kernel is armed for exactly this step: disarm it immediately after, so a
+            // later non-schema caller can never inherit a stale mask.
+            if armed { self.gpu.upload_decode_masks(&mut self.bufs, &[], &[], false); }
             for (k, &i) in batch_idx.iter().enumerate() {
                 let t = next_toks[k];
                 let lane = self.lanes[i].as_mut().unwrap();
@@ -2961,6 +2990,13 @@ impl BatchScheduler {
                 let eos_hit = self.eos.contains(&t) && !lane.ignore_eos && lane.generated >= lane.min_new;
                 if eos_hit || lane.generated >= lane.max_new {
                     finished[i] = true;
+                }
+                // W2: advance the schema FSM over the token this step actually emitted, and end the
+                // turn when the document is complete (a schema turn stops at the closing brace, it
+                // does not run to max_tokens).
+                if self.lanes[i].as_ref().unwrap().schema.is_some() {
+                    let done = self.schema_advance(i, &[t]);
+                    if done { finished[i] = true; }
                 }
             }
         }

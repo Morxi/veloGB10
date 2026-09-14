@@ -1039,6 +1039,9 @@ impl SchemaMask {
             }
             Ty::Integer | Ty::Number => match num_start(b) {
                 Some((st, buf)) => {
+                    if !self.num_prefix_viable(si, &buf, st) {
+                        return false;
+                    }
                     m.stack.push(Frame::Num { si, buf, st });
                     true
                 }
@@ -1107,6 +1110,9 @@ impl SchemaMask {
                     }
                     _ => match num_start(b) {
                         Some((st, buf)) => {
+                            if !self.num_prefix_viable(si, &buf, st) {
+                                return false;
+                            }
                             m.stack.push(Frame::Num { si, buf, st });
                             true
                         }
@@ -1188,6 +1194,51 @@ impl SchemaMask {
             if v >= m {
                 return false;
             }
+        }
+        true
+    }
+
+    /// Can a number whose bytes so far are `buf` (grammar position `st`) still END UP in range?
+    ///
+    /// `num_ok` runs only when the number TERMINATES, so without this check the allowed set let the
+    /// model run an unbounded digit sequence after a value that had already passed the bound — the
+    /// escape the 0.8B probe produced on 2026-09-14 (`{"n":-1000…`, 258 chars, `finish=length`).
+    ///
+    /// The rule is deliberately narrow: it returns false only when the prefix is PROVABLY
+    /// unsatisfiable, so it can prune the mask but can never reject a document that `num_ok` would
+    /// accept. That is why it applies to `Ty::Integer` only — for a float, `.`/`e` can still move
+    /// any digit prefix back into range (`70e-1 == 7`), and for `Ty::Any` a fraction is allowed too.
+    fn num_prefix_viable(&self, si: u32, buf: &[u8], st: NumState) -> bool {
+        let s = &self.schemas[si as usize];
+        if s.ty != Ty::Integer {
+            return true;
+        }
+        if !matches!(st, NumState::NegStart | NumState::Zero | NumState::Int) {
+            return true;
+        }
+        let negative = buf.first() == Some(&b'-');
+        let digits = if negative { &buf[1..] } else { buf };
+        if digits.is_empty() {
+            // A bare `-`: viable iff some negative integer could be in range.
+            return !(s.minimum.is_some_and(|mn| mn > 0.0)
+                || s.excl_min.is_some_and(|mn| mn >= 0.0));
+        }
+        let Ok(text) = std::str::from_utf8(buf) else { return true };
+        let Ok(v) = text.parse::<f64>() else { return true };
+        // An integer's value is monotone in its digits: appending a digit moves it AWAY from zero,
+        // so a positive prefix above the upper bound can never come back down, and a negative
+        // prefix below the lower bound can never come back up.
+        if negative {
+            if s.minimum.is_some_and(|mn| v < mn) || s.excl_min.is_some_and(|mn| v < mn) {
+                return false;
+            }
+        } else if s.maximum.is_some_and(|mx| v > mx) || s.excl_max.is_some_and(|mx| v > mx) {
+            return false;
+        }
+        // `0` / `-0` cannot be extended by another digit (leading zeros are illegal JSON), so this
+        // prefix is already final and must be in range on its own.
+        if st == NumState::Zero && !self.num_ok(si, buf, st) {
+            return false;
         }
         true
     }
@@ -1469,6 +1520,11 @@ impl SchemaMask {
                 Frame::Num { si, mut buf, st } => {
                     if let Some(next) = num_advance(st, b) {
                         buf.push(b);
+                        // W2: refuse a digit that puts the number permanently out of range.
+                        if !self.num_prefix_viable(si, &buf, next) {
+                            m.stack.push(Frame::Dead);
+                            return false;
+                        }
                         m.stack.push(Frame::Num { si, buf, st: next });
                         return true;
                     }
@@ -1671,6 +1727,78 @@ mod tests {
             v[(i >> 5) as usize] |= 1u32 << (i & 31);
         }
         v
+    }
+
+    // ---- 0: W2 ENFORCEMENT — the escapes the 0.8B probe actually produced --------------------
+    //
+    // These are the exact failure shapes seen on hardware (2026-09-14, `w2_probe.py` against the
+    // 0.8B trunk): a truncated \uXXXX escape, an integer far outside `maximum`, a raw control
+    // character inside a string, and a digit run that never closes the document. The byte-level
+    // walk isolates the MACHINE from the token plumbing, so a failure here is the FSM's own bug
+    // (and a pass here means the escape came from a path that never armed the mask).
+
+    const OBJ_SCHEMA: &str = r#"{"type":"object","properties":{
+        "answer":{"type":"string","enum":["ALPHA","BETA"]},
+        "n":{"type":"integer","minimum":1,"maximum":3},
+        "why":{"type":"string","minLength":1,"maxLength":40}},
+        "required":["answer","n","why"],"additionalProperties":false}"#;
+
+    #[test]
+    fn w2_accepts_a_valid_document() {
+        let m = mask(OBJ_SCHEMA);
+        assert!(ok(&m, r#"{"answer":"ALPHA","n":2,"why":"because"}"#),
+                "the positive control must be accepted");
+    }
+
+    #[test]
+    fn w2_refuses_the_observed_escapes() {
+        let m = mask(OBJ_SCHEMA);
+        let bad: &[(&str, &str)] = &[
+            ("truncated escape", r#"{"answer":"ALPHA","n":2,"why":"\u043!"}"#),
+            ("raw newline in string", "{\"answer\":\"ALPHA\",\"n\":2,\"why\":\"a\nb\"}"),
+            ("below minimum", r#"{"answer":"ALPHA","n":-1,"why":"x"}"#),
+            ("above maximum", r#"{"answer":"ALPHA","n":4,"why":"x"}"#),
+            ("far above maximum", r#"{"answer":"ALPHA","n":100000000000,"why":"x"}"#),
+            ("enum violation", r#"{"answer":"GAMMA","n":2,"why":"x"}"#),
+            ("additionalProperties", r#"{"answer":"ALPHA","n":2,"why":"x","extra":1}"#),
+            ("missing required", r#"{"answer":"ALPHA","n":2}"#),
+        ];
+        let mut escaped = Vec::new();
+        for (what, doc) in bad {
+            if ok(&m, doc) { escaped.push(*what); }
+        }
+        assert!(escaped.is_empty(), "these documents were ACCEPTED by the FSM: {escaped:?}");
+    }
+
+    #[test]
+    fn w2_allowed_set_prunes_at_the_number_bound() {
+        // The bitset is what the kernel masks with: after `{"n":3` only `,` / `}` may follow.
+        let m = mask(OBJ_SCHEMA);
+        let st = walk(&m, r#"{"answer":"ALPHA","n":3"#).expect("prefix must be walkable");
+        let bits = m.allowed(st);
+        for d in b'0'..=b'9' {
+            let t = d as usize;
+            assert_eq!(bits[t >> 5] & (1u32 << (t & 31)), 0,
+                       "digit '{}' is allowed after the maximum", d as char);
+        }
+        let st0 = walk(&m, r#"{"answer":"ALPHA","n":"#).expect("prefix must be walkable");
+        let b0 = m.allowed(st0);
+        for c in [b'-', b'0'] {
+            let t = c as usize;
+            assert_eq!(b0[t >> 5] & (1u32 << (t & 31)), 0,
+                       "'{}' is allowed below the minimum", c as char);
+        }
+    }
+
+    #[test]
+    fn w2_allowed_set_tracks_the_escape_state() {
+        let m = mask(OBJ_SCHEMA);
+        let st = walk(&m, r#"{"answer":"ALPHA","n":2,"why":"\u04"#).expect("prefix must be walkable");
+        let bits = m.allowed(st);
+        let allowed = |c: u8| { let t = c as usize; bits[t >> 5] & (1u32 << (t & 31)) != 0 };
+        assert!(allowed(b'A') && allowed(b'9'), "a 4th hex digit must be allowed");
+        assert!(!allowed(b'!'), "'!' must NOT be allowed while a hex digit is pending");
+        assert!(!allowed(b'"'), "the string must not close inside an escape");
     }
 
     // ---- 1: every rejected keyword is named loudly ------------------------------------------
@@ -1984,7 +2112,12 @@ mod tests {
         // A pending number IS finished at the top level: `is_complete` finalizes it.
         let nums = mask(r#"{"type":"integer","maximum":10}"#);
         assert!(nums.is_complete(walk(&nums, "7").unwrap()));
-        assert!(!nums.is_complete(walk(&nums, "70").unwrap()), "over the bound");
+        assert!(walk(&nums, "70").is_none(),
+                "an integer prefix past `maximum` can never return to range — refused mid-prefix");
+        // The same bound on a FLOAT is only decidable once the number ends: `70e-1` is 7, so the
+        // prefix stays allowed and the refusal lands at completion.
+        let floats = mask(r#"{"type":"number","maximum":10}"#);
+        assert!(!floats.is_complete(walk(&floats, "70").unwrap()), "over the bound");
         let finished = walk(&m, r#"{"a":1}"#).unwrap();
         assert!(m.is_complete(finished));
         assert!(m.is_complete(walk(&m, "{\"a\":1} \n\t").unwrap()), "trailing whitespace");

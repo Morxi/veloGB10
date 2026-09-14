@@ -274,7 +274,9 @@ Two properties are treated as non-negotiable and are enforced by gates, not by h
   single canonical serializer across streaming and non-streaming, and **reference-exact tool
   rendering** — key insertion order preserved so the `<tools>` block matches transformers/vLLM
   byte-for-byte), seedable sampling, continuous batching, prefix caching, and OpenAI
-  `reasoning_effort` levels (`none/low/medium/high/xhigh/max`).
+  `reasoning_effort` levels (`none/low/medium/high/xhigh/max`). `response_format` requests are
+  **served** (never rejected); a reply that could not enforce the schema advertises it honestly via
+  the `x-json-schema-enforced: none` response header.
   Also exposes vLLM-compatible `POST /v1/tokenize` and `POST /v1/detokenize` endpoints for
   benchmarking.
 - **Built-in OpenTelemetry** — `--otel-endpoint <URL>` streams OTLP/HTTP-JSON generation telemetry

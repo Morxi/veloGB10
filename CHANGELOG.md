@@ -3,6 +3,23 @@
 High-level release notes for veloGB10. Minor bug fixes and small optimizations are grouped under
 generic language where they aren't individually notable.
 
+## v0.6.1 — `response_format` served again (quality-regression hotfix)
+
+- **`response_format` requests are served, not rejected.** v0.6.0's P13 W2 change turned any
+  `response_format` request into a loud HTTP 400; that was a hard failure of requests that used to
+  succeed and cost measured quality on the public benchmark (the hardmode leg fell 150/176 →
+  85/100 because json_schema scenarios returned `[server error 400]` instead of a verdict). Such a
+  request is now served again, and the truth is advertised instead of hidden: every reply for a
+  schema request carries an **`x-json-schema-enforced: none`** header, and the reason is logged
+  loudly once per distinct reason. Nothing is silently ignored, and nothing that used to work is
+  refused. (Schema *enforcement* remains off — it is not yet proven, and the switch is documented as
+  gated on evidence.)
+- **JSON-schema FSM fix.** An INTEGER prefix that can never return into range is now refused at the
+  digit rather than at termination (previously an unbounded digit run after `maximum` was allowed).
+  Deliberately narrow: `Ty::Integer` only, so a float case like `70e-1 == 7` is never rejected.
+- Phase-B decode-mask arming + schema-blind-lane routing groundwork (inert while no lane carries a
+  schema); 4 new tests. Minor bug fixes and optimizations.
+
 ## v0.6.0 — DFlash v1 drafter lane, DSpark, tool-render parity, TP/FP8 correctness
 
 A large release: a new drafter serving lane, a new draft-model family, reference-exact tool
