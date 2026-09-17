@@ -373,7 +373,14 @@ fn ipv4_of(netdev: &str) -> Option<(Ipv4Addr, u8, Ipv4Addr)> {
         }
         i += 1;
     }
-    Some((ip?, prefix?, brd?))
+    // `brd` is absent for point-to-point prefixes (/31, /30, ...) on some kernels: the runtime only
+    // needs the address itself, while the bcast/mask serve discovery broadcast + rail ranking. So do
+    // NOT hard-require `brd`; synthesize it from ip | ~mask when the kernel omits it.
+    let ip = ip?;
+    let prefix = prefix?;
+    let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+    let bcast = brd.unwrap_or_else(|| Ipv4Addr::from(u32::from(ip) | !mask));
+    Some((ip, prefix, bcast))
 }
 
 /// Rank a reply's source IP: on RoCE rail 1 (3) > rail 2 (2) > any other link (1).

@@ -13668,6 +13668,12 @@ fn resolve_spec_source(args: &[String]) -> gb10_inference::batch::SpecSource {
 }
 
 fn run_server(args: &[String]) {
+    // Honor --rdma-dev → GB10_RDMA_DEV here. The TP data-plane (tp::rdma_dev / cluster run_head_
+    // session) reads ONLY the env var; on the bench/`serve` paths the flag was already folded in,
+    // but the `--server` path never set it, so it silently fell back to the DEFAULT_RDMA_DEV
+    // (rocep1s0f1). On a GB10 whose RoCE rail is the P2P1 port, bringing the QP up on the wrong
+    // device makes the RTR ibv_modify_qp fail ("[net_shim] RTR" → "TP bring-up: net_init failed").
+    if let Some(d) = parse_arg(args, "--rdma-dev") { std::env::set_var("GB10_RDMA_DEV", d); }
     // Validate the draft-dir rule FIRST — an explicit drafter --spec-source without a valid
     // --draft-dir must stop HERE, before any model load or GPU work (resolve_draft_dir is pure:
     // exits 2 on the violation, returns the dir otherwise; every downstream consumer re-resolves
